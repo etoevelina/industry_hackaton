@@ -3,70 +3,135 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-{# Отчёт самодостаточен: картинки и клипы вшиты как data:, внешних ссылок нет вообще.
-   CSP это фиксирует машинно — преподаватель может открыть файл с флешки и быть
-   уверен, что он никуда не обращается и ничего не подгружает. #}
+<!-- Отчёт — светлый документ: это среда чтения и анализа, а не наблюдения.
+     Тёмное оставлено ровно за наблюдением (таймлайн, график риска, таблица
+     инцидентов с кадрами) и за служебными полосами продукта. -->
+<meta name="color-scheme" content="light">
+<!-- Отчёт самодостаточен: картинки, клипы и оба шрифта (Onest и JetBrains Mono)
+     вшиты как data:,
+     CSS инлайном, внешних ссылок нет вообще. CSP фиксирует это машинно —
+     преподаватель открывает файл с флешки и может быть уверен, что он никуда
+     не обращается и ничего не подгружает. -->
 <meta http-equiv="Content-Security-Policy"
       content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; media-src data:; font-src data:; base-uri 'none'; form-action 'none'">
-<title>{{ page_title }}</title>
+<title>{{ doc_title }}</title>
 <style>{{ css }}</style>
 </head>
 <body>
+
+{{ masthead_html }}
+
 <main class="page">
 
   <header class="head">
-    <div class="brand">Локальная система прокторинга · отчёт о сессии</div>
+    <p class="eyebrow mono caps">отчёт о сессии прокторинга</p>
     <h1>{{ page_title }}</h1>
-    <div class="sub">{{ generated_at }}</div>
-    <nav class="toc">
-      <a href="#score">Integrity score</a>
-      <a href="#timeline">Таймлайн</a>
-      <a href="#fusion">Связки</a>
-      <a href="#incidents">Инциденты</a>
-      <a href="#chain">Целостность записи</a>
-      <a href="#limits">Ограничения</a>
+    <p class="head-sub">{{ generated_at }}</p>
+    <nav class="toc" aria-label="Разделы отчёта">
+      <a href="#score"><span class="mono">01</span>&#8201;&#8201;Integrity score</a>
+      <a href="#timeline"><span class="mono">02</span>&#8201;&#8201;Таймлайн</a>
+      <a href="#fusion"><span class="mono">03</span>&#8201;&#8201;Связки сигналов</a>
+      <a href="#incidents"><span class="mono">04</span>&#8201;&#8201;Инциденты</a>
+      <a href="#chain"><span class="mono">05</span>&#8201;&#8201;Целостность записи</a>
+      <a href="#limits"><span class="mono">06</span>&#8201;&#8201;Границы системы</a>
     </nav>
   </header>
 
   {{ header_html }}
 
-  <section id="score">
-    <h2>Итоговый integrity score и вклад каналов</h2>
-    {{ score_svg }}
-    {{ breakdown_html }}
+  <section id="score" class="sheet">
+    <div class="section-head">
+      <span class="section-index mono caps">01</span>
+      <div>
+        <h2>Integrity score</h2>
+        <p class="lead">Оценка показывает не вероятность чего-либо, а насколько можно
+        опираться на результат: сколько зафиксировано отклонений от условий экзамена,
+        насколько уверенно и по каким каналам.</p>
+      </div>
+    </div>
+    <div class="score-grid">
+      <figure class="score-ring">{{ score_svg }}</figure>
+      <div class="score-breakdown">{{ breakdown_html }}</div>
+    </div>
   </section>
 
-  <section id="timeline">
-    <h2>Таймлайн сессии</h2>
+  <section id="timeline" class="monitor">
+    <div class="section-head">
+      <span class="section-index mono caps">02</span>
+      <div>
+        <h2>Таймлайн сессии</h2>
+        <p class="lead">Две шкалы с общей осью времени: вверху — когда и что было
+        зафиксировано, внизу — как на это реагировал risk-score и где он подходил
+        к порогам предупреждения, паузы и блокировки. На объёме, где поштучные
+        метки накладывались бы друг на друга, верхняя шкала переходит на корзины
+        времени и прямо печатает, сколько подписей показано из всех; точное время
+        каждого срабатывания — в таблице раздела 04. На узком экране график
+        прокручивается по горизонтали, а не сжимается: подписи обязаны остаться
+        читаемыми.</p>
+      </div>
+    </div>
     {{ timeline_svg }}
     {{ risk_svg }}
   </section>
 
-  <section id="fusion" class="fusion">
-    <h2>Связки сигналов (fusion) — ядро доказательной базы</h2>
+  <section id="fusion" class="sheet is-key">
+    <div class="section-head">
+      <span class="section-index mono caps">03</span>
+      <div>
+        <h2>Связки сигналов</h2>
+        <p class="lead">Ядро доказательной базы: совпадения сигналов разной природы
+        на одной временной шкале, с разбором таймингов каждой связки.</p>
+      </div>
+    </div>
     {{ fusion_html }}
   </section>
 
-  <section id="incidents">
-    <h2>Инциденты сессии</h2>
-    <p class="lead">Время указано локальное и смещением от начала сессии. «Доверие» —
-    уверенность детектора в момент фиксации, «длит.» — сколько держалось условие до
-    подтверждения. Миниатюра — кадр-доказательство, вшитый в этот файл.</p>
+  <section id="incidents" class="sheet">
+    <div class="section-head">
+      <span class="section-index mono caps">04</span>
+      <div>
+        <h2>Инциденты сессии</h2>
+        <p class="lead">Время указано локальное и смещением от начала сессии.
+        «Код» — идентификатор инцидента из журнала (вида <span class="mono">GAZE_202</span>):
+        именно на него ссылаются при апелляции и по нему комиссия поднимает эпизод;
+        мелкой строкой под ним — вид события из протокола. В графе «Наблюдение»
+        крупно напечатано то, что зафиксировал движок, мелко — техническая подпись
+        вида. «Уверенность» — уверенность детектора в момент фиксации,
+        «длит.» — сколько держалось условие до подтверждения. Миниатюра — кадр
+        момента, вшитый в этот файл.</p>
+      </div>
+    </div>
     {{ incidents_html }}
   </section>
 
-  <section id="chain">
-    <h2>Целостность записи</h2>
+  <section id="chain" class="sheet">
+    <div class="section-head">
+      <span class="section-index mono caps">05</span>
+      <div>
+        <h2>Целостность записи</h2>
+        <p class="lead">Журнал связан хеш-цепочкой, а отчёт подписан. Проверить это
+        можно без доверия к тому, кто отчёт принёс.</p>
+      </div>
+    </div>
     {{ integrity_html }}
   </section>
 
-  <section id="limits">
-    <h2>Ограничения системы</h2>
+  <section id="limits" class="sheet">
+    <div class="section-head">
+      <span class="section-index mono caps">06</span>
+      <div>
+        <h2>Границы системы</h2>
+        <p class="lead">Раздел написан разработчиком, а не найден проверяющим.
+        Он нужен, чтобы отсутствие записи о чём-то не читалось как доказательство,
+        что этого не было.</p>
+      </div>
+    </div>
     {{ limits_html }}
   </section>
 
-  <footer class="foot">{{ footer_html }}</footer>
-
 </main>
+
+<footer class="foot"><div class="foot-inner">{{ footer_html }}</div></footer>
+
 </body>
 </html>

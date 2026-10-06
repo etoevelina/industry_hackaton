@@ -9,6 +9,18 @@
  * Если моста нет или ядро не отвечает, оболочка переходит в деградированный
  * режим: интерфейс полностью работоспособен, проверки помечены как
  * недоступные, об этом явно сказано на экране. Ничего не падает.
+ *
+ * ДИЗАЙН-СИСТЕМА NEON/PROCTOR (Р-13), что из неё держит этот файл:
+ *   — поверхности: светлая среда чтения (.sheet) для согласия, проверок и
+ *     отчёта, тёмная среда наблюдения (.monitor) для калибровки;
+ *   — статус никогда не передаётся одним цветом: у каждой предполётной
+ *     проверки есть и форма (инлайновый SVG), и словесное состояние;
+ *   — моноширинный шрифт — только идентификаторы и таймкоды;
+ *   — цвета риска берутся из переменных tokens.css, в коде их нет.
+ *
+ * ТОН СООБЩЕНИЙ (раздел Alerts гайда): наблюдаемый факт → контекст → действие.
+ * Обвинительных формулировок в текстах нет: система сообщает наблюдение,
+ * решение принимает человек.
  * =========================================================================== */
 
 (function () {
@@ -19,6 +31,20 @@
   var LINK_STALE_MS = 7000;   // ядро молчит дольше — связь деградировала
 
   var SCREENS = ['consent', 'preflight', 'calibration', 'exam', 'report'];
+
+  /**
+   * Поверхность экрана по правилу гайда (Р-13): тёмное — наблюдение и
+   * диагностика, светлое — чтение, письмо и анализ. Значения совпадают с
+   * классами в index.html; здесь они нужны только как страховка, если разметка
+   * пришла без класса поверхности. Существующий класс не снимается никогда.
+   */
+  var SURFACE = {
+    consent: 'sheet',
+    preflight: 'monitor',   // диагностика окружения — тёмная среда
+    calibration: 'monitor',
+    exam: 'sheet',          // светлый лист; тёмный HUD живёт отдельным aside
+    report: 'sheet'
+  };
 
   /** Предполётные проверки. */
   var CHECKS = [
@@ -49,12 +75,197 @@
     fail: 'не пройдено'
   };
 
+  /**
+   * Экран согласия: полный перечень «что пишется / что НЕ пишется».
+   * mode: 'yes' — попадает на диск, 'ram' — только в оперативной памяти,
+   * 'no' — не собирается вообще. Режим дублируется формой и подписью.
+   */
+  var DISCLOSURE = [
+    {
+      signal: 'Кадры с камеры',
+      mode: 'ram',
+      detail: 'Разбираются покадрово в оперативной памяти: есть ли лицо, сколько лиц, ' +
+              'поворот головы, направление взгляда, посторонние предметы. Непрерывной записи нет.'
+    },
+    {
+      signal: 'Кадр и клип инцидента',
+      mode: 'yes',
+      detail: 'Сохраняются только в момент зафиксированного инцидента: обрезанный кадр и ' +
+              'короткий клип вокруг события, в каталоге сессии на этом компьютере.'
+    },
+    {
+      signal: 'Эталон лица с калибровки',
+      mode: 'yes',
+      detail: 'Нужен, чтобы подтвердить: за компьютером всё время один и тот же человек. ' +
+              'Остаётся в каталоге сессии.'
+    },
+    {
+      signal: 'Интервалы между нажатиями клавиш',
+      mode: 'yes',
+      detail: 'Миллисекунды между нажатиями и класс клавиши: символ, навигация, служебная. ' +
+              'Ритм набора нужен, чтобы отличить набор от вставки.'
+    },
+    {
+      signal: 'Символы нажатых клавиш',
+      mode: 'no',
+      detail: 'Какая именно клавиша нажата, система не знает и не передаёт. ' +
+              'Текст, набранный в других окнах, физически недоступен.'
+    },
+    {
+      signal: 'Текст вашего ответа',
+      mode: 'no',
+      detail: 'Из поля ответа наружу уходит только длина в символах. ' +
+              'Сам ответ остаётся в окне теста.'
+    },
+    {
+      signal: 'Звук, речь, расшифровка',
+      mode: 'no',
+      detail: 'Аудио не записывается и не хранится вообще. В режиме аудитории аудиоканал ' +
+              'выключен целиком: в классе он давал бы ложные срабатывания на соседей.'
+    },
+    {
+      signal: 'Содержимое буфера обмена',
+      mode: 'no',
+      detail: 'Не читается. Фиксируется только факт вставки и её длина в символах.'
+    },
+    {
+      signal: 'Экран и другие окна',
+      mode: 'no',
+      detail: 'Снимков экрана нет, список открытых файлов и окон не собирается.'
+    },
+    {
+      signal: 'Проверки окружения',
+      mode: 'yes',
+      detail: 'Число мониторов, виртуальная камера, ПО удалённого доступа, признаки ' +
+              'виртуальной машины, запись экрана, подключённые аудиоустройства.'
+    },
+    {
+      signal: 'События окна теста',
+      mode: 'yes',
+      detail: 'Потеря фокуса, выход из полноэкранного режима, заблокированные горячие ' +
+              'клавиши, факт вставки из буфера.'
+    },
+    {
+      signal: 'Сетевые обращения',
+      mode: 'no',
+      detail: 'Ни одного исходящего запроса. Доказательства и отчёт остаются на этом ' +
+              'компьютере, облака и внешней аналитики нет.'
+    }
+  ];
+
+  var MODE_TEXT = {
+    yes: 'пишется, локально',
+    ram: 'только в памяти',
+    no: 'не пишется'
+  };
+
   function el(id) { return document.getElementById(id); }
   function pad2(n) { return n < 10 ? '0' + n : String(n); }
 
   function fmtDuration(ms) {
     var s = Math.max(0, Math.round(ms / 1000));
     return pad2(Math.floor(s / 60)) + ':' + pad2(s % 60);
+  }
+
+  /** Локальное экранирование: не зависит от наличия window.Proctor.text. */
+  /**
+   * Счётчик повторов из сообщения risk. Контракт (docs/CONTRACT.md) обещает
+   * breakdown как [{kind,contribution,count}], но проверялся типом только
+   * contribution. Нечисловой count уезжал в разметку отчёта как есть: при
+   * рассинхроне версий или кривом JSON это парные теги внутри .bar__head
+   * (грид полос съезжает), а в безобидном случае подпись «×undefined».
+   * CSP (script-src 'self', без 'unsafe-inline') исполнение исключает,
+   * но вёрстку отчёта на демо это ломает.
+   */
+  function normCount(v) {
+    var n = typeof v === 'number' ? v : parseInt(v, 10);
+    if (!isFinite(n) || n < 1) return 1;
+    return Math.round(n);
+  }
+
+  function esc(s) {
+    return String(s === undefined || s === null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function setText(id, value) {
+    var node = el(id);
+    if (node) node.textContent = value;
+  }
+
+  /** Телеметрия, таймкоды и идентификаторы — моноширинным (правило 5). */
+  function markMono(ids) {
+    for (var i = 0; i < ids.length; i++) {
+      var node = el(ids[i]);
+      if (node) node.classList.add('mono');
+    }
+  }
+
+  /**
+   * Инлайновый SVG: цвет — currentColor, штрих задан атрибутом, поэтому значок
+   * виден и до того, как лист стилей опишет его класс. Правила из styles.css
+   * перебивают презентационные атрибуты, так что оформление остаётся за CSS.
+   */
+  function svgOpen(size) {
+    return '<svg viewBox="0 0 ' + size + ' ' + size + '" aria-hidden="true" focusable="false" ' +
+           'fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" ' +
+           'stroke-linejoin="round">';
+  }
+
+  /** Маркер состояния предполётной проверки: форма дублирует цвет. */
+  function markSvg(state) {
+    var o = svgOpen(28) + '<circle cx="14" cy="14" r="11"></circle>';
+    if (state === 'pending') return o + '</svg>';
+    if (state === 'ok') return o + '<path d="M8.5 14.4 L12.4 18 L19.5 10.4"></path></svg>';
+    if (state === 'warn') return o + '<path d="M14 8.6 L14 15.4 M14 19.1 L14 19.2"></path></svg>';
+    return o + '<path d="M9.6 9.6 L18.4 18.4 M18.4 9.6 L9.6 18.4"></path></svg>';
+  }
+
+  /** Маркер строки таблицы согласия. */
+  function modeSvg(mode) {
+    var o = svgOpen(16);
+    if (mode === 'yes') return o + '<path d="M3.2 8.6 L6.3 11.6 L12.8 4.6"></path></svg>';
+    if (mode === 'ram') return o + '<circle cx="8" cy="8" r="4.4"></circle><path d="M8 5.6 L8 8.4"></path></svg>';
+    return o + '<path d="M4.4 4.4 L11.6 11.6 M11.6 4.4 L4.4 11.6"></path></svg>';
+  }
+
+  /**
+   * Запасные правила вёрстки для узлов, которые создаёт этот файл.
+   * Селекторы завёрнуты в :where() — нулевая специфичность, любое правило из
+   * styles.css их перебивает. Нужны, чтобы таблица согласия и строка причины
+   * блокировки были читаемы даже до того, как лист стилей получит новые классы.
+   * Значения — переменные tokens.css; второй аргумент var() задан только для
+   * размеров (страховка, если tokens.css ещё не подключён). Цвета без запасных
+   * значений: хардкод палитры запрещён.
+   */
+  var FALLBACK_CSS = [
+    ':where(.disclose){display:block;margin:var(--space-8,32px) 0;}',
+    ':where(.disclose__head){display:flex;flex-wrap:wrap;gap:var(--space-2,8px);align-items:baseline;justify-content:space-between;margin-bottom:var(--space-4,16px);}',
+    ':where(.disclose__lede){max-width:72ch;font-size:var(--fs-small,14px);}',
+    ':where(.table-wrap){overflow-x:auto;border:1px solid var(--border-hair);border-radius:var(--radius-md,12px);}',
+    ':where(.disclose__table){width:100%;border-collapse:collapse;text-align:left;font-size:var(--fs-small,14px);line-height:var(--lh-body,1.55);}',
+    ':where(.disclose__table th),:where(.disclose__table td){padding:var(--space-3,12px) var(--space-4,16px);border-bottom:1px solid var(--border-hair);vertical-align:top;}',
+    ':where(.disclose__table thead th){font-family:var(--font-mono,monospace);font-size:var(--fs-small,14px);text-transform:uppercase;letter-spacing:var(--tracking-label,0.12em);white-space:nowrap;}',
+    ':where(.disclose__table tbody th){font-weight:600;}',
+    ':where(.disclose__table tr:last-child th),:where(.disclose__table tr:last-child td){border-bottom:0;}',
+    ':where(.disclose__mode){display:inline-flex;gap:var(--space-2,8px);align-items:flex-start;}',
+    ':where(.disclose__mode) svg{flex:none;width:16px;height:16px;margin-top:0.2em;}',
+    ':where(.disclose__detail){max-width:62ch;}',
+    ':where(.preflight-block){flex:1 1 32ch;max-width:64ch;font-size:var(--fs-small,14px);line-height:var(--lh-body,1.55);}',
+    ':where(.chk__state){display:flex;flex-direction:column;gap:2px;align-items:flex-end;text-align:right;}',
+    ':where(.chk__word),:where(.chk__note){font-size:var(--fs-small,14px);}',
+    ':where(.chk__mark) svg{display:block;width:24px;height:24px;}'
+  ].join('\n');
+
+  function installFallbackStyles() {
+    if (document.getElementById('ds-fallback-app')) return;
+    try {
+      var style = document.createElement('style');
+      style.id = 'ds-fallback-app';
+      style.textContent = FALLBACK_CSS;
+      document.head.appendChild(style);
+    } catch (e) { /* без запасных правил экраны всё равно работают */ }
   }
 
   // ------------------------------------------------------------------ мост
@@ -207,7 +418,7 @@
     this.exam = window.Proctor.exam;
     this.calibration = window.Proctor.calibration;
     this.telemetry = window.Proctor.telemetry;
-    this.text = window.Proctor.text;
+    this.text = window.Proctor.text || null;
 
     this.screen = null;
     this.caps = null;
@@ -222,8 +433,52 @@
     this.locked = false;
   }
 
+  /** Экранирование: своё, если hud.js не отдал общий помощник. */
+  App.prototype._esc = function (s) {
+    if (this.text && typeof this.text.escapeHtml === 'function') return this.text.escapeHtml(s);
+    return esc(s);
+  };
+
+  /** Человекочитаемый текст инцидента. */
+  App.prototype._eventText = function (ev) {
+    if (this.text && typeof this.text.eventText === 'function') return this.text.eventText(ev);
+    if (ev && typeof ev.message === 'string' && ev.message.trim()) return ev.message.trim();
+    return (ev && ev.kind) || 'Событие';
+  };
+
+  /** Пороги риска — из protocol.py через hud.js; запас совпадает с protocol.py. */
+  App.prototype._thresholds = function () {
+    if (this.text && this.text.thresholds) return this.text.thresholds;
+    return { warn: 30, pause: 60, lock: 90 };
+  };
+
+  /**
+   * Цвет уровня риска. Ведущий источник — hud.js:colorFor (styles.css держит
+   * под него контрактные алиасы --ok/--warn/--high/--crit). Запас — переменные
+   * риска из tokens.css. Литералов цвета в коде нет ни в одной ветке.
+   */
+  App.prototype._riskColor = function (score) {
+    if (this.text && typeof this.text.colorFor === 'function') return this.text.colorFor(score);
+    var th = this._thresholds();
+    if (score >= th.lock) return 'var(--risk-lock, var(--crit))';
+    if (score >= th.pause) return 'var(--risk-pause, var(--high))';
+    if (score >= th.warn) return 'var(--risk-warn, var(--warn))';
+    return 'var(--risk-ok, var(--ok))';
+  };
+
+  App.prototype._levelOf = function (score) {
+    if (this.text && typeof this.text.levelOf === 'function') return this.text.levelOf(score);
+    var th = this._thresholds();
+    if (score >= th.lock) return { cls: 'lvl-lock', text: 'блокировка' };
+    if (score >= th.pause) return { cls: 'lvl-pause', text: 'высокий' };
+    if (score >= th.warn) return { cls: 'lvl-warn', text: 'внимание' };
+    return { cls: 'lvl-ok', text: 'норма' };
+  };
+
   App.prototype.boot = function () {
     var self = this;
+
+    installFallbackStyles();
 
     this.telemetry.init(function (msg) { self.bridge.sendTelemetry(msg); });
 
@@ -249,10 +504,14 @@
     this._wireCalibration();
     this._wireReport();
 
+    this._renderDisclosure();
     this._initChecks();
     this._subscribe();
     this._loadCapabilities();
     this._startLinkWatchdog();
+
+    // идентификаторы и таймкоды на экране отчёта — моноширинным
+    markMono(['report-session', 'report-duration']);
 
     this.calibration.reset();
     this.show('consent');
@@ -264,20 +523,38 @@
     if (SCREENS.indexOf(name) === -1) return;
     this.screen = name;
     for (var i = 0; i < SCREENS.length; i++) {
-      var node = el('screen-' + SCREENS[i]);
-      if (node) node.hidden = SCREENS[i] !== name;
+      var key = SCREENS[i];
+      var node = el('screen-' + key);
+      if (!node) continue;
+      node.hidden = key !== name;
+      // поверхность задана в разметке; дописываем только если её там нет
+      var surface = SURFACE[key] || '';
+      if (surface && !node.classList.contains('sheet') && !node.classList.contains('monitor')) {
+        node.classList.add(surface);
+      }
     }
+
     var active = SCREENS.indexOf(name);
     var steps = document.querySelectorAll('#stepper .step');
     for (var j = 0; j < steps.length; j++) {
-      steps[j].classList.toggle('is-active', j === active);
-      steps[j].classList.toggle('is-done', j < active);
+      var done = j < active;
+      var isActive = j === active;
+      steps[j].classList.toggle('is-active', isActive);
+      steps[j].classList.toggle('is-done', done);
+      steps[j].setAttribute('data-state', isActive ? 'active' : (done ? 'done' : 'next'));
+      // текущий шаг помечен не только цветом
+      if (isActive) steps[j].setAttribute('aria-current', 'step');
+      else steps[j].removeAttribute('aria-current');
     }
+
     // HUD виден на калибровке и экзамене: студент сразу видит, что фиксируется
     var withHud = (name === 'calibration' || name === 'exam');
     if (withHud) this.hud.show(); else this.hud.hide();
     var root = el('app');
-    if (root) root.classList.toggle('has-hud', withHud);
+    if (root) {
+      root.classList.toggle('has-hud', withHud);
+      root.setAttribute('data-screen', name);
+    }
   };
 
   // --- подписки на поток от сайдкара ---
@@ -378,8 +655,8 @@
 
     var chk = EVENT_TO_CHECK[ev.kind];
     if (chk) {
-      var msg = this.text.eventText(ev);
-      this._setCheck(chk, 'fail', msg.length > 42 ? msg.slice(0, 41) + '…' : msg);
+      var msg = this._eventText(ev);
+      this._setCheck(chk, 'fail', msg.length > 60 ? msg.slice(0, 59) + '…' : msg);
     }
   };
 
@@ -440,6 +717,8 @@
       wrap.classList.toggle('is-up', state === 'up');
       wrap.classList.toggle('is-down', state === 'down');
       wrap.classList.toggle('is-degraded', state === 'degraded');
+      // состояние связи читается и без цвета точки
+      wrap.setAttribute('data-state', state);
     }
     if (t && text) t.textContent = text;
   };
@@ -526,6 +805,71 @@
     };
   };
 
+  /**
+   * Контейнер для таблицы согласия. Если в разметке есть #consent-disclosure,
+   * используем его; иначе создаём и ставим перед карточкой участника, чтобы
+   * студент прочитал перечень до того, как вводить данные.
+   */
+  App.prototype._disclosureHost = function () {
+    var host = el('consent-disclosure');
+    if (host) return host;
+    var screen = el('screen-consent');
+    if (!screen) return null;
+    var inner = screen.querySelector('.screen__inner') || screen;
+    try {
+      host = document.createElement('section');
+      host.id = 'consent-disclosure';
+      host.className = 'disclose';
+      host.setAttribute('aria-labelledby', 'disclose-title');
+      var form = inner.querySelector('.card--form');
+      var bar = inner.querySelector('.consent-bar');
+      var before = form || bar || null;
+      if (before) inner.insertBefore(host, before);
+      else inner.appendChild(host);
+      return host;
+    } catch (e) { return null; }
+  };
+
+  /**
+   * Таблица «что пишется / что НЕ пишется». Светлая среда чтения: смысл
+   * строки несут подпись и форма значка, цвет только усиливает.
+   */
+  App.prototype._renderDisclosure = function () {
+    var host = this._disclosureHost();
+    if (!host) return;
+    var rows = '';
+    for (var i = 0; i < DISCLOSURE.length; i++) {
+      var r = DISCLOSURE[i];
+      rows += '<tr data-mode="' + r.mode + '">' +
+                '<th scope="row">' + this._esc(r.signal) + '</th>' +
+                '<td><span class="disclose__mode" data-mode="' + r.mode + '">' +
+                  modeSvg(r.mode) + '<span>' + this._esc(MODE_TEXT[r.mode]) + '</span>' +
+                '</span></td>' +
+                '<td class="disclose__detail">' + this._esc(r.detail) + '</td>' +
+              '</tr>';
+    }
+    host.innerHTML =
+      '<div class="disclose__head">' +
+        '<h2 class="card__title" id="disclose-title">Что пишется и что не пишется</h2>' +
+        '<p class="disclose__lede muted">Перечень полный: других данных система не собирает. ' +
+          'Всё вычисление идёт на этом компьютере, сеть не используется.</p>' +
+      '</div>' +
+      '<div class="table-wrap">' +
+        // .data-table из гайда описана для тёмной поверхности; экран согласия
+        // светлый, поэтому у таблицы согласия свой класс
+        '<table class="disclose__table">' +
+          '<caption class="visually-hidden">Перечень фиксируемых и не фиксируемых данных: ' +
+            'сигнал, попадает ли он на диск, что именно сохраняется</caption>' +
+          '<thead><tr>' +
+            '<th scope="col">Сигнал</th>' +
+            '<th scope="col">Пишется на диск</th>' +
+            '<th scope="col">Что именно</th>' +
+          '</tr></thead>' +
+          '<tbody>' + rows + '</tbody>' +
+        '</table>' +
+      '</div>';
+  };
+
   // --- экран проверок ---
 
   App.prototype._initChecks = function () {
@@ -574,7 +918,7 @@
     var envIds = ['displays', 'remote', 'vcam', 'vm', 'procs'];
     for (var i = 0; i < envIds.length; i++) {
       if (this.checks[envIds[i]].state === 'pending') {
-        this._setCheck(envIds[i], 'ok', 'нарушений не найдено');
+        this._setCheck(envIds[i], 'ok', 'отклонений не найдено');
       }
     }
     if (this.checks.mic.state === 'pending') {
@@ -587,49 +931,122 @@
     this._renderChecks();
   };
 
+  /**
+   * Список проверок. Состояние несут три носителя одновременно: форма значка,
+   * слово статуса и пояснение. Цвет — четвёртый, вспомогательный.
+   */
   App.prototype._renderChecks = function () {
     var list = el('checks');
     if (!list) return;
+
     var html = '';
     for (var i = 0; i < CHECKS.length; i++) {
       var def = CHECKS[i];
       var st = this.checks[def.id] || { state: 'pending', note: '' };
-      html += '<li class="chk is-' + st.state + '">' +
+      var word = STATE_TEXT[st.state] || st.state;
+      var note = st.note ? this._esc(st.note) : '';
+      html += '<li class="chk is-' + st.state + '" data-state="' + st.state + '" data-check="' + def.id + '">' +
                 '<span class="chk__mark">' + markSvg(st.state) + '</span>' +
                 '<span class="chk__text">' +
-                  '<span class="chk__title">' + def.title + '</span>' +
-                  '<span class="chk__hint">' + def.hint + '</span>' +
+                  '<span class="chk__title">' + this._esc(def.title) + '</span>' +
+                  '<span class="chk__hint">' + this._esc(def.hint) + '</span>' +
                 '</span>' +
-                '<span class="chk__state">' + (st.note || STATE_TEXT[st.state]) + '</span>' +
+                '<span class="chk__state">' +
+                  '<span class="chk__word">' + this._esc(word) + '</span>' +
+                  (note ? '<span class="chk__note muted">' + note + '</span>' : '') +
+                '</span>' +
               '</li>';
     }
     list.innerHTML = html;
+    list.setAttribute('role', 'list');
 
-    var blocked = false, pending = false;
-    for (var j = 0; j < CHECKS.length; j++) {
-      var s = this.checks[CHECKS[j].id].state;
-      if (s === 'fail') blocked = true;
-      if (s === 'pending') pending = true;
-    }
-    var btn = el('btn-start');
-    if (btn) btn.disabled = blocked || pending;
+    this._updateStartGate();
   };
 
-  function markSvg(state) {
-    if (state === 'pending') {
-      return '<svg viewBox="0 0 28 28"><circle cx="14" cy="14" r="11"></circle></svg>';
+  /**
+   * Кнопка старта и строка рядом с ней. Пока есть красный пункт, старт
+   * заблокирован, а текст называет мешающий пункт и действие.
+   * Формула гайда: наблюдаемый факт → контекст → понятное действие.
+   */
+  App.prototype._updateStartGate = function () {
+    var failed = [], pending = [], unavailable = [];
+    for (var i = 0; i < CHECKS.length; i++) {
+      var def = CHECKS[i];
+      var st = this.checks[def.id] || { state: 'pending', note: '' };
+      if (st.state === 'fail') failed.push({ def: def, note: st.note });
+      else if (st.state === 'pending') pending.push({ def: def, note: st.note });
+      else if (st.state === 'warn') unavailable.push({ def: def, note: st.note });
     }
-    if (state === 'ok') {
-      return '<svg viewBox="0 0 28 28"><circle cx="14" cy="14" r="11"></circle>' +
-             '<path d="M8.5 14.4 L12.4 18 L19.5 10.4"></path></svg>';
+
+    var blocked = failed.length > 0 || pending.length > 0;
+    var btn = el('btn-start');
+    var line = this._blockLine();
+    var state = 'ready';
+    var text = '';
+
+    if (failed.length === 1) {
+      // факт → контекст → действие (формула гайда, раздел Alerts)
+      state = 'blocked';
+      text = 'Старт заблокирован пунктом «' + failed[0].def.title + '»' +
+             (failed[0].note ? ' — ' + failed[0].note : '') + '. ' +
+             failed[0].def.hint + '. Устраните и нажмите «Повторить проверки».';
+    } else if (failed.length > 1) {
+      state = 'blocked';
+      var names = [];
+      for (var j = 0; j < failed.length; j++) {
+        names.push('«' + failed[j].def.title + '»' + (failed[j].note ? ' — ' + failed[j].note : ''));
+      }
+      text = 'Старт заблокирован, не пройдено пунктов: ' + failed.length + '. ' +
+             names.join('; ') + '. Устраните и нажмите «Повторить проверки».';
+    } else if (pending.length) {
+      state = 'pending';
+      var waiting = [];
+      for (var k = 0; k < pending.length && k < 4; k++) waiting.push('«' + pending[k].def.title + '»');
+      text = 'Проверки ещё идут: ' + waiting.join(', ') +
+             (pending.length > 4 ? ' и ещё ' + (pending.length - 4) : '') +
+             '. Кнопка включится, когда у всех пунктов появится статус.';
+    } else if (unavailable.length) {
+      state = 'ready-degraded';
+      var off = [];
+      for (var m = 0; m < unavailable.length; m++) {
+        off.push('«' + unavailable[m].def.title + '»' + (unavailable[m].note ? ' — ' + unavailable[m].note : ''));
+      }
+      text = 'Можно начинать. Часть проверок выполнить нельзя: ' + off.join('; ') +
+             '. По этим каналам наблюдение не ведётся, и это будет отмечено в отчёте.';
+    } else {
+      state = 'ready';
+      text = 'Все пункты пройдены. Можно начинать тест.';
     }
-    if (state === 'warn') {
-      return '<svg viewBox="0 0 28 28"><circle cx="14" cy="14" r="11"></circle>' +
-             '<path d="M14 8.6 L14 15.4 M14 19.1 L14 19.2"></path></svg>';
+
+    if (line) {
+      line.textContent = text;
+      line.setAttribute('data-state', state);
+      line.classList.toggle('is-blocked', state === 'blocked');
+      line.classList.toggle('is-pending', state === 'pending');
+      line.classList.toggle('is-ready', state === 'ready' || state === 'ready-degraded');
     }
-    return '<svg viewBox="0 0 28 28"><circle cx="14" cy="14" r="11"></circle>' +
-           '<path d="M9.6 9.6 L18.4 18.4 M18.4 9.6 L9.6 18.4"></path></svg>';
-  }
+    if (btn) {
+      btn.disabled = blocked;
+      btn.setAttribute('aria-describedby', 'preflight-block');
+      btn.setAttribute('title', blocked ? text : 'Начать тест');
+    }
+  };
+
+  /** Строка причины блокировки — рядом с кнопкой старта. Создаётся при нужде. */
+  App.prototype._blockLine = function () {
+    var node = el('preflight-block');
+    if (node) return node;
+    var btn = el('btn-start');
+    if (!btn || !btn.parentNode) return null;
+    try {
+      node = document.createElement('p');
+      node.id = 'preflight-block';
+      node.className = 'preflight-block';
+      node.setAttribute('aria-live', 'polite');
+      btn.parentNode.insertBefore(node, btn);
+      return node;
+    } catch (e) { return null; }
+  };
 
   App.prototype._setNote = function (text) {
     var n = el('preflight-note');
@@ -722,17 +1139,21 @@
   App.prototype._renderReport = function () {
     var sum = this.hud.summary();
     var tele = this.telemetry.sessionSummary();
-    var T = this.text;
 
     var score = Math.max(0, Math.min(100, sum.score || 0));
-    var lv = T.levelOf(score);
+    var lv = this._levelOf(score);
     var ring = el('report-ring');
     var wrap = el('report-ring-wrap');
+    var ringLen = this._decorateReportRing(ring);
     if (ring) {
-      ring.style.strokeDashoffset = String(T.ringLen * (1 - score / 100));
-      ring.style.stroke = T.colorFor(score);
+      ring.style.strokeDashoffset = String((ringLen * (1 - score / 100)).toFixed(2));
+      ring.style.stroke = this._riskColor(score);
     }
-    if (wrap) wrap.className = 'ring ring--lg ' + lv.cls;
+    if (wrap) {
+      wrap.className = 'ring ring--lg ' + lv.cls;
+      // уровень читается словом, а не только цветом кольца
+      wrap.setAttribute('data-level', lv.text);
+    }
     setText('report-score', String(Math.round(score)));
     setText('report-level', lv.text);
     setText('report-incidents', String(sum.total));
@@ -747,7 +1168,7 @@
     var reasonText = {
       student: 'Тест завершён участником.',
       timeout: 'Время теста истекло.',
-      lock: 'Сессия закрыта системой: риск превысил порог блокировки.'
+      lock: 'Сессия закрыта системой: накопленный риск превысил порог блокировки.'
     };
     var lede = (this.examResult && reasonText[this.examResult.reason]) || 'Сессия завершена.';
     lede += ' Отвечено ' + answered + ' из ' + total + ' вопросов. ' +
@@ -761,17 +1182,72 @@
     this._renderLog(sum.events);
   };
 
+  /**
+   * Кольцо итогового риска: длина пунктира считается от фактического радиуса из
+   * разметки, а на кольцо один раз наносятся засечки порогов 30 / 60 / 90.
+   * Засечки — нецветовая подсказка: видно, какой порог дуга прошла, даже если
+   * цвет не читается. Возвращает длину окружности для dashoffset.
+   */
+  App.prototype._decorateReportRing = function (ring) {
+    var fallbackLen = (this.text && this.text.ringLen) ? this.text.ringLen : 2 * Math.PI * 42;
+    if (!ring || typeof ring.getAttribute !== 'function') return fallbackLen;
+
+    var r = parseFloat(ring.getAttribute('r')) || 42;
+    var len = 2 * Math.PI * r;
+    ring.style.strokeDasharray = String(len.toFixed(2));
+
+    var svg = ring.ownerSVGElement || ring.parentNode;
+    if (!svg || typeof svg.getAttribute !== 'function' || el('report-ring-ticks')) return len;
+
+    // Дуга окружности начинается на 3 часах, а растёт с 12: поворот уже делает
+    // правило `.ring svg { rotate(-90deg) }`. Если его нет — компенсируем сами,
+    // ровно так же, как это делает hud.js, иначе засечки уедут относительно дуги.
+    var rotated = false;
+    try {
+      var cs = (typeof window.getComputedStyle === 'function') ? window.getComputedStyle(svg) : null;
+      if (cs && cs.transform && cs.transform !== 'none') rotated = true;
+    } catch (e) { /* нет getComputedStyle — считаем, что поворота нет */ }
+
+    try {
+      var NS = 'http://www.w3.org/2000/svg';
+      var g = document.createElementNS(NS, 'g');
+      g.setAttribute('id', 'report-ring-ticks');
+      g.setAttribute('aria-hidden', 'true');
+      if (!rotated) {
+        g.style.transform = 'rotate(-90deg)';
+        g.style.transformOrigin = '50% 50%';
+      }
+      var th = this._thresholds();
+      var marks = [th.warn, th.pause, th.lock];
+      for (var i = 0; i < marks.length; i++) {
+        var a = (marks[i] / 100) * 2 * Math.PI;
+        var line = document.createElementNS(NS, 'line');
+        line.setAttribute('x1', (50 + Math.cos(a) * (r - 6)).toFixed(2));
+        line.setAttribute('y1', (50 + Math.sin(a) * (r - 6)).toFixed(2));
+        line.setAttribute('x2', (50 + Math.cos(a) * (r + 6)).toFixed(2));
+        line.setAttribute('y2', (50 + Math.sin(a) * (r + 6)).toFixed(2));
+        line.setAttribute('class', 'ring__tick');
+        line.setAttribute('stroke-width', '1.4');
+        // цвет засечки задаёт styles.css (.ring__tick / .sheet .ring__tick);
+        // currentColor — только чтобы линия не исчезла без этих правил
+        line.setAttribute('stroke', 'currentColor');
+        g.appendChild(line);
+      }
+      svg.insertBefore(g, ring);
+    } catch (e) { /* без засечек кольцо остаётся читаемым */ }
+    return len;
+  };
+
   App.prototype._renderBreakdown = function (breakdown, events) {
     var box = el('report-breakdown');
     if (!box) return;
-    var T = this.text;
     var items = [];
 
     if (breakdown && breakdown.length) {
       for (var i = 0; i < breakdown.length; i++) {
         var b = breakdown[i];
         if (!b || typeof b.contribution !== 'number' || b.contribution <= 0) continue;
-        items.push({ kind: b.kind, value: b.contribution, count: b.count || 1 });
+        items.push({ kind: b.kind, value: b.contribution, count: normCount(b.count) });
       }
     } else if (events && events.length) {
       // разложение не пришло — считаем по числу инцидентов каждого типа
@@ -781,26 +1257,33 @@
         agg[k] = (agg[k] || 0) + 1;
       }
       var keys = Object.keys(agg);
-      for (var m = 0; m < keys.length; m++) items.push({ kind: keys[m], value: agg[keys[m]], count: agg[keys[m]] });
+      for (var m = 0; m < keys.length; m++) {
+        items.push({ kind: keys[m], value: agg[keys[m]], count: normCount(agg[keys[m]]) });
+      }
     }
 
     if (!items.length) {
-      box.innerHTML = '<li class="bars__empty">Вклад не зафиксирован: нарушений нет.</li>';
+      box.innerHTML = '<li class="bars__empty">Вклад не зафиксирован: отклонений нет.</li>';
       return;
     }
     items.sort(function (a, b) { return b.value - a.value; });
     var max = items[0].value || 1;
+    var names = (this.text && this.text.event) || {};
+    var shorts = (this.text && this.text.short) || {};
     var html = '';
     for (var n = 0; n < items.length && n < 8; n++) {
       var it = items[n];
-      var name = T.event[it.kind] || T.short[it.kind] || it.kind;
-      html += '<li>' +
+      var name = names[it.kind] || shorts[it.kind] || it.kind;
+      html += '<li data-kind="' + this._esc(it.kind) + '">' +
                 '<div class="bar__head">' +
-                  '<span class="bar__name">' + T.escapeHtml(name) + ' ×' + it.count + '</span>' +
-                  '<span class="bar__val">' + Math.round(it.value) + '</span>' +
+                  // it.count уже прошёл normCount(): это единственная интерполяция
+                  // в модуле без _esc, и безопасна она ровно потому, что гарантированно число
+                  '<span class="bar__name">' + this._esc(name) + ' ×' + it.count + '</span>' +
+                  '<span class="bar__val mono">' + Math.round(it.value) + '</span>' +
                 '</div>' +
                 '<div class="bar__track"><div class="bar__fill" style="width:' +
-                  ((it.value / max) * 100).toFixed(1) + '%;background:' + T.colorFor(Math.min(100, it.value)) + '"></div></div>' +
+                  ((it.value / max) * 100).toFixed(1) + '%;background:' +
+                  this._riskColor(Math.min(100, it.value)) + '"></div></div>' +
               '</li>';
     }
     box.innerHTML = html;
@@ -809,19 +1292,20 @@
   App.prototype._renderLog = function (events) {
     var box = el('report-log');
     if (!box) return;
-    var T = this.text;
     if (!events || !events.length) {
       box.innerHTML = '<li class="log__empty">Инцидентов не зафиксировано.</li>';
       return;
     }
+    var hhmmss = (this.text && this.text.hhmmss) ? this.text.hhmmss : function () { return '--:--:--'; };
     var html = '';
     for (var i = events.length - 1; i >= 0; i--) {
       var ev = events[i];
-      html += '<li>' +
-                '<span class="log__time">' + T.hhmmss(ev.ts) + '</span>' +
+      var sev = this._esc(ev.severity || 'medium');
+      html += '<li data-sev="' + sev + '">' +
+                '<span class="log__time mono">' + this._esc(hhmmss(ev.ts)) + '</span>' +
                 '<span class="log__msg">' +
-                  '<span class="log__sev sev-' + T.escapeHtml(ev.severity || 'medium') + '"></span>' +
-                  T.escapeHtml(T.eventText(ev)) +
+                  '<span class="log__sev sev-' + sev + '" aria-hidden="true"></span>' +
+                  this._esc(this._eventText(ev)) +
                 '</span>' +
               '</li>';
     }
@@ -842,11 +1326,6 @@
       }
     });
   };
-
-  function setText(id, value) {
-    var node = el(id);
-    if (node) node.textContent = value;
-  }
 
   // ------------------------------------------------------------------ старт
 

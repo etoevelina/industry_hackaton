@@ -67,7 +67,18 @@
 
   /* --- типографика --- */
   --font-sans: "Onest", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
-  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  /*
+   * "Onest" стоит в стеке моноширинного ВТОРЫМ намеренно, а не по небрежности.
+   * Вшитые сабсеты JetBrains Mono не содержат казахских ә ғ қ ң һ ұ Ұ (проверено
+   * по cmap), и при font-src 'self' подтянуть их неоткуда. Без этого запасного
+   * шага такая буква ушла бы в системный фолбэк — на Windows/Linux это пустой
+   * прямоугольник. Onest покрывает все 16 казахских букв, значит тофу не будет
+   * нигде. Цифры и латиница по-прежнему берутся из JetBrains Mono, поэтому
+   * табличное выравнивание телеметрии не меняется.
+   * Правило 5 дизайн-системы при этом остаётся в силе: человеческие имена и
+   * названия в .mono не ставим, это стек последней надежды, а не разрешение.
+   */
+  --font-mono: "JetBrains Mono", "Onest", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   --font-wordmark: "Space Grotesk", var(--font-sans); /* ТОЛЬКО латиница */
 
   --fs-display: clamp(40px, 6vw, 72px);
@@ -105,8 +116,33 @@
 
   /* --- интерактив --- */
   --tap-min: 44px;            /* минимальная зона нажатия */
-  --focus-ring: 3px solid var(--info);
+
+  /*
+   * Обводка фокуса зависит от поверхности — ровно так же, как --signal-text-on-light.
+   * --info (#35b7ff) читается только на тёмном: на #0a0a0a это 8.83:1, а на белом
+   * всего 2.24:1, на карточке --gray-100 — 1.90:1 и у кислотной заливки — 1.89:1.
+   * WCAG 2.2 (1.4.11 «Non-text Contrast», 2.4.13 «Focus Appearance») требует >= 3:1,
+   * то есть на светлых экранах (согласие, лист экзамена, отчёт) светлый голубой
+   * фокус физически не виден. Базовое значение поэтому затемнённое:
+   *   #0b6ea8 -> 5.51:1 на #ffffff, 4.67:1 на #ececec, 4.65:1 на #c6ff00.
+   * Тёмная среда возвращает --info ниже, в правиле .monitor / .is-dark.
+   */
+  --focus-ring-color: #0b6ea8;
+  --focus-ring-width: 3px;
   --focus-offset: 3px;
+  /*
+   * ВНИМАНИЕ при использовании. var() внутри пользовательского свойства
+   * подставляется ТАМ, ГДЕ СВОЙСТВО ОБЪЯВЛЕНО, а не там, где применено:
+   * --focus-ring, объявленный здесь, навсегда запекает в себя светлый
+   * --focus-ring-color из :root и НЕ следует за переопределением на .monitor.
+   * Проверено в движке: на .monitor computed --focus-ring-color = #35b7ff,
+   * а --focus-ring = «3px solid #0b6ea8».
+   * Поэтому обводку всегда собираем на месте из двух токенов:
+   *   outline: var(--focus-ring-width) solid var(--focus-ring-color);
+   * --focus-ring остаётся только как совместимость для внешних потребителей
+   * и переобъявляется в каждой среде ниже.
+   */
+  --focus-ring: var(--focus-ring-width) solid var(--focus-ring-color);
   --transition: 0.16s ease;
 
   --layout-max: 1440px;
@@ -118,6 +154,24 @@
     --gray-500: #5e5e5e;
     --gray-300: #d1d1d1;
     --border-hair: #d4d4d4;
+    /* 8.82:1 на белом, 7.47:1 на --gray-100, 7.44:1 у кислотной заливки.
+       Тёмная среда ниже перебивает это значение: на #0a0a0a оно дало бы 2.24:1. */
+    --focus-ring-color: #004e7c;
+    --focus-ring: var(--focus-ring-width) solid #004e7c;
+  }
+
+  /*
+   * Высокая контрастность должна тянуть серый в РАЗНЫЕ стороны на разных
+   * поверхностях. Затемнение --gray-500 до #5e5e5e выигрывает на белом, но на
+   * тёмном это проигрыш: точка важности low в ленте HUD (--sev-low), неактивный
+   * канал (.chan.s-off) и ожидающая проверка (.chk.is-pending) падают
+   * с 3.94:1 до 2.84:1 на --bg-panel — ниже порога 3:1 для нетекстовых объектов.
+   * В тёмной среде поэтому осветляем: #a3a3a3 даёт 7.30:1 на --bg-panel,
+   * 7.85:1 на --bg-monitor и 6.00:1 на --graphite.
+   */
+  .monitor,
+  .is-dark {
+    --gray-500: #a3a3a3;
   }
 }
 
@@ -172,7 +226,9 @@ button {
 }
 
 :focus-visible {
-  outline: var(--focus-ring);
+  /* два токена, а не --focus-ring: только так цвет берётся у поверхности,
+     на которой элемент реально лежит (см. комментарий к --focus-ring выше) */
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
   outline-offset: var(--focus-offset);
 }
 
@@ -217,12 +273,25 @@ button {
 .is-dark {
   color: var(--text-on-dark);
   background: var(--bg-monitor);
+  /* На тёмном затемнённая обводка пропала бы (2.09:1 у #004e7c на --bg-panel),
+     поэтому здесь фокус возвращается к светлому --info: 8.83:1 на #0a0a0a. */
+  --focus-ring-color: var(--info);
+  --focus-ring: var(--focus-ring-width) solid var(--info);
 }
 
 /* Светлая среда чтения и письма */
 .sheet {
   color: var(--text-primary);
   background: var(--bg-canvas);
+  --focus-ring-color: #0b6ea8;
+  --focus-ring: var(--focus-ring-width) solid #0b6ea8;
+}
+
+@media (prefers-contrast: more) {
+  .sheet {
+    --focus-ring-color: #004e7c;
+    --focus-ring: var(--focus-ring-width) solid #004e7c;
+  }
 }
 
 .visually-hidden {

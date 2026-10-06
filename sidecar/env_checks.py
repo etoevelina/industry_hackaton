@@ -1,21 +1,41 @@
 """
-Проверки окружения: защита от remote-помощи и подмены видеопотока.
+Проверки окружения: защита от remote-помощи, подмены видеопотока и подсказки в ухо.
 
 Зачем это нужно. Вся CV-часть смотрит в камеру и доверяет тому, что видит.
-Два класса обхода CV не ловится принципиально:
+Три класса обхода не ловятся кадром принципиально:
 
   1. Подмена потока. Студент ставит OBS Virtual Camera и отдаёт вместо живого
      видео заранее записанный ролик, где он честно смотрит в экран.
   2. Remote-помощь. За машиной сидит кто-то ещё — через AnyDesk/TeamViewer/VNC
      или просто в соседнем окне мессенджера, куда улетает скриншот задания.
+  3. Подсказка в ухо. Наушник или гарнитура со связью: в кадре всё спокойно,
+     а ответы студенту диктуют. Угроза У-02.
 
-Оба случая видны не в кадре, а в состоянии операционной системы: список
-устройств захвата, список процессов, число экранов, признаки гипервизора.
+Все три случая видны не в кадре, а в состоянии операционной системы: список
+устройств захвата, список процессов, число экранов, признаки гипервизора,
+список активных устройств вывода звука.
 Этот модуль — второй, независимый от камеры источник доказательств.
+
+Про аудио отдельно (Р-10)
+-------------------------
+`check_audio_devices()` — это ЗАМЕНА анализа звука, а не дополнение к нему.
+Кейс локальный: в компьютерном классе `VOICE_OTHER` и
+`SPEECH_WITHOUT_LIP_MOTION` срабатывают на соседей и превращаются в генератор
+ложных обвинений, поэтому в `exam_mode: "classroom"` аудио-канал выключен
+целиком. Проверка устройств работает в ОБОИХ режимах и от шума в помещении не
+зависит: подключённые наушники — это состояние ОС, а не оценка сигнала.
+
+Граница проверки, которую нельзя забывать при ссылке на У-02: она видит только
+устройства, подключённые К ЭТОМУ компьютеру. Гарнитура, спаренная с телефоном
+студента, и наушник, воткнутый в телефон, системе не видны — ни одна проверка
+модуля не смотрит за пределы экзаменационной машины. Этот путь закрывается
+очным контролем в аудитории и fusion-связкой «длинная пауза -> мгновенный
+развёрнутый ответ»; проверка устройств — дополнительный детерминированный
+сигнал, а не полное закрытие вектора.
 
 Как устроено
 ------------
-`run_all_checks(config)` вызывает шесть независимых проверок и возвращает
+`run_all_checks(config)` вызывает семь независимых проверок и возвращает
 `list[EnvFinding]` (`kind` / `detail` / `severity`). Каждая проверка:
 
   * самостоятельна — её можно вызвать отдельно, она не зависит от остальных;
@@ -36,6 +56,8 @@
     `QuickTime Player` — они лежат в системных каталогах, но нас интересуют);
   * зеркалированный второй экран (проектор на демо) не считается вторым
     монитором — считаются только логически независимые экраны;
+  * спаренные, но не подключённые Bluetooth-наушники не считаются подключёнными:
+    в списке пар у любого ноутбука лежат десятки чужих устройств из прошлого;
   * сила сигнала выражается через `detail["conf"]`: вклад события в risk-score
     равен `RISK_WEIGHTS[kind] * conf`, поэтому «OBS просто установлен» даёт
     куда меньше, чем «OBS Virtual Camera отдаёт кадры прямо сейчас».
@@ -76,6 +98,7 @@ __all__ = [
     "check_screen_recording",
     "check_blacklisted_processes",
     "check_displays",
+    "check_audio_devices",
     "available",
     "describe_checks",
 ]
@@ -95,6 +118,12 @@ _TTL_DISPLAYS = 8.0
 _TTL_PROCESSES = 3.0
 _TTL_STATIC = 300.0
 _TTL_LISTENERS = 10.0
+#: Аудио-устройства — как экраны: наушники могут воткнуть на середине экзамена,
+#: и это надо увидеть на следующем цикле проверок, а не через полчаса.
+_TTL_AUDIO = 6.0
+#: Снимок устройств на старте живёт всю сессию: по нему видно, что появилось
+#: во время экзамена. Сбрасывается только `reset_cache()`.
+_TTL_BASELINE = 24 * 3600.0
 
 
 # ===========================================================================
@@ -676,6 +705,127 @@ _REMOTE_PORTS: dict[int, str] = {
 
 #: Универсальные стримеры из `VIRTUAL_CAMERA_HOST_CATALOG`: запущенный OBS сам
 #: по себе — запись экрана, а не подмена камеры (см. `check_virtual_camera`).
+#: Наушники и гарнитуры: совпадение по ИМЕНИ устройства вывода. Нужен, потому
+#: что транспорт не всегда выдаёт наушники — проводные в разъёме идут как
+#: «встроенные» и отличаются только названием («Внешние наушники»).
+#: Имена приходят локализованными (macOS отдаёт их на языке системы), поэтому
+#: в списке есть и кириллица. Марки, у которых одинаково называются и колонки,
+#: и наушники (JBL, Soundcore, Marshall), сюда НЕ включены: лучше пропустить
+#: такое устройство в слабый сигнал «внешний вывод», чем выдать ложное.
+HEADPHONE_CATALOG: Catalog = (
+    ("AirPods", r"\bair\s?pods?\b"),
+    ("EarPods", r"\bear\s?pods?\b"),
+    ("Beats", r"\bbeats\b|\bpowerbeats\b|\bbeatsx\b"),
+    ("наушники", r"наушник|\bheadphones?\b|\bearphones?\b|\bear\s?buds?\b|\bbuds\b"),
+    ("гарнитура", r"гарнитур|\bheadsets?\b|hands[\s-]?free|\bhsp\b|\bhfp\b"),
+    # Имя активного выхода macOS приходит на языке системы, и «Внешние наушники»
+    # на казахской локализации читается как «Сыртқы құлаққап». Кейс проводится
+    # в университете имени Ахмет Байтұрсынұлы, то есть kk-локаль на машине жюри
+    # вполне вероятна; ru/en-каталога для неё недостаточно. Язык-независимые
+    # пути (Linux Active Port, Windows form_factor, смена имени встроенного
+    # выхода) работают и без этой строки — она их дополняет, а не заменяет.
+    ("құлаққап (kk)", r"құлақ\s?(қап|аспап)|кулакк?ап|құлақшын"),
+    ("навушники (uk)", r"навушник|наушнык"),
+    ("Kopfhörer (de)", r"kopfh(ö|oe)rer|ohrh(ö|oe)rer"),
+    ("Kulaklık (tr)", r"kulakl[ıi][ğg][ıi]|kulakl[ıi]k"),
+    ("耳机 / 이어폰 / イヤホン", r"耳机|耳機|イヤホン|이어폰|헤드셋"),
+    ("écouteurs / auriculares", r"(é|e)couteur|auricular|aud(í|i)fono|cuffie|"
+                                r"s[łl]uchawk|h(ö|o)rlurar|kuulokke|c(ă|a)[şs]ti"),
+    ("Sony WH/WF", r"\bw[hf]-?1000\b|\bw[hf]-?c\d|\bwi-?c\d"),
+    ("Bose", r"\bbose\b|quiet\s?comfort|\bqc\s?\d{2}\b|\bsoundsport\b"),
+    ("Sennheiser", r"\bsennheiser\b|\bmomentum\s?(true\s?)?wireless\b"),
+    ("Jabra", r"\bjabra\b|\bevolve\b|\belite\s?\d"),
+    ("Poly / Plantronics", r"\bplantronics\b|\bpoly\s|\bvoyager\b|\bblackwire\b|\bsavi\b"),
+    ("HyperX", r"\bhyperx\b|\bcloud\s?(ii|alpha|stinger)\b"),
+    ("SteelSeries Arctis", r"\bsteel\s?series\b|\barctis\b"),
+    ("Razer", r"\brazer\b|\bkraken\b|\bbarracuda\b|\bblackshark\b"),
+    ("Logitech headset", r"\blogitech\s?(h\d|g\d|zone|astro)\b|\bastro\s?a\d{2}\b"),
+    ("Corsair HS", r"\bcorsair\s|\bhs\d{2}\b|\bvoid\b|\bvirtuoso\b"),
+    ("Galaxy / Pixel / FreeBuds", r"galaxy\s?buds|pixel\s?buds|free\s?buds|free\s?lace"),
+    ("Nothing Ear", r"\bnothing\s?ear\b"),
+    ("Redmi / Mi Buds", r"\b(redmi|mi|poco)\s?(air|buds)\b"),
+    ("Soundcore Liberty", r"\bliberty\s?\d\b|\bsoundcore\s?(liberty|space|life)\b"),
+)
+
+#: Виртуальные аудио-устройства: маршрутизируют звук мимо динамика и мимо
+#: наблюдения. Сами по себе они стоят у половины пользователей (Teams, Zoom,
+#: Krisp), поэтому в находку попадают ТОЛЬКО когда выбраны активным выводом.
+VIRTUAL_AUDIO_CATALOG: Catalog = (
+    ("BlackHole", r"\bblack\s?hole\b"),
+    ("Loopback", r"\bloopback\b"),
+    ("Soundflower", r"\bsound\s?flower\b"),
+    ("VB-Audio / VB-Cable", r"\bvb-?(audio|cable)\b|\bcable\s?(input|output)\b"),
+    ("Virtual Audio Cable", r"virtual\s?audio\s?(cable|device)\b"),
+    ("VoiceMeeter", r"\bvoice\s?meeter\b"),
+    ("Audio Hijack / iShowU", r"\baudio\s?hijack\b|\bishowu\b|\binstant\s?on\b"),
+    ("Krisp", r"\bkrisp\b"),
+    ("Microsoft Teams Audio", r"teams\s?audio"),
+    ("Zoom Audio Device", r"zoom\s?audio"),
+    ("Elgato Wave Link", r"wave\s?link\b"),
+    ("Discord Audio", r"discord\s?audio"),
+    ("OBS Audio", r"obs\s?(virtual\s?)?audio"),
+)
+
+_RX_HEADPHONE = _compile(HEADPHONE_CATALOG)
+_RX_VIRTUAL_AUDIO = _compile(VIRTUAL_AUDIO_CATALOG)
+
+#: Linux: имя/тип порта вывода, который включается при подключении в разъём
+#: 3.5 мм. Это jack sense от драйвера, а не название устройства, поэтому
+#: сигнал одинаков на любой локализации системы.
+_RX_LINUX_HEADPHONE_PORT = re.compile(
+    r"analog-output-(headphones?|headset)|\bheadphones?\b|\bheadset\b|"
+    r"\bhands[\s-]?free\b",
+    re.IGNORECASE,
+)
+
+#: Слова строки из списков оператора (`allowed_audio_devices`,
+#: `headphone_names`). Цифры нужны отдельно: модель гарнитуры это «h390»,
+#: «wh-1000xm5», «evolve 65».
+_RX_WORD = re.compile(r"[0-9a-zа-яёіїєґәғқңөұүһ]+", re.IGNORECASE)
+
+#: Строка порта в `pactl list sinks`:
+#: «\t\tanalog-output-headphones: Headphones (type: Headphones, ..., available)»
+_RX_PACTL_PORT = re.compile(
+    r"^\s+(?P<id>[A-Za-z0-9_.\-\[\]]+):\s+(?P<desc>.+?)\s*\((?P<attrs>[^()]*)\)\s*$"
+)
+
+#: Типы устройств Bluetooth, которые являются личным аудио-каналом.
+#: `device_minorType` надёжнее имени: имя пользователь меняет как хочет
+#: («etoevelina», «К♥»), а тип приходит из профиля устройства.
+_BT_HEADPHONE_TYPES = frozenset({
+    "headphones", "headset", "hands-free", "handsfree", "hands free",
+    "earbuds", "earphones", "audio", "headphone",
+})
+#: Колонка — тоже внешний вывод, но звук в ней слышат все. Отдельный, слабый
+#: сигнал: это не приватный канал подсказки.
+_BT_SPEAKER_TYPES = frozenset({"speaker", "speakers", "loudspeaker"})
+
+#: Транспорт CoreAudio -> человекочитаемое название для отчёта.
+_AUDIO_TRANSPORT_RU: dict[str, str] = {
+    "coreaudio_device_type_builtin": "встроенное",
+    "coreaudio_device_type_usb": "USB",
+    "coreaudio_device_type_bluetooth": "Bluetooth",
+    "coreaudio_device_type_bluetooth_le": "Bluetooth LE",
+    "coreaudio_device_type_bluetoothle": "Bluetooth LE",
+    "coreaudio_device_type_virtual": "виртуальное",
+    "coreaudio_device_type_aggregate": "агрегированное",
+    "coreaudio_device_type_hdmi": "HDMI",
+    "coreaudio_device_type_displayport": "DisplayPort",
+    "coreaudio_device_type_airplay": "AirPlay",
+    "coreaudio_device_type_pci": "PCI",
+    "coreaudio_device_type_firewire": "FireWire",
+    "coreaudio_device_type_thunderbolt": "Thunderbolt",
+    "coreaudio_device_type_continuity_capture": "Continuity (iPhone)",
+}
+
+#: Form factor конечной точки Windows (PKEY_AudioEndpoint_FormFactor).
+_WIN_FORM_FACTOR: dict[int, str] = {
+    0: "сетевое устройство", 1: "динамики", 2: "линейный выход",
+    3: "наушники", 4: "микрофон", 5: "гарнитура", 6: "телефонная трубка",
+    7: "цифровой проход", 8: "S/PDIF", 9: "звук через дисплей",
+    10: "тип не указан",
+}
+
 _VCAM_GENERIC_HOSTS = frozenset({
     "OBS Studio (источник виртуальной камеры)",
     "Streamlabs Desktop",
@@ -1807,6 +1957,891 @@ def check_displays(config: Any = None) -> list[EnvFinding]:
 
 
 # ===========================================================================
+# 7. Аудио-устройства вывода (замена аудио-анализа; Р-10, угроза У-02)
+# ===========================================================================
+def _audio_devices() -> list[dict[str, Any]]:
+    """Аудио-устройства системы с ролью, транспортом и признаком «активный вывод».
+
+    Схема строки:
+        name, transport, transport_raw, builtin, output, input,
+        active_output (None — платформа не сообщает), source, manufacturer.
+    """
+    cached = _CACHE.get("audio_devices", _TTL_AUDIO)
+    if cached is not None:
+        return list(cached)
+
+    devices: list[dict[str, Any]] = []
+    try:
+        if IS_MAC:
+            devices.extend(_audio_devices_mac())
+        elif IS_WIN:
+            devices.extend(_audio_devices_win())
+        elif IS_LINUX:
+            devices.extend(_audio_devices_linux())
+    except Exception:
+        pass
+
+    unique: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for dev in devices:
+        key = (str(dev.get("name", "")).lower(), str(dev.get("transport_raw", "")))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(dev)
+    return _CACHE.put("audio_devices", unique)
+
+
+def _audio_devices_mac() -> list[dict[str, Any]]:
+    """macOS: `system_profiler -json SPAudioDataType`.
+
+    Активный выход помечен `coreaudio_default_audio_output_device: spaudio_yes`
+    (или `_properties: coreaudio_default_audio_system_device`). Имена приходят
+    на языке системы — «Динамики MacBook Air», — поэтому встроенность
+    определяется по транспорту, а не по названию.
+    """
+    data = _system_profiler("SPAudioDataType", _TTL_AUDIO)
+    out: list[dict[str, Any]] = []
+    for block in data or []:
+        if not isinstance(block, dict):
+            continue
+        for item in block.get("_items") or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("_name") or "").strip()
+            if not name:
+                continue
+            transport_raw = str(item.get("coreaudio_device_transport") or "").strip()
+            props = str(item.get("_properties") or "")
+            default_out = str(item.get("coreaudio_default_audio_output_device") or "")
+            system_out = str(item.get("coreaudio_default_audio_system_device") or "")
+            out.append({
+                "name": name,
+                "transport": _AUDIO_TRANSPORT_RU.get(
+                    transport_raw.lower(), transport_raw or "неизвестный интерфейс"),
+                "transport_raw": transport_raw,
+                "builtin": transport_raw.lower().endswith("builtin"),
+                "output": bool(item.get("coreaudio_device_output")
+                               or item.get("coreaudio_output_source")),
+                "input": bool(item.get("coreaudio_device_input")
+                              or item.get("coreaudio_input_source")),
+                "active_output": (default_out.endswith("yes")
+                                  or system_out.endswith("yes")
+                                  or "default_audio_system_device" in props),
+                "manufacturer": str(item.get("coreaudio_device_manufacturer") or "") or None,
+                "source": "system_profiler",
+            })
+    return out
+
+
+def _audio_devices_win() -> list[dict[str, Any]]:
+    """Windows: конечные точки вывода из реестра MMDevices.
+
+    Берём только `DeviceState == 1` (устройство активно и подключено). Form
+    factor (`3` — наушники, `5` — гарнитура) и шина (`BTHENUM` — Bluetooth)
+    приходят прямо из свойств конечной точки, то есть это не догадка по имени.
+
+    Честное ограничение: какое из устройств выбрано системным выводом, реестр
+    надёжно не сообщает, поэтому `active_output` здесь None, и решение строится
+    на типе устройства, а не на маршруте звука.
+    """
+    if not IS_WIN:
+        return []
+    try:
+        import winreg  # type: ignore
+    except Exception:
+        return []
+
+    # PKEY_* конечной точки: имя, описание, form factor, имя перечислителя шины.
+    key_friendly = "{b3f8fa53-0004-438e-9003-51a46e139bfc},6"
+    key_desc = "{a45c254e-df1c-4efd-8020-67d146a850e0},2"
+    key_form = "{1da5d803-d492-4edd-8c23-e0c0ffee7f0e},0"
+    key_bus = "{a45c254e-df1c-4efd-8020-67d146a850e0},24"
+
+    base = (r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render")
+    out: list[dict[str, Any]] = []
+    try:
+        root = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base)
+    except Exception:
+        return []
+    try:
+        index = 0
+        while True:
+            try:
+                child = winreg.EnumKey(root, index)
+            except OSError:
+                break
+            index += 1
+            try:
+                with winreg.OpenKey(root, child) as node:
+                    state = 0
+                    try:
+                        state = int(winreg.QueryValueEx(node, "DeviceState")[0])
+                    except Exception:
+                        state = 0
+                    if state != 1:  # 2 — отключено, 4 — отсутствует, 8 — не воткнуто
+                        continue
+                    values: dict[str, Any] = {}
+                    with winreg.OpenKey(node, "Properties") as props:
+                        for prop in (key_friendly, key_desc, key_form, key_bus):
+                            try:
+                                values[prop] = winreg.QueryValueEx(props, prop)[0]
+                            except Exception:
+                                continue
+            except Exception:
+                continue
+
+            name = str(values.get(key_friendly) or values.get(key_desc) or "").strip()
+            if not name:
+                continue
+            try:
+                form = int(values.get(key_form, 10))
+            except Exception:
+                form = 10
+            bus = str(values.get(key_bus) or "").strip()
+            bus_l = bus.lower()
+            if "bthenum" in bus_l or "bthhfenum" in bus_l:
+                transport = "Bluetooth"
+            elif "usb" in bus_l:
+                transport = "USB"
+            elif "hdaudio" in bus_l:
+                transport = "встроенное"
+            else:
+                transport = bus or "неизвестный интерфейс"
+            out.append({
+                "name": name,
+                "transport": transport,
+                "transport_raw": bus,
+                "builtin": "hdaudio" in bus_l and form in (1, 2),
+                "output": True,
+                "input": False,
+                "active_output": None,   # реестр не сообщает текущий вывод
+                "form_factor": _WIN_FORM_FACTOR.get(form, "тип не указан"),
+                "form_factor_id": form,
+                "manufacturer": None,
+                "source": "registry",
+            })
+    finally:
+        try:
+            root.Close()
+        except Exception:
+            pass
+    return out
+
+
+def _linux_transport(sink_name: str) -> str:
+    """Транспорт по имени sink'а PulseAudio/PipeWire."""
+    low = str(sink_name or "").lower()
+    if "bluez" in low or "bluetooth" in low:
+        return "Bluetooth"
+    if "usb" in low:
+        return "USB"
+    if "hdmi" in low:
+        return "HDMI"
+    if "pci" in low or "analog" in low:
+        return "встроенное"
+    return "неизвестный интерфейс"
+
+
+def _pactl_sinks() -> list[dict[str, Any]]:
+    """`pactl list sinks` -> [{name, description, active_port, ports}].
+
+    Нужна именно подробная форма. `pactl list short sinks` не содержит
+    `Active Port`, а при подключении наушников в разъём 3.5 мм меняется ТОЛЬКО
+    он: имя sink'а, транспорт и `Default Sink` остаются прежними. Без этого
+    разбора проводная гарнитура на Linux не видна вообще — а Linux это и есть
+    платформа компьютерных классов.
+
+    `_run` выставляет `LC_ALL=C`, поэтому ключи и типы портов приходят на
+    английском независимо от языка системы.
+    """
+    out: list[dict[str, Any]] = []
+    text = _run(["pactl", "list", "sinks"], timeout=_T_FAST)
+    if not text:
+        return out
+    cur: dict[str, Any] | None = None
+    in_ports = False
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line:
+            continue
+        if not line[0].isspace():                      # «Sink #0»
+            if cur is not None:
+                out.append(cur)
+            cur = ({"name": "", "description": "", "active_port": "",
+                    "active_port_label": "", "ports": {}}
+                   if line.lower().startswith("sink") else None)
+            in_ports = False
+            continue
+        if cur is None:
+            continue
+        stripped = line.strip()
+        low = stripped.lower()
+        if low == "ports:":
+            in_ports = True
+            continue
+        if in_ports:
+            match = _RX_PACTL_PORT.match(line)
+            if match is not None:
+                attrs = match.group("attrs").lower()
+                cur["ports"][match.group("id")] = {
+                    "description": match.group("desc"),
+                    # «not available» = в разъёме ничего нет (jack sense)
+                    "available": "not available" not in attrs
+                                 and "unavailable" not in attrs,
+                    "attrs": match.group("attrs"),
+                }
+                continue
+            in_ports = False                            # секция портов кончилась
+        if low.startswith("name:"):
+            cur["name"] = stripped.split(":", 1)[1].strip()
+        elif low.startswith("description:"):
+            cur["description"] = stripped.split(":", 1)[1].strip()
+        elif low.startswith("active port:"):
+            cur["active_port"] = stripped.split(":", 1)[1].strip()
+    if cur is not None:
+        out.append(cur)
+    for sink in out:
+        port = str(sink.get("active_port") or "")
+        info = (sink.get("ports") or {}).get(port) or {}
+        sink["active_port_label"] = str(info.get("description") or port)
+    return out
+
+
+def _alsa_jack_headphones() -> list[str]:
+    """Jack sense через `amixer`: элементы «Headphone Jack» со значением on.
+
+    Фолбэк для машин без PulseAudio/PipeWire. Сигнал тот же, что и
+    `Active Port` у pactl — он приходит от драйвера, а не из имени устройства,
+    поэтому от локализации не зависит.
+    """
+    root = Path("/proc/asound")
+    if not root.is_dir():
+        return []
+    found: list[str] = []
+    try:
+        cards = sorted(root.glob("card[0-9]*"))
+    except Exception:
+        return []
+    for card in cards[:4]:
+        index = card.name[4:]
+        text = _run(["amixer", "-c", index, "contents"], timeout=_T_FAST) or ""
+        control = ""
+        for line in text.splitlines():
+            low = line.strip().lower()
+            if low.startswith("numid="):
+                match = re.search(r"name='([^']*)'", line)
+                control = match.group(1) if match else ""
+                continue
+            if not control:
+                continue
+            if "values=on" in low.replace(" ", ""):
+                if ("jack" in control.lower()
+                        and _RX_LINUX_HEADPHONE_PORT.search(control)):
+                    found.append(f"{control} (card {index})")
+                control = ""
+    return found
+
+
+def _audio_devices_linux() -> list[dict[str, Any]]:
+    """Linux: выходы PulseAudio/PipeWire (`pactl`), иначе карты ALSA.
+
+    Ключевой момент — `Active Port`. Проводные наушники в разъёме 3.5 мм не
+    создают нового sink'а и не меняют `Default Sink`: ядро переключает только
+    активный порт на `analog-output-headphones`. Этот факт и есть подключение
+    (У-02); он приходит от драйвера, поэтому читается одинаково на русской,
+    английской и казахской локализации.
+
+    Признак уезжает в строку устройства как `form_factor: "наушники"` — ровно
+    то поле, которое `check_audio_devices()` уже читает для Windows, где тип
+    конечной точки тоже сообщает сама система.
+    """
+    if not IS_LINUX:
+        return []
+    out: list[dict[str, Any]] = []
+    default_sink = ""
+    info = _run(["pactl", "info"], timeout=_T_FAST)
+    for line in (info or "").splitlines():
+        if line.lower().startswith("default sink:"):
+            default_sink = line.split(":", 1)[1].strip()
+            break
+
+    for sink in _pactl_sinks():
+        sink_name = str(sink.get("name") or "")
+        if not sink_name:
+            continue
+        port = str(sink.get("active_port") or "")
+        port_label = str(sink.get("active_port_label") or "")
+        jack = bool(_RX_LINUX_HEADPHONE_PORT.search(f"{port} {port_label}"))
+        transport = _linux_transport(sink_name)
+        label = str(sink.get("description") or sink_name)
+        out.append({
+            "name": f"{label} — {port_label}" if port_label else label,
+            "transport": transport,
+            "transport_raw": sink_name,
+            "builtin": transport == "встроенное",
+            "output": True,
+            "input": False,
+            "active_output": bool(default_sink and sink_name == default_sink),
+            "form_factor": "наушники" if jack else "",
+            "active_port": port,
+            "active_port_label": port_label,
+            "jack_sense": jack,
+            "manufacturer": None,
+            "source": "pactl",
+        })
+    if out:
+        return out
+
+    # Подробная форма недоступна (старый pactl, нет прав) — короткая лучше, чем
+    # ничего, но наушники в разъёме в ней не видны: это записано в LIMITATIONS.
+    sinks = _run(["pactl", "list", "short", "sinks"], timeout=_T_FAST)
+    for line in (sinks or "").splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        sink = parts[1]
+        transport = _linux_transport(sink)
+        out.append({
+            "name": sink, "transport": transport, "transport_raw": sink,
+            "builtin": transport == "встроенное", "output": True, "input": False,
+            "active_output": bool(default_sink and sink == default_sink),
+            "manufacturer": None, "source": "pactl-short",
+        })
+    if out:
+        return out
+
+    jacks = _alsa_jack_headphones()
+    cards = Path("/proc/asound/cards")
+    if cards.is_file():
+        try:
+            text = cards.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            text = ""
+        for line in text.splitlines():
+            if "]:" not in line:
+                continue
+            name = line.split("]:", 1)[1].strip()
+            if not name:
+                continue
+            low = name.lower()
+            out.append({
+                "name": name,
+                "transport": "USB" if "usb" in low else "встроенное",
+                "transport_raw": "alsa",
+                "builtin": "usb" not in low, "output": True, "input": False,
+                "active_output": None, "manufacturer": None, "source": "alsa",
+            })
+    for jack in jacks:
+        out.append({
+            "name": jack,
+            "transport": "встроенное",
+            "transport_raw": "alsa-jack",
+            "builtin": True, "output": True, "input": False,
+            "active_output": True,
+            "form_factor": "наушники",
+            "jack_sense": True,
+            "manufacturer": None, "source": "amixer",
+        })
+    return out
+
+
+def _bluetooth_audio_devices() -> list[dict[str, Any]]:
+    """Подключённые СЕЙЧАС Bluetooth-аудиоустройства (macOS).
+
+    Разбирается только `device_connected` (и строки с явным
+    `device_isconnected: attrib_Yes`). Список спаренных устройств сознательно
+    НЕ читается: у любого ноутбука там десятки чужих наушников из прошлого, и
+    в отчёте это были бы и ложная улика, и чужие персональные данные.
+
+    Тип берётся из `device_minorType` — имя устройства пользователь меняет
+    произвольно, тип приходит из профиля.
+    """
+    if not IS_MAC:
+        return []
+    cached = _CACHE.get("bt_audio", _TTL_AUDIO)
+    if cached is not None:
+        return list(cached)
+
+    data = _system_profiler("SPBluetoothDataType", _TTL_AUDIO)
+    rows: list[dict[str, Any]] = []
+    paired_audio = 0
+    for block in data or []:
+        if not isinstance(block, dict):
+            continue
+        for list_key, entries in block.items():
+            if not str(list_key).startswith("device_") or not isinstance(entries, list):
+                continue
+            connected_list = str(list_key) == "device_connected"
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                for name, props in entry.items():
+                    if not isinstance(props, dict):
+                        continue
+                    minor = str(props.get("device_minorType") or "").strip().lower()
+                    major = str(props.get("device_majorType") or "").strip().lower()
+                    is_audio = (minor in _BT_HEADPHONE_TYPES
+                                or minor in _BT_SPEAKER_TYPES
+                                or "audio" in major)
+                    if not is_audio:
+                        continue
+                    flag = str(props.get("device_isconnected") or "").strip().lower()
+                    connected = connected_list or flag.endswith("yes")
+                    if not connected:
+                        paired_audio += 1
+                        continue
+                    rows.append({
+                        "name": str(name).strip() or "Bluetooth-устройство",
+                        "minor_type": minor or (major or "audio"),
+                        "speaker": minor in _BT_SPEAKER_TYPES,
+                        "address": props.get("device_address"),
+                        "source": "bluetooth",
+                    })
+    _CACHE.put("bt_audio_paired_count", paired_audio)
+    return _CACHE.put("bt_audio", rows)
+
+
+def _match_catalog(name: str, catalog: tuple[tuple[str, re.Pattern[str]], ...]
+                   ) -> tuple[str, str] | None:
+    """Первое совпадение имени устройства с каталогом -> (метка, шаблон)."""
+    haystack = str(name or "")
+    for label, rx in catalog:
+        if rx.search(haystack):
+            return label, rx.pattern
+    return None
+
+
+def _audio_signature(dev: dict[str, Any]) -> str:
+    """Стабильный ключ устройства для сравнения с базовой линией.
+
+    Активный порт входит в ключ намеренно: на Linux подключение в разъём
+    3.5 мм не создаёт нового sink'а, меняется только порт — без него
+    «появилось во время экзамена» для проводной гарнитуры не определить.
+    """
+    name = str(dev.get("name") or "").lower()
+    port = str(dev.get("active_port") or "")
+    return f"{name}|{dev.get('transport_raw', '')}|{port}"
+
+
+def _audio_baseline(signatures: set[str]) -> set[str]:
+    """Устройства, которых не было на первом прогоне проверки.
+
+    Первый вызов запоминает снимок и возвращает пустое множество: то, что уже
+    подключено на старте, — это состояние рабочего места, а не событие.
+    Дальше любое новое устройство отмечается как появившееся во время экзамена;
+    снимок при этом не обновляется, иначе отметка исчезла бы на следующем цикле.
+    """
+    baseline = _CACHE.get("audio_baseline", _TTL_BASELINE)
+    if baseline is None:
+        _CACHE.put("audio_baseline", set(signatures))
+        _CACHE.put("audio_baseline_ts", time.time())
+        return set()
+    return {sig for sig in signatures if sig not in baseline}
+
+
+def _audio_session_minutes() -> float | None:
+    """Сколько минут прошло с первого прогона проверки. None — прогон первый."""
+    started = _CACHE.get("audio_baseline_ts", _TTL_BASELINE)
+    if started is None:
+        return None
+    try:
+        return max(0.0, (time.time() - float(started)) / 60.0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _builtin_output_change(outputs: list[dict[str, Any]]) -> str | None:
+    """Имя активного ВСТРОЕННОГО выхода изменилось с первого прогона.
+
+    Язык-независимый признак переключения на разъём 3.5 мм на macOS. Имя
+    выхода приходит на языке системы («Динамики MacBook Air» ->
+    «Внешние наушники» -> «Сыртқы құлаққап»), а сам факт смены имени при
+    неизменном транспорте — нет. Нужен потому, что для встроенного выхода
+    фолбэк «активно и не встроенное» не берётся (`builtin=True`), и опора
+    остаётся только на каталог имён.
+
+    Возвращает новое имя активного встроенного выхода или None.
+    """
+    active = next((d for d in outputs
+                   if d.get("active_output") and d.get("builtin")), None)
+    name = str(active.get("name") or "").strip() if active else ""
+    stored = _CACHE.get("audio_builtin_active", _TTL_BASELINE)
+    if stored is None:
+        _CACHE.put("audio_builtin_active", name)
+        return None
+    if name and str(stored) and name.lower() != str(stored).lower():
+        return name
+    return None
+
+
+def _name_matches(haystack_low: str, needle_low: str) -> bool:
+    """Строка оператора против описания устройства: подстрока ИЛИ все слова.
+
+    Имена устройств в ОС содержат лишние слова («Logitech USB Headset H390»,
+    «Sony WH-1000XM5»), а оператор пишет «logitech h390» или «sony wh 1000».
+    Проверка только по непрерывной подстроке такие записи не находит, то есть
+    список оператора молча не работает. Требуются ВСЕ слова, а не любое.
+    """
+    if not needle_low:
+        return False
+    if needle_low in haystack_low:
+        return True
+    words = _RX_WORD.findall(needle_low)
+    return bool(words) and all(word in haystack_low for word in words)
+
+
+def _audio_device_allowed(dev: dict[str, Any],
+                          patterns: Sequence[str]) -> str | None:
+    """Устройство из списка `env.allowed_audio_devices` -> совпавшая строка.
+
+    Сравниваются имя, производитель, транспорт и тип конечной точки — все эти
+    поля уже лежат в строке `_audio_devices()`. Регистр не важен, регулярных
+    выражений оператор не пишет.
+
+    Совпадением считается ЛЮБОЕ из двух:
+
+    * строка целиком встречается в описании устройства («usb», «logitech»);
+    * ВСЕ слова строки встречаются в описании, пусть и не рядом. Это главный
+      случай: ОС отдаёт «Logitech USB Headset H390», а оператор пишет в список
+      «logitech h390» — то, как гарнитура называется в накладной. Проверка по
+      непрерывной подстроке такую запись молча не находила, и выданная
+      преподавателем гарнитура продолжала давать инцидент при заполненном
+      списке разрешённых.
+
+    Требуются все слова, а не любое: «logitech h390» не должен разрешать
+    чужую гарнитуру только потому, что она тоже Logitech.
+    """
+    if not patterns:
+        return None
+    haystack = " ".join(
+        str(dev.get(key) or "") for key in
+        ("name", "manufacturer", "transport", "transport_raw", "form_factor",
+         "match", "minor_type")
+    ).lower()
+    for pattern in patterns:
+        needle = str(pattern).strip().lower()
+        if not needle:
+            continue
+        if _name_matches(haystack, needle):
+            return str(pattern).strip()
+    return None
+
+
+#: Вид устройства -> (контекст, действие). Текст события собирается из этих
+#: двух строк, поэтому «Попросите отключить устройство» не прилетает монитору
+#: по HDMI, а виртуальному выводу достаётся исполнимое действие. Формула гайда:
+#: наблюдаемый факт -> контекст -> понятное действие; оценок и обвинений нет.
+_AUDIO_REASONS: dict[str, tuple[str, str]] = {
+    "headphones": (
+        "к компьютеру подключена гарнитура или наушники — звук экзамена "
+        "слышит только студент",
+        "Попросите отключить устройство и продолжить со встроенным динамиком",
+    ),
+    "virtual": (
+        "вывод звука направлен в виртуальное аудио-устройство — куда уходит "
+        "звук экзамена, системе не видно",
+        "Попросите переключить вывод звука на встроенный динамик",
+    ),
+    "speaker": (
+        "активна внешняя аудио-колонка — звук экзамена выводится за пределы "
+        "компьютера",
+        "Проверьте, допустим ли внешний вывод звука по условиям экзамена",
+    ),
+    "external": (
+        "активное устройство вывода звука — не встроенный динамик, звук "
+        "экзамена уходит на внешнее устройство",
+        "Проверьте, допустим ли внешний вывод звука по условиям экзамена",
+    ),
+}
+
+
+def check_audio_devices(config: Any = None) -> list[EnvFinding]:
+    """Наушники и гарнитуры: личный аудио-канал во время экзамена (У-02).
+
+    Это ЗАМЕНА анализа звука, а не дополнение к нему (Р-10). Анализ сигнала в
+    аудитории меряет помещение, а не студента; состояние ОС от шума не зависит
+    вообще. Поэтому проверка работает в обоих режимах `exam_mode` и не требует
+    микрофона.
+
+    ЧТО ЭТА ПРОВЕРКА ВИДИТ И ЧЕГО НЕ ВИДИТ — читать до того, как ссылаться
+    на неё как на закрытие У-02:
+
+    * видит устройства, подключённые К ЭКЗАМЕНАЦИОННОМУ КОМПЬЮТЕРУ: BT-пару с
+      этим ноутбуком, USB-гарнитуру, виртуальный вывод, разъём 3.5 мм
+      (macOS — по имени и по смене имени активного встроенного выхода;
+      Linux — по `Active Port`; Windows — по типу конечной точки);
+    * НЕ видит гарнитуру, спаренную с телефоном студента, и наушник, воткнутый
+      в телефон: за пределы этой машины не смотрит ни одна проверка модуля. Это
+      не остаточный риск, а отдельный канал: он закрывается очным контролем в
+      аудитории и fusion-связкой «длинная пауза -> мгновенный развёрнутый
+      ответ», а на самом экзаменационном компьютере канал связи независимо
+      ловит `check_blacklisted_processes` (мессенджеры);
+    * ложные срабатывания возможны и здесь: внешняя колонка, звук через HDMI
+      проектора, выданная преподавателем гарнитура. Поэтому сила сигнала
+      градуирована через `conf`, а не сведена к «инцидент / не инцидент», и
+      есть список разрешённых устройств.
+
+    Что считается сигналом, от сильного к слабому:
+
+    1. наушники или гарнитура активны как вывод и ПОЯВИЛИСЬ во время сессии
+       (0.95) — звук экзамена идёт в ухо студента и больше никуда;
+    2. подключённое во время сессии Bluetooth-аудиоустройство типа
+       Headphones/Headset (0.9);
+    3. то же, но устройство было подключено ДО старта (0.7): это состояние
+       рабочего места, решение принимает человек, а не система;
+    4. активный вывод — виртуальное аудио-устройство (0.7-0.75): куда уходит
+       звук, системе не видно;
+    5. наушники подключены, но вывод пока на встроенный динамик (0.5-0.6) —
+       переключение занимает один клик;
+    6. активный вывод — любое другое не встроенное устройство (0.45-0.5):
+       внешняя колонка или звук через HDMI слышны всей аудитории.
+
+    Признак «появилось во время сессии» теперь РАЗВОДИТ случаи по весу, а не
+    добавляет 0.05: «забыл наушники в разъёме с утра» не должно само по себе
+    пробивать порог предупреждения, а «подключил на середине экзамена» —
+    должно. Признак уходит и в текст события отдельной фразой, не только в
+    `detail`.
+
+    Две независимые ручки на случай, когда звук разрешён:
+
+    * `env.allowed_audio_devices` — список разрешённых устройств по имени,
+      производителю или транспорту («logitech h390», «usb»). Проверяется ПОСЛЕ
+      перечисления и снимает только совпавшие устройства: выданная
+      преподавателем гарнитура перестаёт быть инцидентом, а виртуальный вывод
+      и чужие AirPods рядом — остаются;
+    * `env.allow_headphones` — разрешить наушники как класс (аудирование в
+      языковом тесте). Гасит только наушники и колонки; виртуальное
+      аудио-устройство и внешний вывод продолжают фиксироваться — иначе один
+      флаг выключал бы заодно детект подмены аудио-маршрута.
+    """
+    try:
+        started = time.perf_counter()
+        if not _cfg_bool(config, "env", "check_audio_devices", True):
+            return []
+        allow_headphones = _cfg_bool(config, "env", "allow_headphones", False)
+        allowed_patterns = _cfg_list(config, "env", "allowed_audio_devices")
+
+        devices = _audio_devices()
+        bt_rows = _bluetooth_audio_devices()
+        extra_words = [w.strip().lower() for w in _cfg_list(config, "env", "headphone_names")
+                       if w.strip()]
+
+        outputs = [d for d in devices if d.get("output")]
+        signatures = {_audio_signature(d) for d in outputs}
+        signatures |= {f"bt:{str(r.get('name','')).lower()}" for r in bt_rows}
+        fresh = _audio_baseline(signatures)
+        # смена имени активного встроенного выхода = переключение на разъём,
+        # сигнал не зависит от языка системы (см. `_builtin_output_change`)
+        jack_switch = _builtin_output_change(outputs)
+
+        matched: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        active_name: str | None = None
+
+        for dev in outputs:
+            name = str(dev.get("name") or "")
+            low = name.lower()
+            active = bool(dev.get("active_output"))
+            builtin = bool(dev.get("builtin"))
+            if active:
+                active_name = name
+
+            hit = _match_catalog(name, _RX_HEADPHONE)
+            virtual = _match_catalog(name, _RX_VIRTUAL_AUDIO)
+            # то же правило сравнения, что и у списка разрешённых: оператор
+            # пишет «sony wh 1000», а ОС отдаёт «Sony WH-1000XM5»
+            custom = next((w for w in extra_words if _name_matches(low, w)), None)
+            form = str(dev.get("form_factor") or "")
+
+            kind = ""
+            label = ""
+            pattern = ""
+            if hit:
+                kind, label, pattern = "headphones", hit[0], hit[1]
+            elif custom:
+                kind, label, pattern = "headphones", "список проктора", custom
+            elif form in ("наушники", "гарнитура"):
+                # Тип конечной точки сообщает сама система: Windows —
+                # form_factor реестра, Linux — `Active Port` драйвера.
+                kind, label, pattern = "headphones", form, "form_factor"
+            elif jack_switch and active and builtin and name == jack_switch:
+                # Имя активного встроенного выхода сменилось: так выглядит
+                # подключение в разъём 3.5 мм на любой локализации.
+                kind = "headphones"
+                label = "смена активного встроенного выхода"
+                pattern = "builtin_output_changed"
+            elif virtual and active:
+                kind, label, pattern = "virtual", virtual[0], virtual[1]
+            elif active and not builtin:
+                kind, label = "external", dev.get("transport") or "внешний интерфейс"
+            else:
+                continue
+
+            signature = _audio_signature(dev)
+            appeared = signature in fresh or pattern == "builtin_output_changed"
+
+            # Разрешённые устройства снимаются ПОСЛЕ перечисления и только те,
+            # что совпали: виртуальный аудио-маршрут не разрешает ни одна ручка.
+            allowed_hit = _audio_device_allowed(dev, allowed_patterns)
+            if allowed_hit and kind != "virtual":
+                skipped.append({"name": name, "kind": kind,
+                                "reason": "allowed_audio_devices",
+                                "rule": allowed_hit})
+                continue
+            if allow_headphones and kind in ("headphones", "speaker"):
+                skipped.append({"name": name, "kind": kind,
+                                "reason": "allow_headphones", "rule": "env.allow_headphones"})
+                continue
+
+            if kind == "headphones":
+                # Разница между «подключил во время экзамена» и «забыл
+                # в разъёме с утра» должна быть видна в весе, а не в detail.
+                conf = (0.95 if appeared else 0.7) if active else (0.6 if appeared else 0.5)
+            elif kind == "virtual":
+                conf = 0.75 if appeared else 0.7
+            else:
+                conf = 0.5 if appeared else 0.45
+
+            row = dict(dev)
+            row.update({
+                "match": label,
+                "pattern": pattern,
+                "kind": kind,
+                "conf": round(conf, 2),
+                "active_output": dev.get("active_output"),
+                "appeared_during_exam": appeared,
+            })
+            matched.append(row)
+
+        # Bluetooth: устройство может быть подключено и держать HFP-канал,
+        # даже если системный вывод остался на динамике ноутбука.
+        known = {str(r.get("name", "")).lower() for r in matched}
+        for bt in bt_rows:
+            name = str(bt.get("name") or "")
+            low = name.lower()
+            if low in known:
+                continue
+            speaker = bool(bt.get("speaker"))
+            kind = "speaker" if speaker else "headphones"
+            allowed_hit = _audio_device_allowed(dict(bt, transport="Bluetooth"),
+                                                allowed_patterns)
+            if allowed_hit:
+                skipped.append({"name": name, "kind": kind,
+                                "reason": "allowed_audio_devices", "rule": allowed_hit})
+                continue
+            if allow_headphones:
+                skipped.append({"name": name, "kind": kind,
+                                "reason": "allow_headphones", "rule": "env.allow_headphones"})
+                continue
+            appeared = f"bt:{low}" in fresh
+            if speaker:
+                conf = 0.5 if appeared else 0.45
+            else:
+                conf = 0.9 if appeared else 0.7
+            matched.append({
+                "name": name,
+                "transport": "Bluetooth",
+                "transport_raw": "bluetooth",
+                "builtin": False,
+                "output": True,
+                "input": None,
+                "active_output": None,
+                "kind": "speaker" if speaker else "headphones",
+                "match": f"Bluetooth: {bt.get('minor_type')}",
+                "pattern": "device_minorType",
+                "conf": round(conf, 2),
+                "appeared_during_exam": appeared,
+                "source": "bluetooth",
+            })
+
+        if not matched:
+            return []
+
+        matched.sort(key=lambda r: (-float(r.get("conf") or 0.0),
+                                    not bool(r.get("active_output"))))
+        conf = max(float(r.get("conf") or 0.0) for r in matched)
+        appeared_any = any(r.get("appeared_during_exam") for r in matched)
+        kinds = {str(r.get("kind")) for r in matched}
+
+        phrases: list[str] = []
+        for row in matched[:4]:
+            bits = [str(row.get("transport") or "")]
+            if row.get("active_output"):
+                bits.append("активный вывод")
+            elif row.get("active_output") is None:
+                bits.append("подключено")
+            else:
+                bits.append("подключено, вывод на встроенный динамик")
+            if row.get("appeared_during_exam"):
+                bits.append("появилось во время экзамена")
+            phrases.append(f"«{row.get('name')}» ({', '.join(b for b in bits if b)})")
+        summary = "; ".join(phrases)
+
+        # Формула гайда: наблюдаемый факт -> контекст -> понятное действие.
+        # `reason` и `advice` градуированы по виду устройства и подставляются
+        # в текст события движком: иначе и HDMI-монитор, и BlackHole получали
+        # бы одно предложение про гарнитуру и неисполнимое «отключите».
+        # Обвинений ни в одной строке быть не должно.
+        primary = next((k for k in ("headphones", "virtual", "speaker", "external")
+                        if k in kinds), "external")
+        reason, advice = _AUDIO_REASONS[primary]
+
+        minutes = _audio_session_minutes()
+        if appeared_any:
+            when = "устройство появилось во время сессии"
+            if minutes is not None and minutes >= 1.0:
+                when += f", через {int(minutes)} мин от старта"
+        else:
+            when = ("устройство было подключено до начала сессии: это состояние "
+                    "рабочего места, а не событие экзамена")
+
+        if conf >= 0.9:
+            severity = Severity.HIGH
+        elif conf >= 0.6:
+            severity = Severity.MEDIUM
+        else:
+            severity = Severity.LOW
+
+        head = matched[0]
+        detail: dict[str, Any] = {
+            "conf": round(conf, 2),
+            "summary": summary,
+            # reason / when / advice подставляются в текст события движком
+            # ({reason_sentence}, {when_sentence}, {advice_sentence})
+            "reason": reason,
+            "when": when,
+            "advice": advice,
+            "kind": primary,
+            # `name` подставляется в текст события движком ({name_colon})
+            "name": f"{head.get('name')} ({head.get('transport')})",
+            "devices_matched": matched,
+            "devices_allowed": skipped,
+            "allow_headphones": allow_headphones,
+            "allowed_audio_devices": list(allowed_patterns),
+            "active_output": active_name,
+            "appeared_during_exam": appeared_any,
+            "session_minutes": None if minutes is None else round(minutes, 1),
+            "jack_switch": jack_switch,
+            "all_output_devices": [str(d.get("name")) for d in outputs],
+            "bluetooth_connected": [
+                {"name": r.get("name"), "type": r.get("minor_type")} for r in bt_rows
+            ],
+            # только количество: имена спаренных, но не подключённых устройств
+            # в отчёт не попадают (чужие персональные данные, см. докстринг)
+            "bluetooth_paired_audio_ignored": _CACHE.get(
+                "bt_audio_paired_count", _TTL_AUDIO) or 0,
+            "exam_mode": str(_cfg(config, "env", "exam_mode", "") or ""),
+            "platform": sys.platform,
+            "check": "check_audio_devices",
+            "check_ms": round((time.perf_counter() - started) * 1000, 1),
+        }
+        return [EnvFinding(EventKind.AUDIO_DEVICE_CONNECTED, detail, severity)]
+    except Exception as exc:
+        return _self_error("check_audio_devices", exc)
+
+
+# ===========================================================================
 # Сборка
 # ===========================================================================
 def _self_error(check: str, exc: BaseException) -> list[EnvFinding]:
@@ -1835,6 +2870,8 @@ _CHECKS = (
     ("screen_recording", check_screen_recording),
     ("blacklisted_processes", check_blacklisted_processes),
     ("displays", check_displays),
+    # Процессов не касается, поэтому место в порядке дедупликации неважно.
+    ("audio_devices", check_audio_devices),
 )
 
 #: Ключи detail, в которых лежат списки процессов (для дедупликации).
@@ -1911,7 +2948,7 @@ def _dedupe_finding(finding: EnvFinding, claimed: set[int]) -> bool:
     # улики, не связанные с процессами: устройства, экраны, порты, оборудование
     non_process = any(detail.get(key) for key in (
         "devices_matched", "plugins_matched", "displays", "ports", "system",
-        "evidence", "vendors"))
+        "evidence", "vendors", "bluetooth_connected"))
 
     if had_rows and not kept_rows and not non_process:
         return False
@@ -1947,6 +2984,9 @@ def describe_checks() -> list[dict[str, Any]]:
          "ready": psutil_ok, "needs_psutil": True},
         {"check": "displays", "kind": EventKind.MULTIPLE_DISPLAYS.value,
          "ready": True, "needs_psutil": False},
+        # Работает в обоих exam_mode: это чтение состояния ОС, а не анализ звука.
+        {"check": "audio_devices", "kind": EventKind.AUDIO_DEVICE_CONNECTED.value,
+         "ready": IS_MAC or IS_WIN or IS_LINUX, "needs_psutil": False},
     ]
 
 
@@ -1962,6 +3002,13 @@ def _main() -> int:
     parser.add_argument("--json", action="store_true", help="вывод в JSON")
     parser.add_argument("--allow-multi-display", action="store_true",
                         help="не считать нарушением несколько мониторов")
+    parser.add_argument("--audio-devices", action="store_true",
+                        help="показать, что видит проверка аудио-устройств, "
+                             "даже если находок нет")
+    parser.add_argument("--exam-mode", "--mode", dest="exam_mode", default=None,
+                        choices=["classroom", "remote"],
+                        help="режим развёртывания (на эту проверку не влияет, "
+                             "попадает в detail для отчёта)")
     args = parser.parse_args()
 
     config: dict[str, Any] = {"env": {
@@ -1969,12 +3016,35 @@ def _main() -> int:
     }}
     try:
         from config import ProctorConfig  # конфиг проекта, если он доступен
-        cfg, _warnings = ProctorConfig.load()
+        cfg, _warnings = ProctorConfig.load(argv=[])
+        if args.exam_mode:
+            cfg.set_exam_mode(args.exam_mode)
         config = cfg.to_dict()
         if args.allow_multi_display:
             config.setdefault("env", {})["allow_multiple_displays"] = True
     except Exception:
         pass
+
+    if args.audio_devices:
+        devices = _audio_devices()
+        bt = _bluetooth_audio_devices()
+        if args.json:
+            print(json.dumps({"audio_devices": devices, "bluetooth_connected": bt},
+                             ensure_ascii=False, indent=2))
+        else:
+            print(f"Аудио-устройства системы ({len(devices)}):")
+            for dev in devices:
+                roles = ", ".join(r for r in (
+                    "вывод" if dev.get("output") else "",
+                    "вход" if dev.get("input") else "") if r)
+                flags = ", ".join(f for f in (
+                    "встроенное" if dev.get("builtin") else "не встроенное",
+                    "АКТИВНЫЙ ВЫВОД" if dev.get("active_output") else "") if f)
+                print(f"  «{dev.get('name')}» — {dev.get('transport')}; "
+                      f"{roles or 'роль не указана'}; {flags}")
+            print(f"Подключённые Bluetooth-аудиоустройства: "
+                  f"{', '.join(str(r.get('name')) for r in bt) or 'нет'}")
+            print()
 
     started = time.perf_counter()
     findings = run_all_checks(config)
@@ -1985,6 +3055,7 @@ def _main() -> int:
     else:
         print(f"Платформа: {sys.platform}; проверок: {len(_CHECKS)}; "
               f"psutil: {'да' if _psutil() is not None else 'нет'}; "
+              f"режим: {_cfg(config, 'env', 'exam_mode', 'не задан')}; "
               f"время: {elapsed:.0f} мс")
         if not findings:
             print("Находок нет: окружение чистое.")

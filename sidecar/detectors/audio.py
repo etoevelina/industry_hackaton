@@ -1,6 +1,40 @@
 """
 Аудио-канал прокторинга: речь в кадре, чужой голос, подсказка через наушник.
 
+КАНАЛ РЕЖИМНЫЙ: РАБОТАЕТ ТОЛЬКО В `exam_mode == "remote"` (решение Р-10)
+------------------------------------------------------------------------
+Это главное, что нужно знать про модуль. Кейс — ЛОКАЛЬНЫЙ прокторинг, то есть
+типовая среда — компьютерный класс, а не тихая комната. В аудитории на 30 человек
+анализ звука измеряет не студента, а помещение:
+
+  * `VOICE_OTHER` срабатывает на соседа, на преподавателя и на общий гул —
+    «чужой голос» в аудитории звучит непрерывно и по определению;
+  * `SPEECH_WITHOUT_LIP_MOTION` устроен так, что срабатывает на ЛЮБУЮ чужую речь
+    при сомкнутых губах студента. В классе это состояние — норма, а не признак
+    наушника. Главный сигнал канала превращается в постоянное ложное
+    срабатывание именно там, где система должна работать.
+
+Плюс обратная сторона: в аудитории студент и сам говорить не станет, так что
+ловить нечего. Сигнал не просто шумный — он ещё и пустой.
+
+Поэтому:
+
+  * `exam_mode: "classroom"` (значение по умолчанию) — `available()` возвращает
+    False с причиной «отключён в режиме аудитории: высокий уровень ложных
+    срабатываний», `start()` ничего не поднимает, микрофон НЕ захватывается
+    вообще, ни одного наблюдения наружу не уходит;
+  * `exam_mode: "remote"` — канал работает как спроектирован, среда тихая,
+    чужой голос в комнате действительно чужой.
+
+Код анализа при этом не удалён и не упрощён: он нужен для `remote`, и отключение
+режимом — это один флаг, а не отсутствующая функциональность.
+
+Угроза, ради которой канал заводился (У-02, «наушник со связью»), в аудитории
+закрыта другим, детерминированным способом: `env_checks.check_audio_devices()`
+периодически перечисляет активные устройства вывода звука и фиксирует
+подключённые наушники и Bluetooth-гарнитуры. Устройство либо подключено, либо
+нет — шум помещения на это не влияет, ложных нет в принципе.
+
 ПРИВАТНОСТЬ — ЖЁСТКОЕ ТРЕБОВАНИЕ МОДУЛЯ
 ----------------------------------------
 Аудио НЕ СОХРАНЯЕТСЯ НА ДИСК НИ ПРИ КАКИХ УСЛОВИЯХ. Ни wav, ни буферы, ни
@@ -41,6 +75,7 @@ EventEngine:
 
 Деградация
 ----------
+* `exam_mode != "remote"` -> `available() == False`, микрофон не открывается.
 * Нет sounddevice или нет микрофона -> `available() == False`, канал выключен.
 * Нет webrtcvad -> VAD по адаптивной энергии + ZCR (`vad_backend == "energy"`),
   честно слабее, отражается в `confidence`.
@@ -64,7 +99,30 @@ except Exception:  # pragma: no cover
     np = None  # type: ignore[assignment]
 
 
-__all__ = ["AudioMonitor", "AudioObservation", "DEFAULT_AUDIO_CONFIG"]
+__all__ = [
+    "AudioMonitor",
+    "AudioObservation",
+    "DEFAULT_AUDIO_CONFIG",
+    "EXAM_MODE_CLASSROOM",
+    "EXAM_MODE_REMOTE",
+    "CLASSROOM_DISABLED_REASON",
+]
+
+
+# --------------------------------------------------------------------------
+# Режим развёртывания
+# --------------------------------------------------------------------------
+# Значения дублируют `sidecar/config.py` сознательно: детектор по контракту
+# самодостаточен и получает только `config: dict`, импортировать конфиг он не
+# должен. Строки короткие и зафиксированы в Р-10, расхождения не будет.
+EXAM_MODE_CLASSROOM = "classroom"
+EXAM_MODE_REMOTE = "remote"
+
+#: Причина отключения, которую видит HUD и читает отчёт. Формулировка по гайду:
+#: наблюдаемый факт -> контекст -> что это значит. Без обвинений и без «ошибки».
+CLASSROOM_DISABLED_REASON = (
+    "отключён в режиме аудитории: высокий уровень ложных срабатываний"
+)
 
 
 # --------------------------------------------------------------------------
@@ -72,6 +130,9 @@ __all__ = ["AudioMonitor", "AudioObservation", "DEFAULT_AUDIO_CONFIG"]
 # --------------------------------------------------------------------------
 DEFAULT_AUDIO_CONFIG: dict[str, Any] = {
     "enabled": True,
+    # Режим развёртывания. Канал осмыслен только в "remote"; в "classroom"
+    # (значение по умолчанию) он выключен целиком — см. докстринг модуля и Р-10.
+    "exam_mode": EXAM_MODE_CLASSROOM,
     "sample_rate": 16000,          # webrtcvad умеет 8/16/32/48 кГц
     "frame_ms": 30,                # webrtcvad: только 10/20/30 мс
     "device": None,                # None -> системный вход по умолчанию
@@ -146,6 +207,9 @@ class AudioObservation:
     noise_floor: float = 0.0
     frames_analyzed: int = 0
     error: str = ""
+    #: Режим, в котором снято наблюдение. В отчёте по этому полю видно, что
+    #: канал молчал не из-за поломки, а по решению о режиме.
+    exam_mode: str = EXAM_MODE_CLASSROOM
     ts: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
@@ -169,6 +233,7 @@ class AudioObservation:
             "noise_floor": round(float(self.noise_floor), 5),
             "frames_analyzed": self.frames_analyzed,
             "error": self.error,
+            "exam_mode": self.exam_mode,
             "ts": self.ts,
         }
 
@@ -401,6 +466,21 @@ class AudioMonitor:
             return _cfg(self.config, "audio", key, DEFAULT_AUDIO_CONFIG[key])
 
         self.enabled = bool(ac("enabled"))
+
+        # --- режим развёртывания: главный выключатель канала (Р-10) ---
+        # Читается и как `audio.exam_mode`, и как плоский `exam_mode` — порядок
+        # поиска задан `_cfg`. Всё, что не "remote", трактуется как аудитория:
+        # безопасная сторона — молчащий канал, а не ложные обвинения.
+        self.exam_mode = str(ac("exam_mode") or "").strip().lower()
+        if self.exam_mode != EXAM_MODE_REMOTE:
+            self.exam_mode = EXAM_MODE_CLASSROOM
+        self.mode_allows_audio = self.exam_mode == EXAM_MODE_REMOTE
+        #: Причина молчания канала. Пустая строка — канал разрешён режимом.
+        self.disabled_reason = ""
+        if not self.mode_allows_audio:
+            configured = str(_cfg(self.config, "audio", "disabled_reason", "") or "").strip()
+            self.disabled_reason = configured or CLASSROOM_DISABLED_REASON
+
         self.sample_rate = int(ac("sample_rate"))
         self.frame_ms = int(ac("frame_ms"))
         if self.frame_ms not in (10, 20, 30):
@@ -438,6 +518,11 @@ class AudioMonitor:
         self._probe_ok: bool | None = None
         self._started = False
         self.last_error: str = ""
+        if not self.mode_allows_audio:
+            # Причина известна до первого вызова available(): так её видит и лог
+            # загрузки модулей, и HUD, и шапка отчёта.
+            self.last_error = f"аудио-канал {self.disabled_reason}"
+            self._probe_ok = False
 
         self._vad: Any = None
         self._vad_backend = "none"
@@ -480,7 +565,16 @@ class AudioMonitor:
     # Доступность
     # ----------------------------------------------------------------- #
     def available(self) -> bool:
-        """Есть numpy, установлен sounddevice и в системе есть вход для записи."""
+        """Канал разрешён режимом, есть numpy и sounddevice, есть вход записи.
+
+        Проверка режима стоит ПЕРВОЙ и до `_probe()` сознательно: в режиме
+        аудитории микрофон не должен быть даже опрошен. Причина лежит в
+        `last_error` и `disabled_reason` — «отключён в режиме аудитории:
+        высокий уровень ложных срабатываний», а не «микрофон недоступен».
+        """
+        if not self.mode_allows_audio:
+            self.last_error = f"аудио-канал {self.disabled_reason}"
+            return False
         if not self.enabled or np is None:
             return False
         if self._probe_ok is None:
@@ -514,7 +608,13 @@ class AudioMonitor:
     # Запуск / остановка
     # ----------------------------------------------------------------- #
     def start(self) -> None:
-        """Поднять захват. Повторный вызов безопасен; ошибки не бросаются наружу."""
+        """Поднять захват. Повторный вызов безопасен; ошибки не бросаются наружу.
+
+        В режиме аудитории выходит сразу: ни `sounddevice`, ни поток, ни
+        кольцевой буфер не создаются — звук не покидает драйвер.
+        """
+        if not self.mode_allows_audio:
+            return
         if self._started or not self.available():
             return
         try:
@@ -879,6 +979,7 @@ class AudioMonitor:
                 vad_backend="none",
                 confidence=0.0,
                 error=self.last_error or "аудио-канал недоступен",
+                exam_mode=self.exam_mode,
                 ts=now,
             )
         with self._lock:
@@ -946,6 +1047,7 @@ class AudioMonitor:
             noise_floor=noise_floor,
             frames_analyzed=frames_analyzed,
             error="" if device_ok else (self.last_error or "поток микрофона остановлен"),
+            exam_mode=self.exam_mode,
             ts=now,
         )
 
@@ -970,9 +1072,16 @@ class AudioMonitor:
             self._speech_buf_len = 0
 
     def status(self) -> dict[str, Any]:
-        """Короткая сводка для сообщения `status` протокола."""
+        """Короткая сводка для сообщения `status` протокола.
+
+        `exam_mode` и `disabled_reason` нужны HUD: индикатор канала в аудитории
+        должен читаться как «выключен по режиму», а не как «сломался микрофон».
+        """
         obs = self.poll()
         return {
+            "exam_mode": self.exam_mode,
+            "mode_allows_audio": self.mode_allows_audio,
+            "disabled_reason": self.disabled_reason,
             "available": obs.available,
             "device_ok": obs.device_ok,
             "audio_ok": obs.available and obs.device_ok,

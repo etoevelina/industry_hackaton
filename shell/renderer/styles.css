@@ -1,100 +1,103 @@
 /* ===========================================================================
-   Прокторинг — оформление оболочки. Тёмная тема, системный шрифт,
-   без внешних ресурсов (CSP запрещает сеть). Вся графика — CSS и SVG.
+   NEON/PROCTOR — компоненты и раскладка оболочки прокторинга.
+
+   ЭТОТ ФАЙЛ НЕ ОБЪЯВЛЯЕТ ЗНАЧЕНИЙ. Цвет, типографика, отступы и радиусы
+   приходят только из tokens.css (подключается в index.html перед этим файлом).
+   Любое число здесь — либо структурное (количество колонок, доля, масштаб),
+   либо производное от токена через calc().
+
+   Два мира поверхностей (решение Р-13):
+     .sheet   — светлая среда чтения и письма: согласие, лист экзамена, отчёт
+     .monitor — тёмная среда наблюдения: верхняя панель, предполётная проверка,
+                калибровка, HUD, оверлеи
+
+   Правила, которые нельзя нарушать:
+     — кислотный (--signal) только как действие, live-статус, подтверждение
+       и ОДНА ключевая метрика; никогда крупной заливкой;
+     — кислотный НИКОГДА не цвет текста на белом (1.4:1). На светлом фоне для
+       текста акцента есть --signal-text-on-light;
+     — цвет никогда не единственный носитель смысла: рядом подпись словом,
+       форма или иконка;
+     — зона нажатия не меньше var(--tap-min), рабочие подписи не мельче 14px
+       (var(--fs-small)); var(--fs-label)/var(--fs-tiny) допустимы только для
+       декоративных, aria-hidden надписей;
+     — внешних ресурсов нет: вся графика — CSS и инлайновый SVG.
    =========================================================================== */
 
 :root {
-  --bg:        #0a0d14;
-  --bg-soft:   #0f1420;
-  --surface:   #141a28;
-  --surface-2: #1a2235;
-  --surface-3: #212b42;
-  --line:      #27334d;
-  --line-soft: #1e2739;
+  /* -------------------------------------------------------------------------
+     КОНТРАКТНЫЕ АЛИАСЫ — не значения, а ссылки на токены риска.
+     app.js:_colorFor() подставляет в style кольца цепочку с запасным звеном:
+     'var(--risk-lock, var(--crit))'. Пока tokens.css подключён, срабатывает
+     первое звено; алиасы существуют ровно для того, чтобы второе звено было
+     определено и защитная цепочка не оказалась пустой. Новых значений нет —
+     каждый алиас указывает на токен.
+     ------------------------------------------------------------------------- */
+  --ok:   var(--risk-ok);
+  --warn: var(--risk-warn);
+  --high: var(--risk-pause);
+  --crit: var(--risk-lock);
 
-  --text:      #e9edf6;
-  --text-dim:  #aab4c8;
-  --muted:     #7b87a1;
-
-  --accent:    #4d9dff;
-  --accent-dk: #1f5fb0;
-  --ok:        #2fc08a;
-  --warn:      #f0b429;
-  --high:      #ff8a3d;
-  --danger:    #ff5f5f;
-  --crit:      #ff2f55;
-
-  --r-sm: 8px;
-  --r-md: 12px;
-  --r-lg: 18px;
-
-  --sp-1: 6px;
-  --sp-2: 10px;
-  --sp-3: 16px;
-  --sp-4: 24px;
-  --sp-5: 36px;
-  --sp-6: 52px;
-
-  --fast: 140ms cubic-bezier(.4, 0, .2, 1);
-  --med:  260ms cubic-bezier(.4, 0, .2, 1);
-  --slow: 480ms cubic-bezier(.22, .61, .36, 1);
-
-  /* Семейства объявлены в fonts.css (локальные woff2, без сети). Системный стек
-     оставлен запасным: если файл шрифта не подхватился, интерфейс не ломается,
-     а просто рисуется системным шрифтом. Onest взят ради кириллицы — в Space
-     Grotesk её нет, и русский текст уехал бы в запасной шрифт. */
-  --font: "Onest", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
-          "Helvetica Neue", Arial, "Noto Sans", sans-serif;
-  --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo,
-          Consolas, monospace;
-
-  --hud-w: 330px;
+  /* Структурные размеры компонентов, выраженные через сетку 4px из tokens.css */
+  --hud-w: calc(var(--space-22) * 4);        /* 352px — ширина панели прокторинга */
+  --topbar-h: calc(var(--space-16) + var(--space-2));
+  --ring-size: calc(var(--space-22) + var(--space-4));   /* 104px */
+  --ring-size-lg: calc(var(--space-22) * 2 - var(--space-2));  /* 168px */
+  --ring-len: 263.9;                          /* 2*pi*42 — r кольца в разметке */
 }
-
-* { box-sizing: border-box; }
 
 /* hidden должен побеждать любые display из компонентных правил */
 [hidden] { display: none !important; }
 
-html, body {
-  height: 100%;
-  margin: 0;
-}
-
+/* Тёмная база: светлые экраны ложатся на неё листом (.sheet) */
 body {
-  background:
-    radial-gradient(1100px 620px at 82% -12%, rgba(77,157,255,.13), transparent 62%),
-    radial-gradient(900px 520px at 6% 108%, rgba(47,192,138,.08), transparent 60%),
-    var(--bg);
-  color: var(--text);
-  font-family: var(--font);
-  font-size: 15px;
-  line-height: 1.55;
-  -webkit-font-smoothing: antialiased;
+  background: var(--bg-monitor);
   overflow: hidden;
+  /* выделение текста разрешено только там, где человек пишет или копирует */
   user-select: none;
 }
 
-h1, h2, h3 { margin: 0; font-weight: 650; letter-spacing: -.02em; }
-h1 { font-size: 30px; line-height: 1.18; }
-h2 { font-size: 17px; }
-p  { margin: 0; }
+h1, h2, h3 { margin: 0; font-weight: 700; }
+h1 { font-size: var(--fs-h1); line-height: var(--lh-head); letter-spacing: var(--tracking-display); }
+h2 { font-size: var(--fs-h3); line-height: var(--lh-head); letter-spacing: -0.03em; }
+p { margin: 0; }
+
 code {
-  font-family: var(--mono);
-  font-size: .88em;
-  background: var(--surface-2);
-  border: 1px solid var(--line-soft);
-  border-radius: 5px;
-  padding: 1px 5px;
-  color: #cfe2ff;
+  font-family: var(--font-mono);
+  /* не em: внутри списка 0.9em давало 12.6px, ниже минимума рабочей подписи */
+  font-size: var(--fs-small);
+  padding: calc(var(--space-1) / 2) var(--space-1);
+  border: 1px solid var(--border-hair);
+  border-radius: var(--radius-xs);
+  background: var(--gray-100);
+  color: var(--text-primary);
+  user-select: text;
 }
+/* Space Grotesk назначает класс .wordmark из tokens.css. До этой переработки
+   шрифт грузился, но ни один селектор его не применял — он оставался unloaded.
+   Теперь .wordmark стоит на вордмарке и на латинских технических метках
+   (LINK, LIVE, CONSENT, ENV CHECK, CALIBRATION, REPORT, risk-score).
+   Кириллице его отдавать нельзя: её в Space Grotesk нет (решение Р-14),
+   произошла бы молчаливая подмена шрифта. */
 
-::-webkit-scrollbar { width: 10px; height: 10px; }
+/* Полосы прокрутки: тёмные по умолчанию, светлые внутри листа */
+::-webkit-scrollbar { width: var(--space-2); height: var(--space-2); }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: #243049; border-radius: 6px; border: 2px solid var(--bg); }
-::-webkit-scrollbar-thumb:hover { background: #30405f; }
+::-webkit-scrollbar-thumb {
+  background: var(--graphite);
+  border: 2px solid var(--bg-monitor);
+  border-radius: var(--radius-sm);
+}
+::-webkit-scrollbar-thumb:hover { background: var(--gray-500); }
+.sheet ::-webkit-scrollbar-thumb {
+  background: var(--gray-300);
+  border-color: var(--bg-canvas);
+}
+.sheet ::-webkit-scrollbar-thumb:hover { background: var(--gray-500); }
 
-/* ============================== Каркас ============================== */
+/* ===========================================================================
+   1. КАРКАС
+   =========================================================================== */
 
 .app {
   height: 100%;
@@ -102,788 +105,2109 @@ code {
   grid-template-rows: auto 1fr;
 }
 
+/* ------------------------------- верхняя панель ------------------------------ */
+
 .topbar {
   display: grid;
-  grid-template-columns: 1fr auto 1fr;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   align-items: center;
-  gap: var(--sp-3);
-  padding: 12px 22px;
-  border-bottom: 1px solid var(--line-soft);
-  background: linear-gradient(180deg, rgba(20,26,40,.92), rgba(10,13,20,.72));
-  backdrop-filter: blur(8px);
+  gap: var(--space-4);
+  min-height: var(--topbar-h);
+  padding: var(--space-3) var(--space-6);
+  border-bottom: 1px solid var(--border-hair-dark);
 }
 
-.brand { display: flex; align-items: center; gap: 11px; min-width: 0; }
-.brand__mark { width: 30px; height: 30px; flex: none; }
-.brand__ring  { fill: none; stroke: var(--accent); stroke-width: 2; opacity: .75; }
-.brand__pupil { fill: var(--accent); }
-.brand__tick  { stroke: var(--accent); stroke-width: 2; stroke-linecap: round; opacity: .5; }
-.brand__text { display: flex; flex-direction: column; min-width: 0; }
-.brand__name { font-weight: 680; letter-spacing: -.01em; }
-.brand__sub  { font-size: 11.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-
-/* --- степпер --- */
-.stepper { display: flex; align-items: center; gap: 4px; }
-.step {
-  display: flex; align-items: center; gap: 7px;
-  padding: 5px 11px 5px 9px;
-  border-radius: 999px;
-  color: var(--muted);
-  font-size: 12.5px;
+.brand { display: flex; align-items: center; gap: var(--space-3); min-width: 0; }
+.brand__mark { width: var(--space-8); height: var(--space-8); flex: none; }
+.brand__ring  { fill: none; stroke: var(--signal); stroke-width: 2; opacity: 0.8; }
+.brand__pupil { fill: var(--signal); }
+.brand__tick  { stroke: var(--signal); stroke-width: 2; stroke-linecap: round; opacity: 0.45; }
+.brand__text { display: flex; flex-direction: column; min-width: 0; line-height: 1.2; }
+.brand__name {
+  font-size: var(--fs-h3);
+  color: var(--text-on-dark);
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
-  transition: color var(--med), background var(--med);
 }
+.brand__sub {
+  font-size: var(--fs-small);
+  color: var(--text-muted-on-dark);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---------------------------------- этапы ---------------------------------- */
+/* Прогресс читается тремя способами: номер, точка, насыщенность подписи. */
+
+.stepper { display: flex; align-items: center; gap: var(--space-2); }
+
+.step {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--tap-min);
+  padding: 0 var(--space-3);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted-on-dark);
+  font-size: var(--fs-small);
+  white-space: nowrap;
+  /* Ни цвет, ни фон не анимируем: app.js переназначает is-active на каждом
+     show(), и бесконечно перезапускаемый переход держал бы активный этап
+     в промежуточном состоянии (подпись 1.65:1 на кислотном). */
+  transition: border-color var(--transition);
+}
+.step__num { font-size: var(--fs-small); opacity: 0.7; }
 .step__dot {
-  width: 8px; height: 8px; border-radius: 50%;
-  background: #2b364f;
-  box-shadow: 0 0 0 0 rgba(77,157,255,.45);
-  transition: background var(--med), box-shadow var(--med);
+  width: var(--space-2);
+  height: var(--space-2);
+  flex: none;
+  border: 1px solid var(--gray-500);
+  border-radius: 50%;
 }
-.step.is-done { color: var(--text-dim); }
-.step.is-done .step__dot { background: var(--ok); }
-.step.is-active { color: var(--text); background: rgba(77,157,255,.1); }
-.step.is-active .step__dot { background: var(--accent); animation: pulse 2s infinite; }
-@keyframes pulse {
-  0%   { box-shadow: 0 0 0 0 rgba(77,157,255,.5); }
-  70%  { box-shadow: 0 0 0 7px rgba(77,157,255,0); }
-  100% { box-shadow: 0 0 0 0 rgba(77,157,255,0); }
-}
+.step__label { font-weight: 500; }
 
-/* --- состояние связи с сайдкаром --- */
-.link-state { display: flex; align-items: center; gap: 8px; justify-content: flex-end; font-size: 12.5px; color: var(--muted); }
+.step.is-done { color: var(--text-on-dark); }
+.step.is-done .step__dot { border-color: var(--signal); background: var(--signal); opacity: 0.45; }
+
+.step.is-active {
+  color: var(--ink);
+  border-color: var(--signal);
+  background: var(--signal);
+}
+.step.is-active .step__num { opacity: 1; font-weight: 700; }
+.step.is-active .step__dot { border-color: var(--ink); background: var(--ink); }
+
+/* ------------------------------ состояние связи ------------------------------ */
+/* Форма точки меняется вместе с цветом, подпись словом — в #link-text. */
+
+/* Селектор нарочно двухуровневый: элемент несёт и класс .status-chip, который
+   описан ниже по файлу, — при равной специфичности выиграл бы он и перекрасил
+   фон в цвет самой шапки. */
+.topbar .link-state {
+  justify-self: end;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--tap-min);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border-hair-dark);
+  border-radius: var(--radius-sm);
+  background: var(--bg-panel);
+}
+.topbar .link-state__cap { font-size: var(--fs-small); color: var(--text-muted-on-dark); }
 .link-state__dot {
-  width: 9px; height: 9px; border-radius: 50%;
-  background: var(--muted);
-  transition: background var(--med);
+  width: var(--space-2);
+  height: var(--space-2);
+  flex: none;
+  border: 2px solid var(--gray-500);
+  border-radius: 50%;
+  background: var(--gray-500);
 }
-.link-state.is-up   .link-state__dot { background: var(--ok); }
-.link-state.is-down .link-state__dot { background: var(--danger); }
-.link-state.is-degraded .link-state__dot { background: var(--warn); }
+.link-state__text {
+  font-size: var(--fs-small);
+  color: var(--text-muted-on-dark);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
-/* ============================== Экраны ============================== */
+/* связь есть — залитый круг, кислотный */
+.link-state.is-up .link-state__dot {
+  border-color: var(--signal);
+  background: var(--signal);
+  box-shadow: var(--signal-glow);
+}
+.link-state.is-up .link-state__text { color: var(--text-on-dark); }
 
-.stage { position: relative; overflow: hidden; }
+/* ядро не отвечает — ПУСТОЕ кольцо, предупреждение */
+.link-state.is-degraded .link-state__dot {
+  border-color: var(--warning);
+  background: transparent;
+}
+.link-state.is-degraded .link-state__text { color: var(--warning); }
+
+/* ядра нет — КВАДРАТ, опасность */
+.link-state.is-down .link-state__dot {
+  border-radius: 0;
+  border-color: var(--danger);
+  background: var(--danger);
+}
+.link-state.is-down .link-state__text { color: var(--danger); }
+
+/* ---------------------------------- сцена ---------------------------------- */
+
+.stage {
+  position: relative;
+  min-height: 0;
+  overflow: hidden;
+}
 
 .screen {
   position: absolute;
   inset: 0;
   overflow-y: auto;
-  overflow-x: hidden;
-  padding: var(--sp-5) var(--sp-4) var(--sp-6);
-  animation: screen-in var(--slow) both;
+  overscroll-behavior: contain;
+  animation: screen-in var(--transition) both;
+  transition: right var(--transition), bottom var(--transition);
 }
-.screen[hidden] { display: none; }
+
+/* HUD занимает правый край — отводим под него место, чтобы не накрывать текст.
+   Поджимать нужно сам .screen, а не .stage: абсолютный элемент с inset:0
+   считается от ПАДДИНГ-бокса предка, поэтому padding у .stage его не сузил бы. */
+.app.has-hud .screen { right: calc(var(--hud-w) + var(--space-8)); }
 @keyframes screen-in {
-  from { opacity: 0; transform: translateY(14px); }
+  from { opacity: 0; transform: translateY(var(--space-2)); }
   to   { opacity: 1; transform: none; }
 }
 
-.screen--exam { padding: 0; overflow: hidden; }
+/* .sheet и .monitor раскрашивают экран целиком — значения берутся в tokens.css */
+.screen--exam { overflow: hidden; }
 
-/* когда HUD на экране, контент уступает ему правую колонку и не уезжает под панель */
-.app.has-hud .screen:not(.screen--exam) { padding-right: calc(var(--hud-w) + 36px); }
+.screen__inner {
+  max-width: calc(var(--layout-max) - var(--space-22) * 4);
+  margin: 0 auto;
+  padding: var(--space-12) var(--space-8) var(--space-16);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-8);
+}
+.screen__inner--wide { max-width: var(--layout-max); }
 
-.screen__inner { width: min(960px, 100%); margin: 0 auto; display: flex; flex-direction: column; gap: var(--sp-4); }
-.screen__inner--wide { width: min(1180px, 100%); }
-.screen__head { display: flex; flex-direction: column; gap: 10px; }
-.lede { color: var(--text-dim); font-size: 15.5px; max-width: 86ch; }
+.screen__head { display: flex; flex-direction: column; gap: var(--space-3); max-width: 68ch; }
 
-/* ============================== Карточки ============================== */
+/* Метка раздела: кислотная засечка + латинская строка. На светлом фоне текст
+   метки — --signal-text-on-light, кислотным залит только штрих. */
+.eyebrow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--fs-small);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  color: var(--signal-text-on-light);
+}
+.eyebrow__mark {
+  width: var(--space-6);
+  height: 3px;
+  flex: none;
+  background: var(--signal);
+}
+/* .wordmark из tokens.css ставит плотный трекинг вордмарка — для капслочной
+   метки раздела он не нужен, возвращаем лейбловый. */
+.eyebrow .wordmark { letter-spacing: var(--tracking-label); }
+.monitor .eyebrow { color: var(--signal); }
 
-.cards { display: grid; gap: var(--sp-3); }
-.cards--2 { grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); }
+.lede { font-size: var(--fs-body); color: var(--text-muted); }
+.monitor .lede { color: var(--text-muted-on-dark); }
 
-.card {
-  background: linear-gradient(180deg, var(--surface), var(--bg-soft));
-  border: 1px solid var(--line);
-  border-radius: var(--r-lg);
-  padding: 20px 22px;
-  position: relative;
-  overflow: hidden;
-}
-.card::before {
-  content: "";
-  position: absolute; inset: 0 0 auto 0; height: 2px;
-  background: linear-gradient(90deg, transparent, var(--accent), transparent);
-  opacity: .35;
-}
-.card--ok::before { background: linear-gradient(90deg, transparent, var(--ok), transparent); }
-.card--no::before { background: linear-gradient(90deg, transparent, var(--danger), transparent); }
-.card__title { margin-bottom: 12px; font-size: 16px; }
+/* ---------------------------- сетка 12 / 8 / 4 ---------------------------- */
+/* Брейкпоинты 1280 / 768 / 320 объявлены одним блоком в конце файла. */
 
-.list { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 10px; font-size: 14px; color: var(--text-dim); }
-.list b { color: var(--text); font-weight: 620; }
-.list li { position: relative; padding-left: 26px; }
-.list--plain li { padding-left: 16px; }
-.list--plain li::before {
-  content: ""; position: absolute; left: 2px; top: 9px;
-  width: 5px; height: 5px; border-radius: 50%; background: var(--accent); opacity: .8;
+.cards {
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  gap: var(--space-6);
 }
-.list--check li::before,
-.list--cross li::before {
-  content: ""; position: absolute; left: 0; top: 3px;
-  width: 17px; height: 17px; border-radius: 50%;
-}
-.list--check li::before { background: rgba(47,192,138,.14); border: 1px solid rgba(47,192,138,.45); }
-.list--cross li::before { background: rgba(255,95,95,.12); border: 1px solid rgba(255,95,95,.42); }
-.list--check li::after {
-  content: ""; position: absolute; left: 5px; top: 8px;
-  width: 7px; height: 4px; border-left: 2px solid var(--ok); border-bottom: 2px solid var(--ok);
-  transform: rotate(-45deg);
-}
-.list--cross li::after {
-  content: ""; position: absolute; left: 5.5px; top: 10px;
-  width: 7px; height: 0; border-top: 2px solid var(--danger);
-}
+.cards > * { grid-column: span 12; }
+.cards--2 > * { grid-column: span 6; }
 
-/* ============================== Форма ============================== */
+/* ===========================================================================
+   2. КОМПОНЕНТЫ ГАЙДА
+   =========================================================================== */
 
-.card--form { padding: 18px 22px 22px; }
-.form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: var(--sp-3); }
-.field { display: flex; flex-direction: column; gap: 6px; }
-.field__label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
-.field__input {
-  background: var(--bg);
-  border: 1px solid var(--line);
-  border-radius: var(--r-sm);
-  color: var(--text);
-  font: inherit;
-  padding: 10px 12px;
-  transition: border-color var(--fast), box-shadow var(--fast);
-  user-select: text;
-}
-.field__input:focus {
-  outline: none;
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px rgba(77,157,255,.16);
-}
-
-.consent-bar {
-  display: flex; align-items: center; justify-content: space-between; gap: var(--sp-4);
-  flex-wrap: wrap;
-  padding: 18px 22px;
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-radius: var(--r-lg);
-}
-.checkbox { display: flex; align-items: center; gap: 12px; cursor: pointer; font-size: 14.5px; color: var(--text-dim); }
-.checkbox input { position: absolute; opacity: 0; width: 0; height: 0; }
-.checkbox__box {
-  width: 22px; height: 22px; flex: none;
-  border: 1.5px solid var(--line); border-radius: 6px;
-  background: var(--bg);
-  position: relative;
-  transition: border-color var(--fast), background var(--fast);
-}
-.checkbox__box::after {
-  content: ""; position: absolute; left: 6px; top: 5px;
-  width: 7px; height: 11px;
-  border-right: 2.4px solid #061018; border-bottom: 2.4px solid #061018;
-  transform: rotate(40deg) scale(.4); opacity: 0;
-  transition: transform var(--fast), opacity var(--fast);
-}
-.checkbox input:checked + .checkbox__box { background: var(--accent); border-color: var(--accent); }
-.checkbox input:checked + .checkbox__box::after { opacity: 1; transform: rotate(40deg) scale(1); }
-.checkbox input:focus-visible + .checkbox__box { box-shadow: 0 0 0 3px rgba(77,157,255,.22); }
-
-/* ============================== Кнопки ============================== */
+/* ---------------------------------- .btn ----------------------------------- */
+/* Моноширинный с трекингом — технический характер из гайда. Без uppercase:
+   подписи кириллические, капслоком длинная русская строка читается хуже,
+   а 13px гайда ниже требуемого минимума 14px для рабочих подписей. */
 
 .btn {
-  appearance: none;
-  border: 1px solid var(--line);
-  background: var(--surface-2);
-  color: var(--text);
-  font: inherit;
-  font-weight: 560;
-  padding: 10px 18px;
-  border-radius: 10px;
-  cursor: pointer;
-  transition: background var(--fast), border-color var(--fast), transform var(--fast), opacity var(--fast);
+  min-height: var(--tap-min);
+  min-width: var(--tap-min);
+  padding: 0 var(--space-4);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  /* inherit: на листе — var(--text-primary), в .monitor — var(--text-on-dark).
+     Явное правило .monitor .btn здесь нельзя: по специфичности оно перебило бы
+     .btn--primary и белый текст лёг бы на кислотную заливку (1.4:1). */
+  color: inherit;
+  font-family: var(--font-mono);
+  font-size: var(--fs-small);
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-align: center;
+  transition: background var(--transition), color var(--transition),
+              border-color var(--transition), transform var(--transition);
 }
-.btn:hover:not(:disabled) { background: var(--surface-3); border-color: #32415f; }
-.btn:active:not(:disabled) { transform: translateY(1px); }
-.btn:disabled { opacity: .42; cursor: not-allowed; }
-.btn:focus-visible { outline: none; box-shadow: 0 0 0 3px rgba(77,157,255,.3); }
-.btn--lg { padding: 13px 26px; font-size: 15.5px; }
-.btn--primary {
-  background: linear-gradient(180deg, #4d9dff, #2f7fe0);
-  border-color: #2f7fe0;
-  color: #04121f;
-  font-weight: 650;
-}
-.btn--primary:hover:not(:disabled) { background: linear-gradient(180deg, #65abff, #3c8bea); border-color: #3c8bea; }
-.btn--danger { background: rgba(255,95,95,.12); border-color: rgba(255,95,95,.45); color: #ffb3b3; }
-.btn--danger:hover:not(:disabled) { background: rgba(255,95,95,.2); }
-.btn--ghost { background: transparent; }
+.btn--lg { min-height: calc(var(--tap-min) + var(--space-2)); padding: 0 var(--space-6); }
 
-.actions { display: flex; align-items: center; gap: var(--sp-3); justify-content: flex-end; flex-wrap: wrap; }
-.actions--right { justify-content: flex-end; }
-/* главное действие экрана не должно уезжать под сгиб на ноутбучном экране */
+.btn--primary { color: var(--ink); background: var(--signal); border-color: var(--signal); }
+.btn--primary:hover:not(:disabled) { background: var(--acid-hover); border-color: var(--acid-hover); transform: translateY(-1px); }
+.btn--primary:active:not(:disabled) { background: var(--acid-pressed); border-color: var(--acid-pressed); transform: none; }
+
+/*
+ * Главное действие («Начать тест», «Далее», «Завершить», «Продолжить тест») —
+ * двойная обводка фокуса. Внешнее кольцо из токенов обводки лежит на фоне страницы
+ * (на белом 5.51:1), внутреннее кольцо цветом --ink отделяет его от собственной
+ * кислотной заливки (#0a0a0a на #c6ff00 = 16.69:1). Так соседний контраст
+ * выполняется с обеих сторон кольца и фокус на главном действии видно всегда —
+ * в том числе на проекторе, где светлый голубой просто растворялся.
+ * Вторым носителем идёт утолщение рамки, а не только цвет.
+ */
+.btn--primary:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-offset);
+  box-shadow: inset 0 0 0 2px var(--ink);
+}
+
+.btn--secondary { border-color: var(--gray-500); background: transparent; }
+.btn--secondary:hover:not(:disabled) { border-color: var(--text-primary); }
+.monitor .btn--secondary:hover:not(:disabled) { color: var(--signal); border-color: var(--signal); }
+
+.btn--ghost { color: var(--text-muted); }
+.btn--ghost:hover:not(:disabled) { background: var(--gray-100); color: var(--text-primary); }
+.monitor .btn--ghost { color: var(--text-muted-on-dark); }
+.monitor .btn--ghost:hover:not(:disabled) { background: var(--graphite); color: var(--text-on-dark); }
+
+/* Текст тёмный, а не белый: #ffffff на --danger даёт 3.6:1, --ink — 5.2:1.
+   Отступление от гайда сознательное, причина — порог контраста 4.5:1. */
+.btn--danger { color: var(--ink); background: var(--danger); border-color: var(--danger); }
+.btn--danger:hover:not(:disabled) { filter: brightness(1.1); }
+
+.btn:disabled { opacity: 0.38; cursor: not-allowed; transform: none; }
+
+/* Кнопка без модификатора — вторичная по умолчанию */
+.btn:not([class*="btn--"]) { border-color: var(--gray-500); }
+
+.actions { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; }
+.actions--right { justify-content: flex-end; margin-left: auto; }
+/* Липкая панель действий. Фон строго непрозрачный: под ней проходит список
+   проверок, и градиент просвечивал бы текстом по тексту. */
 .actions--sticky {
   position: sticky;
   bottom: 0;
-  z-index: 5;
-  margin-top: auto;
-  padding: 26px 0 8px;
-  background: linear-gradient(180deg, rgba(10, 13, 20, 0) 0%, var(--bg) 46%, var(--bg) 100%);
+  align-items: flex-start;
+  justify-content: flex-end;
+  padding: var(--space-4) 0;
+  border-top: 1px solid var(--border-hair-dark);
+  background: var(--bg-monitor);
+}
+.sheet .actions--sticky { border-top-color: var(--border-hair); background: var(--bg-canvas); }
+
+/* ---------------------------------- .card ---------------------------------- */
+
+.card {
+  padding: var(--space-6);
+  border: 1px solid var(--text-primary);
+  border-radius: var(--radius-md);
+  background: var(--bg-canvas);
+  color: var(--text-primary);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+.monitor .card {
+  border-color: var(--border-hair-dark);
+  background: var(--bg-panel);
+  color: var(--text-on-dark);
 }
 
-.notice {
-  border-radius: var(--r-md);
-  padding: 12px 16px;
-  font-size: 13.5px;
-  border: 1px solid var(--line);
-  background: var(--surface);
-  color: var(--text-dim);
+.card__title {
+  font-size: var(--fs-h3);
+  letter-spacing: -0.03em;
 }
-.notice--muted { border-style: dashed; }
 
-/* ============================== Предполётные проверки ============================== */
+.card--form { gap: var(--space-6); }
 
-.checks { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
-.chk {
-  display: grid;
-  grid-template-columns: 34px 1fr auto;
+/* --------------------------------- .badge ---------------------------------- */
+
+.badge {
+  display: inline-flex;
   align-items: center;
-  gap: 14px;
-  padding: 12px 18px;
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-left: 3px solid var(--line);
-  border-radius: var(--r-md);
-  transition: border-color var(--med), background var(--med);
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--border-hair);
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-small);
+  color: var(--text-muted);
+  white-space: nowrap;
 }
-.chk__mark { width: 28px; height: 28px; position: relative; }
-.chk__mark svg { width: 100%; height: 100%; }
-.chk__mark circle { fill: none; stroke-width: 2; }
-.chk__mark path { fill: none; stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; }
-.chk__text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.chk__title { font-weight: 580; }
-.chk__hint { font-size: 12.8px; color: var(--muted); }
-.chk__state { font-size: 12.5px; color: var(--muted); white-space: nowrap; }
+.badge::before {
+  content: "";
+  width: var(--space-2);
+  height: var(--space-2);
+  flex: none;
+  border-radius: 50%;
+  background: var(--tone, var(--gray-500));
+}
+.monitor .badge { border-color: var(--border-hair-dark); color: var(--text-muted-on-dark); }
 
-.chk.is-pending { border-left-color: var(--muted); }
-.chk.is-pending .chk__mark circle { stroke: var(--muted); stroke-dasharray: 44 22; animation: spin 1.3s linear infinite; transform-origin: 50% 50%; }
-.chk.is-pending .chk__mark path { display: none; }
+/* ------------------------------ .status-chip ------------------------------- */
+
+.status-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: var(--tap-min);
+  padding: var(--space-2) var(--space-4);
+  border: 1px solid var(--border-hair-dark);
+  border-radius: var(--radius-sm);
+  background: var(--bg-monitor);
+  color: var(--text-on-dark);
+  font-size: var(--fs-small);
+}
+.status-chip { --tone: var(--signal); }
+.status-chip__dot {
+  width: var(--space-4);
+  height: var(--space-4);
+  flex: none;
+  border-radius: 50%;
+  background: var(--tone);
+}
+.status-chip--light {
+  border-color: var(--border-hair);
+  background: var(--gray-100);
+  color: var(--text-primary);
+}
+.status-chip--light .status-chip__dot { box-shadow: 0 0 0 1px var(--border-hair) inset; }
+.status-chip__text { min-width: 0; line-height: var(--lh-body); }
+.chips { display: flex; flex-wrap: wrap; gap: var(--space-3); }
+
+/* ------------------------- .alert / .notice (лента) ------------------------ */
+/* Полоса слева несёт уровень, но текст всегда объясняет наблюдение словами.
+   Формула сообщения: наблюдаемый факт → контекст → понятное действие. */
+
+.alert,
+.notice {
+  --tone: var(--info);
+  border: 1px solid var(--border-hair-dark);
+  border-radius: var(--radius-sm);
+  background: var(--bg-panel);
+  color: var(--text-on-dark);
+  font-size: var(--fs-small);
+  /* Контейнер тостов #toasts лежит в body, а не внутри .monitor, поэтому тёмный
+     фон сообщения не получил бы тёмный токен обводки фокуса. Задаём его здесь:
+     кнопка «Скрыть сообщение» фокусируется с клавиатуры, а на --bg-panel
+     затемнённый #004e7c дал бы 2.09:1 вместо 8.22:1 у --info. */
+  --focus-ring-color: var(--info);
+  --focus-ring: var(--focus-ring-width) solid var(--info);
+}
+/* На светлом фон строго белый: на --gray-100 приглушённый текст давал 3.96:1 */
+.sheet .alert,
+.sheet .notice {
+  border-color: var(--gray-300);
+  background: var(--bg-canvas);
+  color: var(--text-primary);
+  /* фон вернулся к белому — вместе с ним возвращается и затемнённая обводка */
+  --focus-ring-color: inherit;
+  --focus-ring: inherit;
+}
+
+.alert {
+  display: grid;
+  grid-template-columns: var(--space-1) minmax(0, 1fr) auto;
+  gap: var(--space-4);
+  align-items: start;
+  padding: var(--space-4);
+}
+.alert + .alert { margin-top: var(--space-3); }
+.alert-bar {
+  width: var(--space-1);
+  min-height: var(--tap-min);
+  height: 100%;
+  border-radius: var(--radius-xs);
+  background: var(--tone);
+}
+.alert strong { display: block; margin-bottom: var(--space-1); font-size: var(--fs-body); }
+.alert p { color: var(--text-muted-on-dark); }
+.sheet .alert p { color: var(--text-muted); }
+/* Тёмная подложка .alert по умолчанию: приглушённый серый тут --gray-300 */
+/* Код наблюдения — голая строка, без плашки: подложка --gray-100 из общего
+   правила code опускала приглушённый текст до 3.96:1. */
+.alert__code,
+.alert code {
+  align-self: center;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font-family: var(--font-mono);
+  font-size: var(--fs-small);
+  color: var(--text-muted-on-dark);
+  white-space: nowrap;
+}
+.sheet .alert__code,
+.sheet .alert code { color: var(--text-muted); }
+/* Уровень сообщения hud.js задаёт инлайном (--tone), в разметке остаётся
+   только информационный вариант отчёта. */
+.alert--info { --tone: var(--info); }
+
+/* .notice — однотекстовая версия: app.js пишет в неё только textContent */
+.notice {
+  position: relative;
+  padding: var(--space-4) var(--space-4) var(--space-4) var(--space-6);
+  line-height: var(--lh-body);
+}
+.notice::before {
+  content: "";
+  position: absolute;
+  left: var(--space-3);
+  top: var(--space-4);
+  bottom: var(--space-4);
+  width: var(--space-1);
+  border-radius: var(--radius-xs);
+  background: var(--tone);
+}
+.notice--muted { --tone: var(--gray-500); }
+
+/* --------------------------- .event — лента инцидентов --------------------- */
+/* Один паттерн на три места: HUD (.feed li), журнал отчёта (.log li)
+   и самостоятельный .event. Точка уровня + таймкод + текст наблюдения. */
+
+.event,
+.feed li,
+.log li {
+  display: grid;
+  gap: var(--space-3);
+  align-items: baseline;
+  padding: var(--space-3) 0;
+  border-top: 1px solid var(--border-hair-dark);
+  font-size: var(--fs-small);
+}
+/* HUD и .event: точка -> факт с пояснением -> время справа.
+   Порядок узлов задан hud.js (_feedNode) и повторяет .event из гайда. */
+.event,
+.feed li { grid-template-columns: var(--space-2) minmax(0, 1fr) auto; align-items: start; }
+/* Журнал отчёта: app.js кладёт два span-а, точка уровня живёт внутри .log__msg */
+.log li { grid-template-columns: auto minmax(0, 1fr); }
+
+.sheet .event,
+.sheet .log li { border-top-color: var(--border-hair); }
+
+.event i,
+.feed__sev,
+.log__sev {
+  width: var(--space-2);
+  height: var(--space-2);
+  flex: none;
+  border-radius: 50%;
+  background: var(--tone, var(--gray-500));
+}
+.event i,
+.event__dot,
+.feed__sev { margin-top: 0.45em; }
+.event__body { min-width: 0; }
+.event__body b { font-weight: 600; }
+.event__time { white-space: nowrap; }
+.log__sev { display: inline-block; margin-right: var(--space-2); }
+.event time,
+.feed__time,
+.log__time {
+  font-family: var(--font-mono);
+  font-size: var(--fs-small);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+}
+.monitor .event time,
+.monitor .feed__time,
+.monitor .log__time { color: var(--text-muted-on-dark); }
+.feed__msg, .log__msg { min-width: 0; }
+
+/* Уровни из protocol.Severity. Цвет идёт рядом с текстом события, а не вместо. */
+.sev-info     { --tone: var(--sev-info); }
+.sev-low      { --tone: var(--sev-low); }
+.sev-medium   { --tone: var(--sev-medium); }
+.sev-high     { --tone: var(--sev-high); }
+.sev-critical { --tone: var(--sev-critical); }
+
+/* -------------------------------- .progress -------------------------------- */
+/* Ширину .progress__bar задаёт calibration.js атрибутом style. */
+
+.progress {
+  height: var(--space-2);
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--graphite);
+}
+.sheet .progress { background: var(--gray-100); }
+.progress__bar {
+  display: block;
+  width: 0;
+  height: 100%;
+  background: var(--signal);
+  box-shadow: var(--signal-glow);
+  transition: width var(--transition);
+}
+
+/* ------------------------------- .data-table ------------------------------- */
+
+.table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border-hair);
+  border-radius: var(--radius-md);
+}
+.monitor .table-wrap { border-color: var(--border-hair-dark); }
+
+.data-table {
+  width: 100%;
+  min-width: calc(var(--space-22) * 7);
+  border-collapse: collapse;
+  font-size: var(--fs-small);
+  background: var(--bg-canvas);
+  color: var(--text-primary);
+}
+.data-table th {
+  padding: var(--space-3) var(--space-4);
+  text-align: left;
+  font-family: var(--font-mono);
+  font-size: var(--fs-small);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  color: var(--text-primary);
+  background: var(--gray-100);
+  white-space: nowrap;
+}
+.data-table td {
+  padding: var(--space-4);
+  border-top: 1px solid var(--border-hair);
+  vertical-align: top;
+}
+.data-table td.mono { font-family: var(--font-mono); user-select: text; }
+.data-table tbody tr:hover td { background: var(--gray-100); }
+
+.monitor .data-table { background: var(--bg-panel); color: var(--text-on-dark); }
+/* Заголовок таблицы в тёмной среде: приглушённость держат uppercase, трекинг и вес,
+   а не провальный серый. --gray-500 на --bg-monitor давал 4.24:1 при тексте 14px/600
+   (порог 4.5:1 — large начинается с 18.66px bold), а под prefers-contrast: more
+   --gray-500 уходит в #5e5e5e и пара падает до 3.05:1.
+   --text-muted-on-dark даёт 10.09:1. */
+.monitor .data-table th { color: var(--text-muted-on-dark); background: var(--bg-monitor); }
+.monitor .data-table td { border-top-color: var(--border-hair-dark); }
+.monitor .data-table tbody tr:hover td { background: var(--graphite); }
+
+/* --------------------------------- .chart ---------------------------------- */
+
+.chart {
+  position: relative;
+  padding: var(--space-4);
+  border: 1px solid var(--border-hair);
+  border-radius: var(--radius-md);
+  background: var(--bg-canvas);
+}
+.monitor .chart { border-color: var(--border-hair-dark); background: var(--bg-panel); }
+
+.chart-header {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-4);
+  margin-bottom: var(--space-4);
+}
+.chart-title { font-size: var(--fs-h3); }
+.legend { font-size: var(--fs-small); color: var(--text-muted); }
+.monitor .legend { color: var(--text-muted-on-dark); }
+
+/* Внутри карточки рамка графика лишняя: карточка её уже дала */
+.card > .chart { padding: 0; border: 0; background: transparent; }
+
+/* ------------------- .scan-visual / .face-frame / .scanline ---------------- */
+/* Паттерн наблюдения из гайда: тёмное поле, перекрестье, овал, сканлайн. */
+
+.scan-panel {
+  padding: var(--space-6);
+  border: 1px solid var(--border-hair-dark);
+  border-radius: var(--radius-lg);
+  background: var(--bg-panel);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.scan-visual {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid var(--border-hair-dark);
+  border-radius: var(--radius-md);
+  background:
+    radial-gradient(circle at center, var(--graphite) 0 18%, var(--ink-2) 19% 55%, var(--ink) 56%);
+}
+.scan-visual__cross {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 60%;
+  height: 60%;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  background:
+    linear-gradient(90deg, transparent calc(50% - 0.5px), var(--signal) 50%, transparent calc(50% + 0.5px)),
+    linear-gradient(transparent calc(50% - 0.5px), var(--signal) 50%, transparent calc(50% + 0.5px));
+  opacity: 0.22;
+}
+
+/* Угловые засечки рамки лица */
+.face-frame {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: calc(var(--space-22) * 2 + var(--space-4));
+  height: calc(var(--space-22) * 3 - var(--space-8));
+  transform: translate(-50%, -50%);
+  border: 1px solid var(--signal);
+  pointer-events: none;
+}
+.face-frame::before,
+.face-frame::after {
+  content: "";
+  position: absolute;
+  inset: -2px;
+}
+.face-frame::before {
+  background:
+    linear-gradient(var(--signal), var(--signal)) left top / var(--space-8) 3px no-repeat,
+    linear-gradient(var(--signal), var(--signal)) left top / 3px var(--space-8) no-repeat;
+}
+.face-frame::after {
+  background:
+    linear-gradient(var(--signal), var(--signal)) right bottom / var(--space-8) 3px no-repeat,
+    linear-gradient(var(--signal), var(--signal)) right bottom / 3px var(--space-8) no-repeat;
+}
+
+.scanline {
+  position: absolute;
+  left: var(--space-2);
+  right: var(--space-2);
+  top: 22%;
+  height: 1px;
+  background: var(--signal);
+  box-shadow: 0 0 12px var(--signal);
+  animation: scan 3s ease-in-out infinite alternate;
+}
+@keyframes scan { to { top: 78%; } }
+
+.scan-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+}
+
+/* -------------------------------- .room-grid ------------------------------- */
+/* Перспективная сетка комнаты — фон поля 9-точечной калибровки. */
+
+.room-grid {
+  position: absolute;
+  inset: 0;
+  transform: rotateX(58deg) translateY(34%);
+  transform-origin: center bottom;
+  pointer-events: none;
+  opacity: 0.35;
+  background-image:
+    linear-gradient(var(--signal) 1px, transparent 1px),
+    linear-gradient(90deg, var(--signal) 1px, transparent 1px);
+  background-size: var(--space-12) var(--space-12);
+}
+
+/* ===========================================================================
+   3. ЭКРАН 1 — СОГЛАСИЕ (светлый лист)
+   =========================================================================== */
+
+.list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.list li {
+  position: relative;
+  padding: var(--space-3) 0 var(--space-3) var(--space-8);
+  border-top: 1px solid var(--border-hair);
+  font-size: var(--fs-small);
+  line-height: var(--lh-body);
+}
+.monitor .list li { border-top-color: var(--border-hair-dark); }
+.list li::before {
+  position: absolute;
+  left: 0;
+  top: var(--space-3);
+  width: var(--space-6);
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  text-align: left;
+}
+.list--plain li::before { content: "·"; color: var(--gray-500); }
+
+/* ------------------------------- поля ввода -------------------------------- */
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(calc(var(--space-22) * 3), 1fr));
+  gap: var(--space-4);
+}
+.field { display: flex; flex-direction: column; gap: var(--space-2); min-width: 0; }
+.field__label {
+  font-size: var(--fs-small);
+  font-weight: 600;
+  color: var(--text-muted);
+}
+.monitor .field__label { color: var(--text-muted-on-dark); }
+.field__input {
+  min-height: var(--tap-min);
+  padding: 0 var(--space-4);
+  border: 1px solid var(--gray-300);
+  border-radius: var(--radius-sm);
+  background: var(--bg-canvas);
+  color: var(--text-primary);
+  font-size: var(--fs-body);
+  user-select: text;
+  transition: border-color var(--transition);
+}
+.field__input:hover { border-color: var(--gray-500); }
+.field__input:focus { border-color: var(--text-primary); outline: none; }
+.field__input:focus-visible { outline: var(--focus-ring-width) solid var(--focus-ring-color); outline-offset: var(--focus-offset); }
+.monitor .field__input {
+  border-color: var(--border-hair-dark);
+  background: var(--bg-monitor);
+  color: var(--text-on-dark);
+}
+
+/* -------------------------------- чекбокс ---------------------------------- */
+
+.consent-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-6);
+  flex-wrap: wrap;
+  padding: var(--space-4) var(--space-6);
+  border: 1px solid var(--text-primary);
+  border-radius: var(--radius-md);
+  background: var(--gray-100);
+}
+
+.checkbox {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: var(--tap-min);
+  padding: var(--space-2) 0;
+  cursor: pointer;
+  flex: 1 1 calc(var(--space-22) * 4);
+}
+.checkbox input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  margin: 0;
+}
+.checkbox__box {
+  position: relative;
+  width: var(--space-6);
+  height: var(--space-6);
+  flex: none;
+  border: 2px solid var(--text-primary);
+  border-radius: var(--radius-xs);
+  background: var(--bg-canvas);
+  transition: background var(--transition), border-color var(--transition);
+}
+.checkbox__box::after {
+  content: "";
+  position: absolute;
+  left: 25%;
+  top: 12%;
+  width: 40%;
+  height: 62%;
+  border: solid var(--ink);
+  border-width: 0 3px 3px 0;
+  transform: rotate(40deg) scale(0);
+  transition: transform var(--transition);
+}
+.checkbox input:checked + .checkbox__box { background: var(--signal); border-color: var(--signal); }
+.checkbox input:checked + .checkbox__box::after { transform: rotate(40deg) scale(1); }
+.checkbox input:focus-visible + .checkbox__box {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-offset);
+}
+.checkbox__text { font-size: var(--fs-small); line-height: var(--lh-body); }
+
+/* ===========================================================================
+   4. ЭКРАН 2 — ПРЕДПОЛЁТНАЯ ПРОВЕРКА (тёмная диагностика)
+   Каждая строка: статус-точка + ПОДПИСЬ СТАТУСА СЛОВОМ + название проверки.
+   =========================================================================== */
+
+.checks {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border-hair-dark);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.chk {
+  --tone: var(--gray-500);
+  display: grid;
+  grid-template-columns: var(--space-8) minmax(0, 1fr) auto;
+  gap: var(--space-4);
+  align-items: center;
+  min-height: calc(var(--tap-min) + var(--space-6));
+  padding: var(--space-3) var(--space-4);
+  background: var(--bg-panel);
+}
+.chk + .chk { border-top: 1px solid var(--border-hair-dark); }
+
+.chk__mark { display: grid; place-items: center; }
+.chk__mark svg { width: var(--space-8); height: var(--space-8); }
+.chk__mark circle { fill: none; stroke: var(--tone); stroke-width: 2; opacity: 0.6; }
+.chk__mark path {
+  fill: none;
+  stroke: var(--tone);
+  stroke-width: 2.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.chk__text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.chk__title { font-size: var(--fs-body); font-weight: 600; color: var(--text-on-dark); }
+.chk__hint { font-size: var(--fs-small); color: var(--text-muted-on-dark); }
+
+/* Подпись статуса словом — обязательный дубль цвета (a11y) */
+.chk__state {
+  justify-self: end;
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--tone);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: var(--fs-small);
+  color: var(--tone);
+  white-space: nowrap;
+}
+
+/* Проверка идёт: дуга вращается вместе со всем svg (у circle в SVG начало
+   координат не в центре, вращать его самого нельзя — он уедет по орбите). */
+.chk.is-pending { --tone: var(--gray-500); }
+.chk.is-pending .chk__mark circle { stroke-dasharray: 10 58; opacity: 1; }
+.chk.is-pending .chk__mark svg { transform-origin: center; animation: spin 1.5s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-.chk.is-ok { border-left-color: var(--ok); }
-.chk.is-ok .chk__mark circle { stroke: rgba(47,192,138,.5); }
-.chk.is-ok .chk__mark path { stroke: var(--ok); }
-.chk.is-ok .chk__state { color: var(--ok); }
+.chk.is-ok   { --tone: var(--risk-ok); }
+.chk.is-warn { --tone: var(--warning); }
+.chk.is-fail { --tone: var(--danger); background: var(--bg-monitor); }
 
-.chk.is-warn { border-left-color: var(--warn); background: rgba(240,180,41,.05); }
-.chk.is-warn .chk__mark circle { stroke: rgba(240,180,41,.5); }
-.chk.is-warn .chk__mark path { stroke: var(--warn); }
-.chk.is-warn .chk__state { color: var(--warn); }
+/* ===========================================================================
+   5. ЭКРАН 3 — КАЛИБРОВКА (тёмная)
+   =========================================================================== */
 
-.chk.is-fail { border-left-color: var(--danger); background: rgba(255,95,95,.06); }
-.chk.is-fail .chk__mark circle { stroke: rgba(255,95,95,.5); }
-.chk.is-fail .chk__mark path { stroke: var(--danger); }
-.chk.is-fail .chk__state { color: var(--danger); }
+.calib {
+  display: grid;
+  grid-template-columns: minmax(calc(var(--space-22) * 3), 4fr) 8fr;
+  gap: var(--space-6);
+  align-items: start;
+}
 
-/* ============================== Калибровка ============================== */
+.calib__steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-2); }
 
-.calib { display: grid; grid-template-columns: 268px 1fr; gap: var(--sp-3); align-items: start; }
-@media (max-width: 880px) { .calib { grid-template-columns: 1fr; } }
-
-.calib__steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
 .cstep {
-  display: grid; grid-template-columns: 26px 1fr; gap: 12px; align-items: start;
-  padding: 12px 14px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-md);
-  background: var(--surface);
-  transition: border-color var(--med), background var(--med);
+  --tone: var(--gray-300);
+  display: grid;
+  grid-template-columns: var(--space-8) minmax(0, 1fr);
+  gap: var(--space-3);
+  align-items: start;
+  min-height: var(--tap-min);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border-hair-dark);
+  border-radius: var(--radius-sm);
+  background: var(--bg-panel);
+  color: var(--text-muted-on-dark);
 }
 .cstep__idx {
-  width: 26px; height: 26px; border-radius: 50%;
-  display: grid; place-items: center;
-  font-size: 12.5px; font-weight: 640;
-  background: var(--surface-3); color: var(--text-dim);
-  transition: background var(--med), color var(--med);
+  display: grid;
+  place-items: center;
+  width: var(--space-8);
+  height: var(--space-8);
+  border: 1px solid var(--tone);
+  border-radius: 50%;
+  font-family: var(--font-mono);
+  font-size: var(--fs-small);
+  color: var(--tone);
 }
-.cstep__name { font-weight: 560; font-size: 14px; }
-.cstep__meta { font-size: 12px; color: var(--muted); }
-.cstep.is-active { border-color: var(--accent); background: rgba(77,157,255,.08); }
-.cstep.is-active .cstep__idx { background: var(--accent); color: #04121f; }
-.cstep.is-done .cstep__idx { background: rgba(47,192,138,.2); color: var(--ok); }
-.cstep.is-done { border-color: rgba(47,192,138,.3); }
+.cstep__name { font-size: var(--fs-body); font-weight: 600; }
+.cstep__meta { font-size: var(--fs-small); color: var(--text-muted-on-dark); }
 
-.calib__pane {
-  background: linear-gradient(180deg, var(--surface), var(--bg-soft));
-  border: 1px solid var(--line);
-  border-radius: var(--r-lg);
-  padding: 20px 22px 18px;
-  display: flex; flex-direction: column; gap: var(--sp-3);
-}
-.calib__stagehead { display: flex; flex-direction: column; gap: 4px; }
-.calib__hint { color: var(--text-dim); font-size: 14px; min-height: 22px; }
+.cstep.is-active { --tone: var(--signal); border-color: var(--signal); color: var(--text-on-dark); }
+.cstep.is-active .cstep__idx { background: var(--signal); color: var(--ink); border-color: var(--signal); }
+.cstep.is-done { --tone: var(--signal); color: var(--text-muted-on-dark); }
+.cstep.is-done .cstep__idx { border-color: var(--signal); color: var(--signal); }
+
+.calib__pane { min-width: 0; }
+.calib__stagehead { display: flex; flex-direction: column; gap: var(--space-1); }
+.calib__hint { font-size: var(--fs-small); color: var(--text-muted-on-dark); min-height: var(--space-6); }
 
 .calib__viewport {
-  position: relative;
-  min-height: 330px;
-  border-radius: var(--r-md);
-  border: 1px solid var(--line-soft);
-  background:
-    linear-gradient(rgba(39,51,77,.4) 1px, transparent 1px) 0 0 / 100% 44px,
-    linear-gradient(90deg, rgba(39,51,77,.4) 1px, transparent 1px) 0 0 / 44px 100%,
-    var(--bg);
-  overflow: hidden;
+  height: calc(var(--space-22) * 5);
   display: grid;
   place-items: center;
 }
 
-/* рамка лица */
-.calib__frame { position: relative; width: 220px; height: 280px; display: grid; place-items: center; }
-.calib__video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; border-radius: 110px / 140px; transform: scaleX(-1); opacity: .9; }
-.calib__oval { position: absolute; inset: 0; width: 100%; height: 100%; }
-.calib__oval ellipse { fill: none; stroke: var(--accent); stroke-width: 2; stroke-dasharray: 10 9; opacity: .85; animation: dash 18s linear infinite; }
-.calib__oval path { stroke: var(--accent); stroke-width: 2; stroke-linecap: round; opacity: .5; }
-@keyframes dash { to { stroke-dashoffset: -380; } }
-.calib__countdown { position: relative; font-size: 54px; font-weight: 300; color: var(--text); text-shadow: 0 2px 18px rgba(0,0,0,.6); }
+/* --------- этап identity: превью, рамка со сканлайном, овал, отсчёт -------- */
 
-/* точка взгляда */
-.calib__dotfield { position: absolute; inset: 0; }
+.calib__frame {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+}
+.calib__video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  opacity: 0.85;
+}
+.calib__oval {
+  position: relative;
+  height: 76%;
+  pointer-events: none;
+}
+.calib__oval ellipse {
+  fill: none;
+  stroke: var(--gray-500);
+  stroke-width: 1.5;
+  stroke-dasharray: 6 8;
+}
+.calib__oval path { fill: none; stroke: var(--signal); stroke-width: 2; stroke-linecap: round; }
+/* Отсчёт лежит поверх овала, а не под ним */
+.calib__countdown {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  font-size: var(--fs-display);
+  line-height: var(--lh-display);
+  font-weight: 700;
+  letter-spacing: var(--tracking-display);
+  color: var(--signal);
+  text-shadow: 0 0 var(--space-6) color-mix(in srgb, var(--ink), transparent 40%);
+}
+
+/* ------------- этапы gaze_center / gaze_grid: крупная точка ---------------- */
+
+.calib__dotfield {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  perspective: calc(var(--space-22) * 7);
+}
+/* calibration.js задаёт left/top в процентах — центрируем трансформом */
 .calib__dot {
-  position: absolute; left: 50%; top: 50%;
-  width: 54px; height: 54px; margin: -27px 0 0 -27px;
-  display: grid; place-items: center;
-  transition: left var(--slow), top var(--slow);
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: var(--space-12);
+  height: var(--space-12);
+  transform: translate(-50%, -50%);
+  display: grid;
+  place-items: center;
+  transition: left var(--transition), top var(--transition);
 }
 .calib__dot::before {
-  content: ""; position: absolute; inset: 0;
+  content: "";
+  position: absolute;
+  inset: 0;
+  border: 1px solid var(--signal);
   border-radius: 50%;
-  border: 1.5px solid rgba(77,157,255,.55);
-  animation: halo 1.5s ease-out infinite;
+  animation: halo 1.6s ease-out infinite;
 }
 .calib__dotcore {
-  width: 17px; height: 17px; border-radius: 50%;
-  background: var(--accent);
-  box-shadow: 0 0 20px 5px rgba(77,157,255,.45);
+  width: var(--space-4);
+  height: var(--space-4);
+  border-radius: 50%;
+  background: var(--signal);
+  box-shadow: var(--signal-glow);
 }
 @keyframes halo {
-  0%   { transform: scale(.45); opacity: .95; }
-  100% { transform: scale(1.1); opacity: 0; }
+  0%   { transform: scale(0.45); opacity: 1; }
+  100% { transform: scale(1); opacity: 0; }
 }
 
-/* голос */
-.calib__voice { display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 0 24px; text-align: center; }
-.wave { display: flex; align-items: center; gap: 5px; height: 76px; }
+/* ------------------------- этап voice: индикатор речи ---------------------- */
+
+.calib__voice {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-4);
+  padding: var(--space-6);
+  text-align: center;
+}
+.wave { display: flex; align-items: flex-end; gap: var(--space-1); height: var(--space-12); }
 .wave span {
-  width: 6px; border-radius: 3px;
-  background: linear-gradient(180deg, var(--accent), var(--accent-dk));
-  animation: wv 1.1s ease-in-out infinite;
-  height: 18px;
+  width: var(--space-1);
+  height: 30%;
+  border-radius: 999px;
+  background: var(--signal);
+  animation: wv 1s ease-in-out infinite alternate;
 }
-.wave span:nth-child(1) { animation-delay: 0s;    }
-.wave span:nth-child(2) { animation-delay: .09s;  }
-.wave span:nth-child(3) { animation-delay: .18s;  }
-.wave span:nth-child(4) { animation-delay: .27s;  }
-.wave span:nth-child(5) { animation-delay: .36s;  }
-.wave span:nth-child(6) { animation-delay: .45s;  }
-.wave span:nth-child(7) { animation-delay: .54s;  }
-.wave span:nth-child(8) { animation-delay: .63s;  }
-.wave span:nth-child(9) { animation-delay: .72s;  }
-.wave span:nth-child(10){ animation-delay: .81s;  }
-@keyframes wv { 0%,100% { height: 14px; opacity: .55; } 50% { height: 64px; opacity: 1; } }
-.calib__phrase { color: var(--muted); font-size: 13px; }
+.wave span:nth-child(1)  { animation-delay: 0ms; }
+.wave span:nth-child(2)  { animation-delay: 80ms; }
+.wave span:nth-child(3)  { animation-delay: 160ms; }
+.wave span:nth-child(4)  { animation-delay: 240ms; }
+.wave span:nth-child(5)  { animation-delay: 320ms; }
+.wave span:nth-child(6)  { animation-delay: 400ms; }
+.wave span:nth-child(7)  { animation-delay: 480ms; }
+.wave span:nth-child(8)  { animation-delay: 560ms; }
+.wave span:nth-child(9)  { animation-delay: 640ms; }
+.wave span:nth-child(10) { animation-delay: 720ms; }
+@keyframes wv { to { height: 100%; } }
+
+.calib__phrase { font-size: var(--fs-small); color: var(--text-muted-on-dark); }
 .calib__quote {
-  margin: 0; font-size: 20px; font-weight: 500; line-height: 1.4;
-  color: var(--text); max-width: 32ch;
+  margin: 0;
+  max-width: 44ch;
+  font-size: var(--fs-h3);
+  line-height: var(--lh-head);
+  color: var(--text-on-dark);
 }
 
-.progress { height: 6px; border-radius: 4px; background: var(--surface-3); overflow: hidden; }
-.progress__bar {
-  height: 100%; width: 0;
-  background: linear-gradient(90deg, var(--accent-dk), var(--accent));
-  border-radius: 4px;
-  transition: width 180ms linear;
+.calib__footer { margin-top: var(--space-2); }
+.calib__counter { font-size: var(--fs-small); }
+.calib__counter::before { background: var(--signal); }
+
+/* ===========================================================================
+   6. ЭКРАН 4 — ЭКЗАМЕН (светлый лист; тёмный HUD живёт отдельно)
+   =========================================================================== */
+
+.exam {
+  height: 100%;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  max-width: var(--layout-max);
+  margin: 0 auto;
 }
-.calib__footer { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3); flex-wrap: wrap; }
-.calib__counter { font-size: 12.5px; color: var(--muted); }
-
-/* ============================== Экзамен ============================== */
-
-.exam { height: 100%; display: grid; grid-template-rows: auto 1fr auto; }
 
 .exam__bar {
   display: grid;
-  grid-template-columns: minmax(180px, 1fr) auto minmax(140px, 1fr);
+  grid-template-columns: minmax(0, 1fr) auto auto;
   align-items: center;
-  gap: var(--sp-3);
-  padding: 12px 22px;
-  padding-right: calc(var(--hud-w) + 40px);
-  border-bottom: 1px solid var(--line-soft);
-  background: rgba(15,20,32,.7);
+  gap: var(--space-4);
+  padding: var(--space-3) var(--space-8);
+  border-bottom: 1px solid var(--border-hair);
 }
 .exam__meta { display: flex; flex-direction: column; min-width: 0; }
-.exam__name { font-weight: 600; font-size: 14.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.exam__pos { font-size: 12px; color: var(--muted); }
+.exam__name {
+  font-size: var(--fs-body);
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.exam__pos { font-size: var(--fs-small); color: var(--text-muted); }
 
-.exam__nav { display: flex; gap: 7px; justify-content: center; flex-wrap: wrap; }
+/* ------------------------- палитра вопросов (qbtn) ------------------------- */
+
+.exam__nav { display: flex; gap: var(--space-2); flex-wrap: wrap; justify-content: center; }
 .qbtn {
-  width: 34px; height: 34px;
-  border-radius: 9px;
-  border: 1px solid var(--line);
-  background: var(--surface);
-  color: var(--text-dim);
-  font: inherit; font-size: 13px; font-weight: 600;
-  cursor: pointer;
   position: relative;
-  transition: background var(--fast), border-color var(--fast), color var(--fast);
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  min-width: var(--tap-min);
+  min-height: var(--tap-min);
+  border: 1px solid var(--gray-300);
+  border-radius: var(--radius-sm);
+  background: var(--bg-canvas);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: var(--fs-small);
+  font-weight: 600;
+  transition: border-color var(--transition), background var(--transition);
 }
-.qbtn:hover { border-color: #35456580; background: var(--surface-2); }
-.qbtn.is-answered { color: var(--ok); border-color: rgba(47,192,138,.4); }
-.qbtn.is-current { background: var(--accent); border-color: var(--accent); color: #04121f; }
+.qbtn:hover { border-color: var(--text-primary); }
+/* отвечено — заливка кислотным (подтверждение), плюс засечка внизу */
+.qbtn.is-answered { background: var(--signal); border-color: var(--signal); color: var(--ink); }
+/* текущий — чёрная рамка и жирный контур, не только цвет */
+.qbtn.is-current { border-color: var(--text-primary); border-width: 2px; box-shadow: var(--signal-glow); }
 .qbtn__kind {
-  position: absolute; right: 3px; bottom: 3px;
-  width: 4px; height: 4px; border-radius: 50%;
-  background: var(--muted);
+  position: absolute;
+  left: 50%;
+  bottom: var(--space-1);
+  width: var(--space-3);
+  height: 2px;
+  transform: translateX(-50%);
+  background: transparent;
 }
-.qbtn.is-open .qbtn__kind { background: var(--accent); }
-.qbtn.is-current .qbtn__kind { background: #04121f; }
+/* открытый вопрос отличается ФОРМОЙ метки, а не цветом */
+.qbtn.is-open .qbtn__kind { background: var(--gray-500); }
+.qbtn.is-answered .qbtn__kind { background: var(--ink); }
 
-.exam__timer { display: flex; flex-direction: column; align-items: flex-end; }
-.exam__timerlabel { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .07em; }
-.exam__timerval { font-family: var(--mono); font-size: 21px; font-weight: 500; font-variant-numeric: tabular-nums; }
-.exam__timer.is-low .exam__timerval { color: var(--warn); }
-.exam__timer.is-crit .exam__timerval { color: var(--danger); animation: blink 1.1s step-start infinite; }
-@keyframes blink { 50% { opacity: .35; } }
+/* -------------------------------- таймер ----------------------------------- */
 
-.exam__body {
-  overflow-y: auto;
-  padding: var(--sp-5) 22px var(--sp-4);
-  padding-right: calc(var(--hud-w) + 36px);
+.exam__timer {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  min-width: calc(var(--space-22) + var(--space-4));
 }
-.qcard {
-  width: min(820px, 100%);
+.exam__timerlabel {
+  font-size: var(--fs-small);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  color: var(--text-muted);
+}
+.exam__timerval {
+  font-size: var(--fs-h3);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: var(--lh-head);
+}
+/* Истекающее время: цвет + подчёркивание + мигание — три носителя */
+/* Подчёркивание на белом: --warning дал бы 1.73:1 и был бы не виден */
+.exam__timer.is-low .exam__timerval {
+  color: var(--text-primary);
+  box-shadow: inset 0 -3px 0 var(--gray-500);
+}
+.exam__timer.is-crit .exam__timerval {
+  color: var(--danger);
+  box-shadow: inset 0 -3px 0 var(--danger);
+  animation: blink 1s steps(2, end) infinite;
+}
+@keyframes blink { 50% { opacity: 0.45; } }
+
+/* ------------------------------- лист вопроса ------------------------------ */
+
+/* Отступы листа задаёт .qsheet, который создаёт exam.js: здесь только прокрутка */
+.exam__body { overflow-y: auto; }
+.qsheet {
+  width: 100%;
+  max-width: var(--layout-max);
   margin: 0 auto;
-  display: flex; flex-direction: column; gap: var(--sp-3);
-  animation: screen-in var(--med) both;
-  padding-right: 0;
+  padding: var(--space-8) var(--space-8) var(--space-12);
 }
-.qcard__top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.tag {
-  font-size: 11.5px; letter-spacing: .05em; text-transform: uppercase;
-  padding: 3px 9px; border-radius: 999px;
-  border: 1px solid var(--line); color: var(--muted);
-  background: var(--surface);
-}
-.tag--open { border-color: rgba(77,157,255,.4); color: #9ac8ff; }
-.tag--diff { border-color: rgba(240,180,41,.35); color: #ffd277; }
-.qcard__text { font-size: 21px; line-height: 1.45; font-weight: 520; }
 
-.opts { display: flex; flex-direction: column; gap: 10px; }
-.opt {
-  display: flex; align-items: flex-start; gap: 13px;
-  padding: 14px 17px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-md);
-  background: var(--surface);
-  cursor: pointer;
-  transition: border-color var(--fast), background var(--fast), transform var(--fast);
+.qcard {
+  width: 100%;
+  max-width: 80ch;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
 }
-.opt:hover { border-color: #3a4b6d; background: var(--surface-2); }
-.opt input { position: absolute; opacity: 0; width: 0; height: 0; }
+
+.qcard__top { display: flex; gap: var(--space-2); flex-wrap: wrap; }
+/* .tag — вариант .badge для метаданных вопроса */
+.tag {
+  display: inline-flex;
+  align-items: center;
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--border-hair);
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-small);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.tag--open { border-color: var(--text-primary); color: var(--text-primary); }
+.tag--diff { background: var(--gray-100); color: var(--text-primary); }
+
+.qcard__text {
+  font-size: var(--fs-h2);
+  line-height: var(--lh-head);
+  letter-spacing: -0.03em;
+  user-select: text;
+}
+
+/* -------------------------- варианты ответа (.opt) ------------------------- */
+
+.opts { display: flex; flex-direction: column; gap: var(--space-3); }
+.opt {
+  display: grid;
+  grid-template-columns: var(--space-6) minmax(0, 1fr);
+  gap: var(--space-4);
+  align-items: center;
+  min-height: var(--tap-min);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--gray-300);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: border-color var(--transition), background var(--transition);
+}
+.opt:hover { border-color: var(--text-primary); }
+.opt input { position: absolute; width: 1px; height: 1px; opacity: 0; margin: 0; }
 .opt__radio {
-  width: 20px; height: 20px; flex: none; margin-top: 1px;
-  border: 1.6px solid var(--line); border-radius: 50%;
-  position: relative; transition: border-color var(--fast);
+  position: relative;
+  width: var(--space-6);
+  height: var(--space-6);
+  border: 2px solid var(--gray-500);
+  border-radius: 50%;
+  background: var(--bg-canvas);
+  transition: border-color var(--transition);
 }
 .opt__radio::after {
-  content: ""; position: absolute; inset: 4px;
-  border-radius: 50%; background: var(--accent);
-  transform: scale(0); transition: transform var(--fast);
+  content: "";
+  position: absolute;
+  inset: 25%;
+  border-radius: 50%;
+  background: var(--ink);
+  transform: scale(0);
+  transition: transform var(--transition);
 }
-.opt input:checked + .opt__radio { border-color: var(--accent); }
+.opt input:checked + .opt__radio { border-color: var(--text-primary); }
 .opt input:checked + .opt__radio::after { transform: scale(1); }
-.opt.is-checked { border-color: var(--accent); background: rgba(77,157,255,.08); }
-.opt__label { font-size: 15.5px; }
+.opt input:focus-visible + .opt__radio { outline: var(--focus-ring-width) solid var(--focus-ring-color); outline-offset: var(--focus-offset); }
+/* Выбранный вариант: рамка 2px + светлая заливка + залитая точка. Кислотным
+   большие области не заливаем — он остаётся за кнопкой действия. */
+.opt.is-checked {
+  border-color: var(--text-primary);
+  border-width: 2px;
+  background: var(--gray-100);
+}
+.opt__label { font-size: var(--fs-body); line-height: var(--lh-body); user-select: text; }
+
+/* ---------------------------- поле ответа (.answer) ------------------------ */
 
 .answer {
   width: 100%;
-  min-height: 240px;
+  min-height: calc(var(--space-22) * 2);
+  padding: var(--space-4);
+  border: 1px solid var(--gray-300);
+  border-radius: var(--radius-sm);
+  background: var(--bg-canvas);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
   resize: vertical;
-  background: var(--bg);
-  border: 1px solid var(--line);
-  border-radius: var(--r-md);
-  color: var(--text);
-  font: inherit; font-size: 15.5px; line-height: 1.6;
-  padding: 16px 18px;
   user-select: text;
-  transition: border-color var(--fast), box-shadow var(--fast);
 }
-.answer:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(77,157,255,.14); }
-.answer::placeholder { color: #55617a; }
+.answer:focus { border-color: var(--text-primary); outline: none; }
+.answer:focus-visible { outline: var(--focus-ring-width) solid var(--focus-ring-color); outline-offset: var(--focus-offset); }
+.answer::placeholder { color: var(--gray-500); }
 
-.qcard__foot { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3); font-size: 12.5px; color: var(--muted); }
-.qcard__privacy { display: flex; align-items: center; gap: 8px; }
-.qcard__privacy svg { width: 15px; height: 15px; flex: none; }
-.qcard__privacy svg * { fill: none; stroke: var(--muted); stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+.qcard__foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  font-size: var(--fs-small);
+  color: var(--text-muted);
+}
+.qcard__privacy { display: inline-flex; align-items: center; gap: var(--space-2); }
+.qcard__privacy svg { width: var(--space-4); height: var(--space-4); flex: none; }
+.qcard__privacy svg * { fill: none; stroke: var(--text-muted); stroke-width: 1.8; }
+
+/* -------------------------------- низ экрана ------------------------------- */
 
 .exam__foot {
-  display: flex; align-items: center; gap: var(--sp-2);
-  padding: 13px 22px;
-  padding-right: calc(var(--hud-w) + 40px);
-  border-top: 1px solid var(--line-soft);
-  background: rgba(15,20,32,.7);
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-8);
+  border-top: 1px solid var(--border-hair);
 }
-.exam__footspacer { flex: 1; font-size: 12.5px; color: var(--muted); text-align: center; }
+.exam__footspacer { flex: 1; font-size: var(--fs-small); color: var(--text-muted); }
 
-/* ============================== Отчёт ============================== */
+/* ===========================================================================
+   7. ЭКРАН 5 — ОТЧЁТ (светлая среда анализа)
+   =========================================================================== */
 
-.report { display: grid; grid-template-columns: auto 1fr; gap: var(--sp-4); align-items: center; }
-@media (max-width: 760px) { .report { grid-template-columns: 1fr; } }
-.report__score { display: flex; flex-direction: column; align-items: center; gap: 8px; }
-.report__scorenote { font-size: 12.5px; color: var(--muted); }
-.report__tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: var(--sp-2); }
+.report {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: var(--space-8);
+  align-items: center;
+  padding: var(--space-6);
+  border: 1px solid var(--text-primary);
+  border-radius: var(--radius-md);
+}
+.report__score { display: flex; flex-direction: column; align-items: center; gap: var(--space-3); }
+.report__scorenote {
+  font-size: var(--fs-small);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  color: var(--text-muted);
+}
+.report__tiles {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--space-4);
+}
 .tile {
-  background: var(--surface); border: 1px solid var(--line);
-  border-radius: var(--r-md); padding: 16px 18px;
+  padding: var(--space-4);
+  border-left: 2px solid var(--border-hair);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
 }
-.tile__num { font-size: 28px; font-weight: 620; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
-.tile__cap { font-size: 12.5px; color: var(--muted); }
-.report__hint { flex: 1; font-size: 12.5px; color: var(--muted); }
+.tile__num {
+  font-size: var(--fs-h2);
+  font-weight: 700;
+  line-height: var(--lh-head);
+  letter-spacing: -0.04em;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tile__cap { font-size: var(--fs-small); color: var(--text-muted); }
+.report__hint { flex: 1; font-size: var(--fs-small); color: var(--text-muted); }
 
-.bars { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 12px; }
-.bars__empty, .log__empty, .feed__empty, .hud__contribempty { color: var(--muted); font-size: 13px; }
-.bar__head { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; margin-bottom: 5px; }
-.bar__name { color: var(--text-dim); }
-.bar__val { color: var(--text); font-variant-numeric: tabular-nums; }
-.bar__track { height: 6px; border-radius: 4px; background: var(--surface-3); overflow: hidden; }
-.bar__fill { height: 100%; border-radius: 4px; transition: width var(--slow); }
+/* ------------------------- вклад в оценку (.bars) ------------------------- */
+/* Цвет полосы приходит из app.js (T.colorFor) — он дублирует число справа. */
 
-.log { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; max-height: 320px; overflow-y: auto; }
-.log li { display: grid; grid-template-columns: 64px 1fr; gap: 10px; font-size: 13.2px; padding-bottom: 8px; border-bottom: 1px solid var(--line-soft); }
-.log__time { color: var(--muted); font-family: var(--mono); font-size: 12px; }
-.log__msg { color: var(--text-dim); }
-.log__sev { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 7px; vertical-align: middle; }
+.bars { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-3); }
 
-/* ============================== Кольцо risk-score ============================== */
+/* Пустые состояния лент. Селекторы с «>» обязательны: иначе правило .feed li /
+   .log li навяжет им сетку и единственная строка текста уедет в колонку точки.
+   Классы приходят из разметки app.js и hud.js, менять их нельзя. */
+.bars > .bars__empty,
+.log > .log__empty,
+.feed > .feed__empty,
+.hud__contrib > .hud__contribempty {
+  display: block;
+  list-style: none;
+  padding: var(--space-2) 0;
+  border: 0;
+  font-size: var(--fs-small);
+  color: var(--text-muted);
+}
+.monitor .log > .log__empty,
+.monitor .feed > .feed__empty,
+.monitor .bars > .bars__empty,
+.monitor .hud__contrib > .hud__contribempty { color: var(--text-muted-on-dark); }
 
-.ring { position: relative; width: 104px; height: 104px; flex: none; }
-.ring--lg { width: 168px; height: 168px; }
+.bar__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-bottom: var(--space-1);
+  font-size: var(--fs-small);
+}
+.bar__name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bar__val {
+  flex: none;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.bar__track { height: var(--space-2); border-radius: 999px; background: var(--gray-100); overflow: hidden; }
+.monitor .bar__track { background: var(--graphite); }
+.bar__fill { height: 100%; border-radius: 999px; transition: width var(--transition); }
+
+/* ------------------------- журнал инцидентов (.log) ----------------------- */
+
+.log { list-style: none; margin: 0; padding: 0; max-height: calc(var(--space-22) * 5); overflow-y: auto; }
+.log li:first-child { border-top: 0; }
+.log__msg { line-height: var(--lh-body); }
+
+/* ===========================================================================
+   8. КОЛЬЦО RISK-SCORE (одна ключевая метрика — здесь кислотный уместен)
+   =========================================================================== */
+
+.ring { position: relative; width: var(--ring-size); height: var(--ring-size); flex: none; }
+.ring--lg { width: var(--ring-size-lg); height: var(--ring-size-lg); }
 .ring svg { width: 100%; height: 100%; transform: rotate(-90deg); }
-.ring__track { fill: none; stroke: var(--surface-3); stroke-width: 8; }
+.ring__track { fill: none; stroke: var(--border-hair); stroke-width: 7; }
+.monitor .ring__track { stroke: var(--graphite); }
 .ring__value {
-  fill: none; stroke: var(--ok); stroke-width: 8; stroke-linecap: round;
-  stroke-dasharray: 263.9; stroke-dashoffset: 263.9;
-  transition: stroke-dashoffset var(--slow), stroke var(--med);
+  fill: none;
+  stroke: var(--risk-ok);
+  stroke-width: 7;
+  stroke-linecap: round;
+  /* длина окружности r=42 — hud.js и app.js считают dashoffset от этого числа */
+  stroke-dasharray: var(--ring-len);
+  stroke-dashoffset: var(--ring-len);
+  transition: stroke-dashoffset 0.48s ease, stroke var(--transition);
 }
 .ring__center {
-  position: absolute; inset: 0;
-  display: flex; flex-direction: column; align-items: center; justify-content: center;
-  gap: 1px;
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
 }
-.ring__num { font-size: 27px; font-weight: 650; line-height: 1; font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
-.ring--lg .ring__num { font-size: 46px; }
-.ring__label { font-size: 10.5px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
-.ring--lg .ring__label { font-size: 12px; }
+.ring__num {
+  font-size: var(--fs-h3);
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: -0.04em;
+  font-variant-numeric: tabular-nums;
+}
+.ring--lg .ring__num { font-size: var(--fs-h1); }
+.ring__label {
+  font-size: var(--fs-small);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  color: var(--text-muted);
+}
+.monitor .ring__label { color: var(--text-muted-on-dark); }
 
-.lvl-ok    .ring__value { stroke: var(--ok); }
-.lvl-warn  .ring__value { stroke: var(--warn); }
-.lvl-pause .ring__value { stroke: var(--high); }
-.lvl-lock  .ring__value { stroke: var(--crit); }
-.lvl-ok    .ring__label { color: var(--ok); }
-.lvl-warn  .ring__label { color: var(--warn); }
-.lvl-pause .ring__label { color: var(--high); }
-.lvl-lock  .ring__label { color: var(--crit); }
+/* Уровень риска: кольцо + подпись словом (#hud-level / #report-level). */
+.lvl-ok    .ring__value { stroke: var(--risk-ok); }
+.lvl-warn  .ring__value { stroke: var(--risk-warn); }
+.lvl-pause .ring__value { stroke: var(--risk-pause); }
+.lvl-lock  .ring__value { stroke: var(--risk-lock); }
 
-/* ============================== HUD ============================== */
+/* Цвет уровня живёт на дуге. Подпись на ТЁМНОМ повторяет его, на СВЕТЛОМ —
+   нет: --risk-warn на белом даёт 1.73:1, --risk-pause 2.36:1. На листе слово
+   остаётся чёрным, а цвет несёт кольцо — смысл не теряется. */
+.sheet .ring__label { color: var(--text-primary); }
+.monitor .lvl-ok    .ring__label { color: var(--risk-ok); }
+.monitor .lvl-warn  .ring__label { color: var(--risk-warn); }
+.monitor .lvl-pause .ring__label { color: var(--risk-pause); }
+.monitor .lvl-lock  .ring__label { color: var(--risk-lock); }
+
+/* ===========================================================================
+   9. HUD ПРОКТОРИНГА (тёмная среда наблюдения)
+   =========================================================================== */
 
 .hud {
   position: fixed;
-  top: 72px; right: 18px;
+  top: calc(var(--topbar-h) + var(--space-4));
+  right: var(--space-6);
   width: var(--hud-w);
+  max-height: calc(100vh - var(--topbar-h) - var(--space-12));
   z-index: 40;
-  background: linear-gradient(180deg, rgba(23,30,46,.97), rgba(13,17,27,.97));
-  border: 1px solid var(--line);
-  border-radius: var(--r-lg);
-  box-shadow: 0 22px 54px rgba(0,0,0,.52);
-  backdrop-filter: blur(10px);
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-hair-dark);
+  border-radius: var(--radius-lg);
+  background: var(--bg-panel);
+  box-shadow: 0 var(--space-6) var(--space-16) color-mix(in srgb, var(--ink), transparent 45%);
   overflow: hidden;
-  animation: screen-in var(--med) both;
 }
-.hud[hidden] { display: none; }
+.hud[hidden] { display: none !important; }
 
 .hud__head {
-  display: flex; align-items: center; gap: 9px;
-  padding: 11px 13px;
-  border-bottom: 1px solid var(--line-soft);
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-2) var(--space-2) var(--space-4);
+  border-bottom: 1px solid var(--border-hair-dark);
 }
+/* Точка LIVE: кислотная, с пульсацией. Рядом латинская метка и подпись словом —
+   индикатор записи не опирается на один цвет. */
 .hud__live {
-  width: 8px; height: 8px; border-radius: 50%;
-  background: var(--danger);
-  box-shadow: 0 0 0 0 rgba(255,95,95,.5);
-  animation: pulse-rec 2.2s infinite;
+  width: var(--space-2);
+  height: var(--space-2);
+  flex: none;
+  border-radius: 50%;
+  background: var(--signal);
+  animation: pulse-rec 2.2s ease-out infinite;
 }
 @keyframes pulse-rec {
-  0%   { box-shadow: 0 0 0 0 rgba(255,95,95,.55); }
-  70%  { box-shadow: 0 0 0 8px rgba(255,95,95,0); }
-  100% { box-shadow: 0 0 0 0 rgba(255,95,95,0); }
+  0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--signal), transparent 45%); }
+  70%  { box-shadow: 0 0 0 var(--space-2) color-mix(in srgb, var(--signal), transparent 100%); }
+  100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--signal), transparent 100%); }
 }
-.hud__title { flex: 1; font-size: 12.5px; font-weight: 580; letter-spacing: .01em; color: var(--text-dim); }
+.hud__cap { font-size: var(--fs-label); color: var(--signal); }
+.hud__title {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--fs-small);
+  font-weight: 600;
+  color: var(--text-muted-on-dark);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .hud__toggle {
-  appearance: none; background: transparent; border: none; cursor: pointer;
-  width: 24px; height: 24px; display: grid; place-items: center; border-radius: 6px;
-  transition: background var(--fast);
+  width: var(--tap-min);
+  height: var(--tap-min);
+  flex: none;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  transition: background var(--transition);
 }
-.hud__toggle:hover { background: var(--surface-3); }
+.hud__toggle:hover { background: var(--graphite); }
 .hud__chev {
-  width: 8px; height: 8px;
-  border-right: 1.8px solid var(--text-dim);
-  border-bottom: 1.8px solid var(--text-dim);
+  width: var(--space-2);
+  height: var(--space-2);
+  border-right: 2px solid var(--text-muted-on-dark);
+  border-bottom: 2px solid var(--text-muted-on-dark);
   transform: rotate(225deg);
-  transition: transform var(--med);
+  transition: transform var(--transition);
 }
 .hud.is-collapsed .hud__chev { transform: rotate(45deg); }
 .hud.is-collapsed .hud__body { display: none; }
 
-.hud__body { padding: 13px; display: flex; flex-direction: column; gap: 14px; }
-
-.hud__risk { display: grid; grid-template-columns: 104px 1fr; gap: 13px; align-items: center; }
-.hud__riskside { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
-.hud__riskcap { font-size: 10.5px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
-.hud__contrib { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
-.hud__contrib li { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--text-dim); }
-.hud__contrib .c__n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.hud__contrib .c__v { color: var(--muted); font-variant-numeric: tabular-nums; flex: none; }
-.hud__fps { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
-
-.hud__section { display: flex; flex-direction: column; gap: 8px; }
-.hud__sectitle {
-  font-size: 10.5px; text-transform: uppercase; letter-spacing: .09em; color: var(--muted);
-  padding-top: 11px; border-top: 1px solid var(--line-soft);
+.hud__body {
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  overflow-y: auto;
 }
 
-.chans { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+.hud__risk { display: grid; grid-template-columns: var(--ring-size) minmax(0, 1fr); gap: var(--space-4); align-items: center; }
+.hud__riskside { display: flex; flex-direction: column; gap: var(--space-2); min-width: 0; }
+.hud__riskcap { font-size: var(--fs-small); text-transform: uppercase; letter-spacing: var(--tracking-label); color: var(--text-muted-on-dark); }
+.hud__contrib { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-1); }
+.hud__contrib li { display: flex; justify-content: space-between; gap: var(--space-2); font-size: var(--fs-small); color: var(--text-muted-on-dark); }
+.hud__contrib .c__n { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hud__contrib .c__v { flex: none; font-family: var(--font-mono); font-variant-numeric: tabular-nums; color: var(--text-muted-on-dark); }
+.hud__fps { font-size: var(--fs-small); color: var(--text-muted-on-dark); font-variant-numeric: tabular-nums; }
+
+.hud__section { display: flex; flex-direction: column; gap: var(--space-3); }
+.hud__sectitle {
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-hair-dark);
+  font-size: var(--fs-small);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  color: var(--text-muted-on-dark);
+}
+
+/* --------------------------- каналы наблюдения ---------------------------- */
+/* Состояние канала: точка (цвет + форма) + подпись словом в .chan__state. */
+
+.chans { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-2); }
 .chan {
-  display: flex; align-items: center; gap: 8px;
-  padding: 8px 10px;
-  border: 1px solid var(--line-soft);
-  border-radius: 9px;
-  background: var(--surface);
-  transition: border-color var(--med), background var(--med);
+  --tone: var(--gray-500);
+  display: grid;
+  /* точка -> название и состояние словом -> ФИГУРА состояния (hud.js) */
+  grid-template-columns: var(--space-3) minmax(0, 1fr) auto;
+  gap: var(--space-2);
+  align-items: start;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-hair-dark);
+  border-radius: var(--radius-sm);
+  background: var(--bg-monitor);
 }
 .chan__dot {
-  width: 9px; height: 9px; border-radius: 50%; flex: none;
-  background: var(--muted);
-  transition: background var(--med), box-shadow var(--med);
+  width: var(--space-3);
+  height: var(--space-3);
+  margin-top: 3px;
+  border: 2px solid var(--tone);
+  border-radius: 50%;
+  background: var(--tone);
 }
 .chan__text { display: flex; flex-direction: column; min-width: 0; }
-.chan__name { font-size: 12.5px; font-weight: 540; }
-.chan__state { font-size: 10.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chan__name { font-size: var(--fs-small); font-weight: 600; color: var(--text-on-dark); }
+.chan__state { font-size: var(--fs-small); color: var(--text-muted-on-dark); overflow: hidden; text-overflow: ellipsis; }
 
-.chan.s-ok   .chan__dot { background: var(--ok);     box-shadow: 0 0 8px rgba(47,192,138,.5); }
-.chan.s-warn .chan__dot { background: var(--warn);   box-shadow: 0 0 8px rgba(240,180,41,.5); }
-.chan.s-bad  .chan__dot { background: var(--danger); box-shadow: 0 0 9px rgba(255,95,95,.6); }
-.chan.s-off  .chan__dot { background: #3a4660; }
-.chan.s-warn { border-color: rgba(240,180,41,.3); background: rgba(240,180,41,.05); }
-.chan.s-bad  { border-color: rgba(255,95,95,.34); background: rgba(255,95,95,.07); }
+.chan.s-ok   { --tone: var(--risk-ok); }
+.chan.s-warn { --tone: var(--warning); border-color: var(--warning); }
+.chan.s-bad  { --tone: var(--danger); border-color: var(--danger); }
+/* канал выключен — ПУСТОЕ кольцо: отсутствие данных отличается формой, не цветом */
+.chan.s-off  { --tone: var(--gray-500); }
+.chan.s-off .chan__dot { background: transparent; }
 
-.feed { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 7px; }
-.feed li { display: grid; grid-template-columns: 7px 46px 1fr; gap: 8px; align-items: baseline; font-size: 12px; }
-.feed__sev { width: 7px; height: 7px; border-radius: 50%; margin-top: 5px; }
-.feed__time { color: var(--muted); font-family: var(--mono); font-size: 11px; }
-.feed__msg { color: var(--text-dim); line-height: 1.4; }
-.feed__new { animation: feed-in var(--med) both; }
-@keyframes feed-in { from { opacity: 0; transform: translateX(10px); } to { opacity: 1; transform: none; } }
+/* ----------------------------- лента событий ------------------------------ */
 
-.sev-info     { background: var(--accent); }
-.sev-low      { background: var(--warn); }
-.sev-medium   { background: var(--high); }
-.sev-high     { background: var(--danger); }
-.sev-critical { background: var(--crit); }
+.feed { list-style: none; margin: 0; padding: 0; }
+.feed li:first-child { border-top: 0; }
+.feed__msg { line-height: var(--lh-body); color: var(--text-muted-on-dark); }
+.feed__new { animation: feed-in var(--transition) both; }
+@keyframes feed-in {
+  from { opacity: 0; transform: translateY(calc(var(--space-2) * -1)); }
+  to   { opacity: 1; transform: none; }
+}
 
-/* ============================== Мягкие уведомления ============================== */
+/* ===========================================================================
+   10. ТОСТЫ И ОВЕРЛЕИ
+   =========================================================================== */
 
-.toasts {
+/* Контейнер неблокирующих сообщений. hud.js пишет сюда .alert--toast.
+   Правый нижний угол: не закрывает ни вопрос, ни HUD. */
+.toasts,
+.alerts {
   position: fixed;
-  /* выше нижней панели экзамена, чтобы не перекрывать кнопки навигации */
-  bottom: 86px; left: 50%; transform: translateX(-50%);
+  right: var(--space-6);
+  bottom: var(--space-6);
   z-index: 60;
-  display: flex; flex-direction: column; gap: 9px; align-items: center;
-  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  width: min(calc(var(--space-22) * 5), calc(100vw - var(--space-12)));
 }
-.toast {
-  display: flex; align-items: center; gap: 12px;
-  max-width: 560px;
-  padding: 12px 18px;
-  border-radius: 999px;
-  background: rgba(32,40,60,.96);
-  border: 1px solid rgba(240,180,41,.45);
-  box-shadow: 0 14px 34px rgba(0,0,0,.45);
-  font-size: 14px;
-  color: var(--text);
-  animation: toast-in var(--med) both;
+/* При открытом HUD сообщение встаёт левее панели и выше нижней строки кнопок
+   экзамена: перекрывать «Далее» и «Завершить» оно не должно. */
+.app.has-hud ~ .toasts,
+.app.has-hud ~ .alerts {
+  right: calc(var(--hud-w) + var(--space-12));
+  bottom: calc(var(--space-22) + var(--space-4));
 }
-.toast.is-out { animation: toast-out var(--med) both; }
-.toast__mark { width: 9px; height: 9px; border-radius: 50%; background: var(--warn); flex: none; }
-.toast__sub { color: var(--muted); font-size: 12.5px; }
-@keyframes toast-in  { from { opacity: 0; transform: translateY(14px) scale(.97); } to { opacity: 1; transform: none; } }
-@keyframes toast-out { to   { opacity: 0; transform: translateY(10px) scale(.98); } }
 
-/* ============================== Оверлеи ============================== */
+/* Неблокирующее сообщение (hud.js): полоса уровня, факт с пояснением,
+   код наблюдения и кнопка закрытия — четыре колонки. */
+.alert--toast {
+  grid-template-columns: var(--space-1) minmax(0, 1fr) auto auto;
+  box-shadow: 0 var(--space-4) var(--space-12) color-mix(in srgb, var(--ink), transparent 50%);
+  animation: toast-in var(--transition) both;
+  transition: opacity var(--transition);
+}
+.alert--toast.is-out { opacity: 0; }
+.alert__close {
+  min-width: var(--tap-min);
+  min-height: var(--tap-min);
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: inherit;
+  font-size: var(--fs-body);
+}
+.alert__close:hover { background: var(--graphite); }
+@keyframes toast-in { from { opacity: 0; transform: translateY(var(--space-3)); } to { opacity: 1; transform: none; } }
 
 .overlay {
-  position: fixed; inset: 0; z-index: 70;
-  display: grid; place-items: center;
-  padding: var(--sp-4);
-  animation: fade-in var(--med) both;
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: grid;
+  place-items: center;
+  padding: var(--space-6);
+  background: color-mix(in srgb, var(--ink), transparent 14%);
+  animation: fade-in var(--transition) both;
+  /* Страховка: если корень пришёл без модификатора состояния, тон всё равно
+     остаётся предупреждающим, а не серым из body. */
+  --tone: var(--risk-warn);
 }
-.overlay[hidden] { display: none; }
+.overlay[hidden] { display: none !important; }
 @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
-.overlay--pause { background: rgba(7,10,17,.72); backdrop-filter: blur(7px); }
-.overlay--lock  { background: rgba(9,6,10,.92); backdrop-filter: blur(12px); }
+
+/*
+ * Состояние задаётся на корне оверлея и спускается вниз через --tone.
+ * До этого .overlay--pause / .overlay--lock (их навешивает и разметка, и hud.js)
+ * не имели ни одного правила: различие держалось только на дочерних
+ * .overlay__card--lock и .overlay__badge--*, то есть модификаторы корня были
+ * мёртвым контрактом между js и css. Теперь тон один на оба состояния.
+ */
+.overlay--pause { --tone: var(--risk-pause); }
+.overlay--lock { --tone: var(--risk-lock); }
 
 .overlay__card {
-  width: min(560px, 100%);
-  background: linear-gradient(180deg, var(--surface), var(--bg-soft));
-  border: 1px solid var(--line);
-  border-radius: 22px;
-  padding: 30px 32px;
-  display: flex; flex-direction: column; gap: 14px;
-  box-shadow: 0 30px 80px rgba(0,0,0,.6);
-  text-align: left;
+  width: min(calc(var(--space-22) * 7), 100%);
+  max-height: 100%;
+  overflow-y: auto;
+  padding: var(--space-8);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  align-items: flex-start;
+  border: 1px solid var(--border-hair-dark);
+  border-radius: var(--radius-lg);
+  background: var(--bg-panel);
 }
-.overlay__card--lock { border-color: rgba(255,47,85,.36); align-items: center; text-align: center; }
-.lockmark { width: 56px; height: 56px; }
-.lockmark * { fill: none; stroke: var(--crit); stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; }
-.lockmark circle { fill: var(--crit); stroke: none; }
+/* Тон приходит с корня (.overlay--lock), значение то же --risk-lock = --danger */
+.overlay__card--lock { border-color: var(--tone); }
 
+.lockmark { width: var(--space-12); height: var(--space-12); }
+.lockmark * { fill: none; stroke: var(--danger); stroke-width: 2.4; stroke-linecap: round; }
+.lockmark circle { fill: var(--danger); stroke: none; }
+
+/* Бейдж состояния: слово + форма метки, цвет третьим носителем */
 .overlay__badge {
-  align-self: flex-start;
-  font-size: 11px; text-transform: uppercase; letter-spacing: .1em;
-  padding: 4px 11px; border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid currentColor;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: var(--fs-small);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
 }
-.overlay__card--lock .overlay__badge { align-self: center; }
-.overlay__badge--pause { background: rgba(255,138,61,.14); color: var(--high); border: 1px solid rgba(255,138,61,.4); }
-.overlay__badge--lock  { background: rgba(255,47,85,.14);  color: var(--crit); border: 1px solid rgba(255,47,85,.42); }
-.overlay__title { font-size: 25px; }
-.overlay__text { color: var(--text-dim); font-size: 15px; }
-.overlay__cond { margin: 0; padding-left: 20px; color: var(--text-dim); font-size: 14px; display: flex; flex-direction: column; gap: 6px; }
-.overlay__note { font-size: 12.8px; color: var(--muted); }
-.overlay__wait { font-size: 12px; color: var(--muted); }
-.overlay__session {
-  display: flex; flex-direction: column; align-items: center; gap: 2px;
-  padding: 12px 20px; border-radius: var(--r-md);
-  background: var(--bg); border: 1px solid var(--line);
-}
-.overlay__sesscap { font-size: 10.5px; text-transform: uppercase; letter-spacing: .09em; color: var(--muted); }
-.overlay__sessval { font-family: var(--mono); font-size: 17px; color: var(--text); user-select: text; }
+.overlay__badgemark { width: var(--space-2); height: var(--space-2); flex: none; background: currentColor; }
+/* Цвет — с корня оверлея, форма метки — за модификатором: цвет не единственный
+   носитель смысла (пауза — квадрат, блокировка — круг), плюс слово в самом бейдже. */
+.overlay__badge--pause,
+.overlay__badge--lock { color: var(--tone); }
+.overlay__badge--pause .overlay__badgemark { border-radius: 0; }
+.overlay__badge--lock .overlay__badgemark { border-radius: 50%; }
 
-/* ============================== Прочее ============================== */
+.overlay__title { font-size: var(--fs-h2); color: var(--text-on-dark); letter-spacing: var(--tracking-display); }
+.overlay__text { font-size: var(--fs-body); color: var(--text-on-dark); }
+.overlay__cond {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+}
+.overlay__cond li {
+  position: relative;
+  padding: var(--space-3) 0 var(--space-3) var(--space-6);
+  border-top: 1px solid var(--border-hair-dark);
+  font-size: var(--fs-small);
+  color: var(--text-muted-on-dark);
+}
+/*
+ * Маркер условия — шеврон, нарисованный границами, а НЕ текстовой стрелкой.
+ * U+2192 «→» отсутствует в cmap всех семи вшитых woff2 и не попадает ни в один
+ * объявленный unicode-range (подробности в шапке fonts.css). При font-src 'self'
+ * подменить его нечем: на демо-машине вне macOS это пустой прямоугольник, а внутри
+ * принудительного var(--font-mono) ещё и съехавшая относительно соседей базовая линия.
+ * Правило 8 дизайн-системы: рисуем сами, внешних ресурсов нет.
+ */
+.overlay__cond li::before {
+  content: "";
+  position: absolute;
+  left: var(--space-1);
+  top: calc(var(--space-3) + 0.78em);
+  width: var(--space-2);
+  height: var(--space-2);
+  border-top: 2px solid var(--signal);
+  border-right: 2px solid var(--signal);
+  transform: translateY(-50%) rotate(45deg);
+}
+.overlay__note { font-size: var(--fs-small); color: var(--text-muted-on-dark); }
+.overlay__wait { font-size: var(--fs-small); color: var(--text-muted-on-dark); font-family: var(--font-mono); }
+
+.overlay__session {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border-hair-dark);
+  border-radius: var(--radius-sm);
+  background: var(--bg-monitor);
+}
+.overlay__sesscap {
+  font-size: var(--fs-small);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  color: var(--text-muted-on-dark);
+}
+.overlay__sessval { font-size: var(--fs-body); color: var(--text-on-dark); user-select: text; }
+
+
+/* ===========================================================================
+   11. РАЗМЕТКА, КОТОРУЮ СОЗДАЮТ JS-МОДУЛИ
+
+   app.js, exam.js, hud.js и calibration.js достраивают часть узлов сами и
+   возят с собой запасные правила в :where() — нулевая специфичность, поэтому
+   всё ниже их перебивает. Эти классы — часть контракта разметки: переименовывать
+   их нельзя, они приходят из JS.
+   =========================================================================== */
+
+/* ------------- app.js: перечень согласия (#consent-disclosure) ------------- */
+/* Светлая среда чтения. Режим каждого сигнала несут значок И подпись словом,
+   поэтому цветовая кодировка строк здесь не нужна вовсе. */
+
+.disclose {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-6);
+  border: 1px solid var(--text-primary);
+  border-radius: var(--radius-md);
+}
+.disclose__head { display: flex; flex-direction: column; gap: var(--space-2); }
+.disclose__lede { max-width: 80ch; font-size: var(--fs-small); }
+
+.disclose__table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+  font-size: var(--fs-small);
+  line-height: var(--lh-body);
+}
+.disclose__table th,
+.disclose__table td {
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--border-hair);
+  vertical-align: top;
+}
+.disclose__table thead th {
+  font-family: var(--font-mono);
+  font-size: var(--fs-small);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  color: var(--text-primary);
+  background: var(--gray-100);
+  white-space: nowrap;
+}
+.disclose__table tbody th { font-weight: 600; }
+.disclose__table tr:last-child th,
+.disclose__table tr:last-child td { border-bottom: 0; }
+.disclose__table tbody tr:hover th,
+.disclose__table tbody tr:hover td { background: var(--gray-100); }
+
+.disclose__mode { display: inline-flex; gap: var(--space-2); align-items: flex-start; white-space: nowrap; }
+.disclose__mode svg { flex: none; width: var(--space-4); height: var(--space-4); margin-top: 0.2em; }
+/* «пишется» — акцент, допустимый на светлом только как ТЁМНЫЙ текст */
+.disclose__mode[data-mode="yes"] { color: var(--signal-text-on-light); font-weight: 600; }
+.disclose__mode[data-mode="ram"] { color: var(--text-muted); }
+.disclose__mode[data-mode="no"]  { color: var(--text-primary); }
+.disclose__detail { max-width: 62ch; color: var(--text-muted); }
+
+/* --------------- app.js: причина блокировки старта и статусы -------------- */
+
+.preflight-block {
+  flex: 1 1 32ch;
+  max-width: 64ch;
+  margin-right: auto;
+  font-size: var(--fs-small);
+  line-height: var(--lh-body);
+  color: var(--warning);
+}
+
+/* .chk__state стал двухстрочным: слово статуса + уточнение */
+.chk__state {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  align-items: flex-end;
+  text-align: right;
+  white-space: normal;
+}
+.chk__word { font-size: var(--fs-small); font-weight: 600; }
+.chk__note { font-size: var(--fs-small); color: var(--text-muted-on-dark); }
+
+/* ------------------------ hud.js: фигуры и засечки ------------------------ */
+
+/* Фигура состояния канала — нецветовой дубль точки, стоит в конце строки */
+.chan__shape { display: inline-flex; align-items: center; margin-left: auto; flex: none; color: var(--tone); }
+.chan__shape svg,
+.badge svg,
+.glyph { display: block; width: var(--space-3); height: var(--space-3); }
+.badge svg { color: var(--tone, var(--gray-500)); }
+/* У бейджа с собственным значком точка ::before лишняя */
+.badge:has(svg)::before { display: none; }
+
+/* Засечки порогов 30/60/90 на кольце: видно пройденный порог без опоры на цвет */
+.ring__tick { stroke: var(--border-hair-dark); }
+.sheet .ring__tick { stroke: var(--border-hair); }
+
+/* ------------------- calibration.js: бейдж, телеметрия, шаги -------------- */
+
+.calib__badge { align-self: flex-start; }
+.calib__tele {
+  display: block;
+  margin-top: var(--space-2);
+  font-size: var(--fs-small);
+  color: var(--text-muted-on-dark);
+}
+.calib__todo {
+  margin: var(--space-2) 0 0;
+  min-height: calc(var(--fs-body) * var(--lh-body));
+  font-size: var(--fs-small);
+  line-height: var(--lh-body);
+  color: var(--text-on-dark);
+}
+.calib__pct { font-size: var(--fs-small); font-variant-numeric: tabular-nums; color: var(--signal); }
+.cstep__text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+/* Пропущенный этап остаётся читаемым: его видно, а не спрятано */
+.cstep.is-skipped { --tone: var(--warning); opacity: 0.75; }
+.cstep.is-skipped .cstep__idx { font-family: var(--font-mono); }
+
+/* --------------------- exam.js: палитра, легенда, ответ ------------------- */
+
+.exam__navwrap { display: flex; flex-direction: column; align-items: center; gap: var(--space-2); min-width: 0; }
+
+/* Кнопка вопроса: номер + ФИГУРА состояния. Цвет — третий носитель. */
+.qbtn {
+  flex-direction: column;
+  gap: 2px;
+  font-variant-numeric: tabular-nums;
+}
+.qbtn__num { font-size: var(--fs-small); line-height: 1; }
+.qbtn__mark { display: grid; place-items: center; height: var(--space-4); color: var(--gray-500); }
+.qbtn__mark svg { display: block; width: var(--space-4); height: var(--space-4); }
+.qbtn.is-answered .qbtn__mark { color: var(--ink); }
+/* Пропущенный вопрос на белом помечен ПУНКТИРОМ: --warning на белом даёт
+   1.73:1 и как носитель смысла на листе не годится. */
+.qbtn.is-skipped { border-style: dashed; border-color: var(--gray-500); }
+.qbtn.is-skipped .qbtn__mark { color: var(--text-muted); }
+.qbtn.is-current .qbtn__mark { color: var(--text-primary); }
+
+/* Легенда состояний: форма + подпись словом, без опоры на цвет */
+.qlegend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+  align-items: center;
+  font-size: var(--fs-small);
+  color: var(--text-muted);
+}
+.qlegend__item { display: inline-flex; align-items: center; gap: var(--space-1); }
+.qlegend__item svg { display: block; width: var(--space-4); height: var(--space-4); }
+.qlegend__item[data-state="answered"] { color: var(--signal-text-on-light); }
+.qlegend__item[data-state="skipped"]  { color: var(--text-primary); }
+.qlegend__item--count { font-variant-numeric: tabular-nums; color: var(--text-primary); }
+
+/* Выбранный вариант помечен галочкой, а не только рамкой */
+.opt { grid-template-columns: var(--space-6) minmax(0, 1fr) auto; }
+.opt__mark { display: grid; place-items: center; width: var(--space-6); color: var(--text-primary); }
+.opt__mark svg { display: block; width: var(--space-4); height: var(--space-4); }
+
+/* Поле развёрнутого ответа: подпись, счётчик, отметка о черновике */
+.answer__wrap { display: flex; flex-direction: column; gap: var(--space-2); max-width: 76ch; }
+.answer__label { font-size: var(--fs-small); font-weight: 600; color: var(--text-muted); }
+.answer { min-height: 15em; }
+.answer__bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: var(--fs-small);
+  color: var(--text-muted);
+}
+.answer__count { font-variant-numeric: tabular-nums; color: var(--text-primary); }
+.answer__saved { font-size: var(--fs-small); }
+
+/* ===========================================================================
+   12. АДАПТИВ. Брейкпоинты 1280 / 768 / 320 — сетка 12 / 8 / 4 колонки.
+   =========================================================================== */
+
+/* Границы объявлены как 1279.98 / 767.98: сам брейкпоинт — это ширина, на
+   которой макет ещё ЦЕЛЫЙ. При max-width:1280px правило сработало бы и ровно
+   на 1280, то есть на штатной ширине демо-экрана. */
+@media (max-width: 1279.98px) {
+  .cards { grid-template-columns: repeat(8, minmax(0, 1fr)); }
+  .cards > * { grid-column: span 8; }
+  .cards--2 > * { grid-column: span 4; }
+
+  .calib { grid-template-columns: 1fr; }
+  .report { grid-template-columns: 1fr; }
+  .report__tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+/* Промежуточная граница, продиктованная шириной содержимого, а не устройством:
+   лист вопроса требует ~700px, HUD — 352px, шапка в одну строку — ~1100px.
+   Ниже этого этапы уезжают на свою строку (подписи не прячем: слово —
+   носитель смысла), а HUD становится нижней полосой. */
+@media (max-width: 1100px) {
+  .topbar {
+    grid-template-columns: minmax(0, 1fr) auto;
+    row-gap: var(--space-3);
+  }
+  .brand { grid-row: 1; grid-column: 1; }
+  .link-state { grid-row: 1; grid-column: 2; }
+  .stepper { grid-row: 2; grid-column: 1 / -1; overflow-x: auto; }
+
+  .hud {
+    top: auto;
+    right: var(--space-4);
+    left: var(--space-4);
+    bottom: var(--space-4);
+    width: auto;
+    max-height: 46vh;
+  }
+  .app.has-hud .screen { right: 0; bottom: calc(46vh + var(--space-4)); }
+  /* HUD занял низ экрана — сообщения поднимаются над ним */
+  .app.has-hud ~ .toasts,
+  .app.has-hud ~ .alerts { bottom: calc(46vh + var(--space-4)); }
+}
+
+@media (max-width: 767.98px) {
+  .cards { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .cards > *,
+  .cards--2 > * { grid-column: span 4; }
+
+  .topbar { padding: var(--space-3) var(--space-4); }
+  /* Состояние связи должно сжиматься, иначе оно наезжает на вордмарк */
+  .topbar { grid-template-columns: minmax(0, 1fr) minmax(0, max-content); }
+  .topbar .link-state { min-width: 0; }
+  .screen__inner { padding: var(--space-8) var(--space-4) var(--space-12); gap: var(--space-6); }
+
+  .exam__bar { grid-template-columns: minmax(0, 1fr) auto; row-gap: var(--space-3); padding: var(--space-3) var(--space-4); }
+  .exam__nav { grid-column: 1 / -1; order: 3; justify-content: flex-start; }
+  .exam__body { padding: var(--space-6) var(--space-4); }
+  .exam__foot { padding: var(--space-3) var(--space-4); flex-wrap: wrap; }
+  .exam__footspacer { order: 3; flex-basis: 100%; }
+
+  .chans { grid-template-columns: 1fr; }
+  .chk { grid-template-columns: var(--space-8) minmax(0, 1fr); }
+  .chk__state { grid-column: 2; justify-self: start; }
+  .report__tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .calib__viewport { height: calc(var(--space-22) * 4); }
+  .form-grid { grid-template-columns: 1fr; }
+  .consent-bar { padding: var(--space-4); }
+  .alert { grid-template-columns: var(--space-1) minmax(0, 1fr); }
+  .alert__code { grid-column: 2; }
+}
+
+@media (max-width: 320px) {
+  .screen__inner { padding: var(--space-6) var(--space-3) var(--space-8); }
+  .card { padding: var(--space-4); }
+  .report__tiles { grid-template-columns: 1fr; }
+  .brand__sub { display: none; }
+  .topbar .link-state__cap { display: none; }
+  .actions { flex-direction: column; align-items: stretch; }
+  .btn { width: 100%; }
+}
+
+/* ===========================================================================
+   13. ДОСТУПНОСТЬ
+   tokens.css уже гасит анимации и переходы глобально при prefers-reduced-motion.
+   Здесь — то, что обязано ОСТАНОВИТЬСЯ, а не ускориться: сканлайн, волна,
+   гало точки, мигание таймера и вращение индикатора проверки застывают
+   в видимом состоянии.
+   =========================================================================== */
 
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after {
-    animation-duration: .01ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: .01ms !important;
+  .scanline,
+  .wave span,
+  .calib__dot::before,
+  .hud__live,
+  .chk.is-pending .chk__mark svg,
+  .exam__timer.is-crit .exam__timerval {
+    animation: none !important;
   }
+  .scanline { top: 50%; }
+  .wave span { height: 65%; }
+  .calib__dot::before { transform: scale(1); opacity: 0.6; }
+  .chk.is-pending .chk__mark circle { stroke-dasharray: none; }
+  .screen, .feed__new, .alert--toast, .overlay { animation: none !important; }
 }
 
-@media (max-width: 1180px) {
-  .hud { width: 300px; }
-  :root { --hud-w: 300px; }
+/* Высокая контрастность: усиливаем границы и убираем полупрозрачность.
+   Значения цветов при этом всё равно переопределяет tokens.css. */
+@media (prefers-contrast: more) {
+  .card,
+  .chk,
+  .chan,
+  .cstep,
+  .opt,
+  .qbtn,
+  .field__input,
+  .answer,
+  .badge,
+  .tag,
+  .status-chip,
+  .alert,
+  .notice,
+  .overlay__card,
+  .alert--toast,
+  .scan-panel,
+  .chart,
+  .table-wrap { border-width: 2px; }
+
+  .brand__ring,
+  .brand__tick,
+  .scan-visual__cross,
+  .room-grid { opacity: 1; }
+
+  .step.is-done .step__dot { opacity: 1; }
+  .chk__mark circle { opacity: 1; }
+  .btn:disabled { opacity: 0.6; }
+  .calib__video { opacity: 1; }
 }

@@ -89,6 +89,7 @@ class EventKind(str, Enum):
     SPEECH_WITHOUT_LIP_MOTION = "SPEECH_WITHOUT_LIP_MOTION"  # наушник со связью
 
     # --- окружение (проверки ОС) ---
+    AUDIO_DEVICE_CONNECTED = "AUDIO_DEVICE_CONNECTED"  # наушники/гарнитура во время экзамена
     VIRTUAL_CAMERA = "VIRTUAL_CAMERA"
     REMOTE_ACCESS_SOFTWARE = "REMOTE_ACCESS_SOFTWARE"
     VIRTUAL_MACHINE = "VIRTUAL_MACHINE"
@@ -139,6 +140,9 @@ RISK_WEIGHTS: dict[EventKind, float] = {
     EventKind.VOICE_OTHER: 40.0,
     EventKind.SPEECH_WITHOUT_LIP_MOTION: 45.0,
 
+    # Замена аудио-анализа в режиме аудитории: детерминированно, ложных не даёт.
+    # Вес высокий — наушники во время экзамена это прямой признак внешней подсказки.
+    EventKind.AUDIO_DEVICE_CONNECTED: 40.0,
     EventKind.VIRTUAL_CAMERA: 70.0,
     EventKind.REMOTE_ACCESS_SOFTWARE: 60.0,
     EventKind.VIRTUAL_MACHINE: 30.0,
