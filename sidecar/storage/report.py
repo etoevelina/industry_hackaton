@@ -1375,6 +1375,7 @@ _PLACEHOLDER_RE = re.compile(r"\{\{\s*([a-z_][a-z0-9_]*)\s*(?:\|\s*safe\s*)?\}\}
 _BUILTIN_TEMPLATE = """<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; media-src data:; font-src data:; base-uri 'none'; form-action 'none'">
 <title>{{ page_title }}</title><style>{{ css }}</style></head>
 <body><main class="page">
 <header class="head"><div class="brand">Отчёт о прокторинге</div>

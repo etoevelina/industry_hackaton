@@ -118,10 +118,14 @@ RULES: dict[str, Rule] = {
     "phone_raised": _rule(
         EventKind.PHONE_RAISED, Channel.VISION, 0.6, 0.6, 12.0,
         "Телефон поднят к лицу{held_for}{conf_area}"),
+    # Текст перечисляет только то, что действительно проверено эвристикой
+    # detectors/objects.py::_eval_aimed (поднят, вертикальный бокс, приближение,
+    # выдержка). Направление взгляда она не использует, и утверждать его в
+    # доказательном отчёте нельзя — подробности всегда лежат в detail.explain.
     "phone_aimed_at_screen": _rule(
         EventKind.PHONE_AIMED_AT_SCREEN, Channel.VISION, 0.6, 0.6, 12.0,
-        "Телефон направлен на экран{held_na}: поднят, держится вертикально, "
-        "взгляд в его сторону{conf_area}"),
+        "Телефон направлен на экран{held_na}: поднят, держится вертикально "
+        "и приближается к камере{conf_area}"),
     "forbidden_object": _rule(
         EventKind.FORBIDDEN_OBJECT, Channel.VISION, 2.0, 1.5, 30.0,
         "В кадре посторонний предмет: {label_ru}{held_dash}{conf_area}"),

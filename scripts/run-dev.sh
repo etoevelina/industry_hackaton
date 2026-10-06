@@ -12,6 +12,7 @@
 #   bash scripts/run-dev.sh --mock          # демо без камеры: события из scripts/demo_scenario.json
 #   bash scripts/run-dev.sh --headless      # реальный сайдкар, но без камеры (проверка протокола)
 #   bash scripts/run-dev.sh --no-kiosk      # окно оболочки можно двигать (отладка)
+#   bash scripts/run-dev.sh --allow-multi-display  # проектор расширением экрана: не блокировать тест
 #   bash scripts/run-dev.sh --sidecar-only  # только сайдкар
 #   bash scripts/run-dev.sh --shell-only    # только оболочка (подключится к уже запущенному)
 #   bash scripts/run-dev.sh --port 8800     # другой порт WS для обоих процессов
@@ -34,6 +35,7 @@ WS_PORT="8787"
 MOCK=0
 HEADLESS=0
 NO_KIOSK=0
+ALLOW_MULTI_DISPLAY=0
 SIDECAR_ONLY=0
 SHELL_ONLY=0
 PASSTHROUGH=0
@@ -58,6 +60,7 @@ while [ $# -gt 0 ]; do
         --mock)          MOCK=1 ;;
         --headless)      HEADLESS=1 ;;
         --no-kiosk)      NO_KIOSK=1 ;;
+        --allow-multi-display) ALLOW_MULTI_DISPLAY=1 ;;
         --sidecar-only)  SIDECAR_ONLY=1 ;;
         --shell-only)    SHELL_ONLY=1 ;;
         --port)          shift; [ $# -gt 0 ] || fail "--port без значения"; WS_PORT="$1" ;;
@@ -163,6 +166,12 @@ else
     [ "${HEADLESS}" = "1" ] && SIDECAR_ARGS+=(--headless)
 fi
 
+# Проектор на сцене подключён расширением экрана: и оболочка, и проверки
+# окружения должны знать, что второй экран сейчас разрешён.
+if [ "${ALLOW_MULTI_DISPLAY}" = "1" ] && [ "${MOCK}" != "1" ]; then
+    SIDECAR_ARGS+=(--allow-multi-display)
+fi
+
 [ -f "${SIDECAR_ENTRY}" ] || fail "не найдена точка входа сайдкара: ${SIDECAR_ENTRY}"
 
 SIDECAR_ARGS+=(--host "${WS_HOST}" --port "${WS_PORT}")
@@ -255,6 +264,7 @@ fi
 if [ "${SIDECAR_ONLY}" != "1" ]; then
     SHELL_ARGS=(. --ws-host "${WS_HOST}" --ws-port "${WS_PORT}")
     [ "${NO_KIOSK}" = "1" ] && SHELL_ARGS+=(--no-kiosk)
+    [ "${ALLOW_MULTI_DISPLAY}" = "1" ] && SHELL_ARGS+=(--allow-multi-display)
     say "старт: оболочка Electron"
     say "аварийный выход из kiosk-окна: Cmd+Alt+Shift+Q"
     (

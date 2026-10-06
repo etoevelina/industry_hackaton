@@ -13,6 +13,14 @@
     python3 scripts/verify_report.py --report r.html --sig r.html.sig \\
                                      --pub r.html.pub --db evidence.sqlite
 
+Про доверие к ключу. Подпись Ed25519 по умолчанию проверяется ТЕМ ЖЕ публичным
+ключом, который лежит рядом с отчётом (`report.html.pub`). Сама по себе такая
+проверка подтверждает только, что отчёт и подпись согласованы: кто пересоберёт
+отчёт и подпишет его своим ключом, её пройдёт. Поэтому ключ сверяется с
+эталоном: `keys/report_ed25519.key.pub` на машине экзамена или файл из
+`--trusted-pub`. Эталон совпал — отчёт подлинный; эталона нет — об этом сказано
+прямо, а не замолчано.
+
 Коды возврата:
     0 — всё сошлось;
     1 — обнаружена подделка или расхождение;
@@ -92,9 +100,31 @@ def _block(title: str) -> None:
     _say(LINE)
 
 
+def _trusted_pub(explicit: str | None) -> tuple[str, str]:
+    """Эталонный публичный ключ: (hex, откуда взят). Пусто — эталона нет.
+
+    По умолчанию это `keys/report_ed25519.key.pub` рядом с репозиторием: на
+    машине экзамена он есть, и проверка получается настоящей. У преподавателя
+    эталона может не быть — тогда путь указывается через `--trusted-pub`.
+    Ключ, приехавший ВМЕСТЕ с отчётом, эталоном не считается никогда.
+    """
+    candidates = [Path(explicit).expanduser()] if explicit else [
+        _ROOT / "keys" / "report_ed25519.key.pub"]
+    for path in candidates:
+        try:
+            if path.is_file():
+                value = path.read_text(encoding="utf-8").strip().lower()
+                if value:
+                    return value, str(path)
+        except OSError:
+            continue
+    return "", ""
+
+
 def _check_signature(report_mod: Any, report: Path | None,
-                     sig: str | None, pub: str | None) -> tuple[str, list[str]]:
-    """Вернуть ('ok'|'fail'|'skip', строки вывода)."""
+                     sig: str | None, pub: str | None,
+                     trusted_hex: str = "", trusted_src: str = "") -> tuple[str, list[str]]:
+    """Вернуть ('ok'|'ok-unpinned'|'fail'|'skip', строки вывода)."""
     lines: list[str] = []
     if report is None:
         return "skip", ["  Файл отчёта не указан — подпись не проверялась."]
@@ -114,8 +144,28 @@ def _check_signature(report_mod: Any, report: Path | None,
     if result.get("sha256_actual"):
         lines.append(f"  sha256 файла:     {str(result['sha256_actual'])[:32]}…")
     if result.get("ok"):
-        lines.append("  РЕЗУЛЬТАТ: подпись действительна — файл отчёта не изменялся.")
-        return "ok", lines
+        actual = str(result.get("public_key") or "").strip().lower()
+        if trusted_hex and actual and actual != trusted_hex:
+            lines.append(f"  Эталонный ключ: {trusted_src}")
+            lines.append(f"  Эталон (hex):   {trusted_src and trusted_hex[:32]}…")
+            lines.append("  РЕЗУЛЬТАТ: ПОДПИСЬ ПОСТОРОННИМ КЛЮЧОМ — отчёт подписан не тем "
+                         "ключом, которому доверяет проверяющий.")
+            lines.append("  Так выглядит отчёт, пересобранный и подписанный заново: "
+                         "пара «отчёт + подпись» согласована, но ключ чужой.")
+            return "fail", lines
+        if trusted_hex:
+            lines.append(f"  Эталонный ключ: {trusted_src} — совпал")
+            lines.append("  РЕЗУЛЬТАТ: подпись действительна ключом системы — "
+                         "файл отчёта не изменялся.")
+            return "ok", lines
+        lines.append("  РЕЗУЛЬТАТ: отчёт и подпись согласованы — файл не изменялся "
+                     "после подписания.")
+        lines.append("  ВНИМАНИЕ: публичный ключ приехал в том же комплекте, что и отчёт, "
+                     "поэтому подлинность самого ключа не подтверждена: тот, кто пересоберёт")
+        lines.append("  отчёт и подпишет его своим ключом, эту проверку пройдёт. Сверьте "
+                     "ключ с эталоном вуза: --trusted-pub <файл>")
+        lines.append("  (на машине экзамена эталон лежит в keys/report_ed25519.key.pub).")
+        return "ok-unpinned", lines
     reason = str(result.get("reason") or "причина не определена")
     if "не найден" in reason or "не установлен" in reason:
         lines.append(f"  РЕЗУЛЬТАТ: проверить не удалось — {reason}.")
@@ -178,6 +228,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sig", help="файл подписи (по умолчанию <отчёт>.sig)")
     parser.add_argument("--pub", help="публичный ключ (по умолчанию <отчёт>.pub)")
     parser.add_argument("--db", help="SQLite-журнал доказательств (evidence.sqlite)")
+    parser.add_argument("--trusted-pub", dest="trusted_pub",
+                        help="эталонный публичный ключ вуза; с ним проверка становится "
+                             "настоящей (по умолчанию keys/report_ed25519.key.pub)")
     parser.add_argument("--quiet", action="store_true", help="только итоговый вердикт")
     args = parser.parse_args(argv)
     if args.report_pos and not args.report:
@@ -201,7 +254,9 @@ def main(argv: list[str] | None = None) -> int:
         _say("Проверяются две независимые вещи: подлинность файла отчёта")
         _say("и целостность журнала инцидентов (hash-chain).")
 
-    sig_status, sig_lines = _check_signature(report_mod, report, args.sig, args.pub)
+    trusted_hex, trusted_src = _trusted_pub(args.trusted_pub)
+    sig_status, sig_lines = _check_signature(report_mod, report, args.sig, args.pub,
+                                             trusted_hex, trusted_src)
     chain_status, chain_lines = _check_chain(db_mod, db)
 
     if not args.quiet:
@@ -213,7 +268,8 @@ def main(argv: list[str] | None = None) -> int:
             _say(line)
 
     _block("ИТОГОВЫЙ ВЕРДИКТ")
-    labels = {"ok": "в порядке", "fail": "НАРУШЕНО", "skip": "не проверялось"}
+    labels = {"ok": "в порядке", "ok-unpinned": "ключ не сверен с эталоном",
+              "fail": "НАРУШЕНО", "skip": "не проверялось"}
     _say(f"  Подпись отчёта:   {labels[sig_status]}")
     _say(f"  Цепочка журнала:  {labels[chain_status]}")
     _say()
@@ -231,6 +287,13 @@ def main(argv: list[str] | None = None) -> int:
         _say("  журнала связана хешем с предыдущей, пересчёт сошёлся.")
         _say()
         return 0
+    if sig_status == "ok-unpinned" and chain_status == "ok":
+        _say("  ПРИЗНАКОВ ПОДДЕЛКИ НЕ НАЙДЕНО, НО ПРОВЕРКА НЕПОЛНАЯ.")
+        _say("  Отчёт согласован со своей подписью, цепочка журнала цела. Не подтверждено")
+        _say("  одно: что подпись поставлена ключом системы, а не ключом того, кто")
+        _say("  пересобрал отчёт. Сверьте ключ с эталоном вуза: --trusted-pub <файл>.")
+        _say()
+        return 2
     _say("  ПРОВЕРКА НЕПОЛНАЯ.")
     _say("  Признаков подделки не найдено, но часть проверок выполнить не удалось")
     _say("  (см. выше). Запросите полный комплект: report.html, report.html.sig,")

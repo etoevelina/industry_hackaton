@@ -974,7 +974,18 @@ class FaceAnalyzer:
             return
 
         # --- есть карта экрана: «смотрит куда-то в свой монитор» = норма ---
-        if obs.gaze_ok and self._has_screen_map():
+        #
+        # Карта — функция ТОЛЬКО взгляда в глазнице и обучена при одной позе
+        # головы: engine/calibration.py отбрасывает кадры сетки, где голова ушла
+        # дальше grid_head_tolerance от базы. Значит и применять её можно только
+        # при той же позе. Иначе достаточно повернуть голову к шпаргалке, оставив
+        # глаза в центре глазниц: карта даст (0.5, 0.5), зона станет «center», и
+        # GAZE_SIDE/GAZE_OFF_SCREEN не родятся ни при каком повороте головы.
+        # Голова за персональным порогом -> карте не верим, уходим на девиации,
+        # где поворот головы учтён.
+        head_trusted = not obs.pose_ok or (
+            abs(obs.head_dev_yaw) < 1.0 and abs(obs.head_dev_pitch) < 1.0)
+        if obs.gaze_ok and head_trusted and self._has_screen_map():
             pt = self._eval_screen_map(obs.gaze_yaw, obs.gaze_pitch)
             if pt is not None:
                 x, y = pt
@@ -1076,6 +1087,18 @@ def _euler_from_matrix(rmat: Any) -> tuple[float, float, float]:
     Разложение R = Rz(roll)*Ry(yaw)*Rx(pitch). Модель задана в системе камеры,
     поэтому фронтальное лицо даёт R ≈ I и все углы около нуля: скачков на ±180
     не возникает. Результат дополнительно заворачивается в (-180, 180].
+
+    ЗНАКИ. Оси вращения — оси камеры OpenCV: y смотрит ВНИЗ по кадру, x — вправо.
+    Поэтому «сырой» угол вокруг y положителен, когда лицо поворачивается в ЛЕВУЮ
+    половину кадра, а «сырой» угол вокруг x положителен, когда лицо смотрит ВНИЗ.
+    Это противоположно соглашению FaceObservation (yaw > 0 — вправо по кадру,
+    pitch > 0 — голова поднята) и противоположно знаку взгляда в глазнице
+    (gaze_yaw > 0 — радужка вправо по кадру, gaze_pitch > 0 — вверх). Если не
+    развернуть знак здесь, в _classify_zone девиации головы и глаз не складываются,
+    а взаимно гасятся: поворот головы на 30° вправо (head_dev −1.67) плюс взгляд
+    вправо (gaze_dev +1.36) дают суммарно −0.31, то есть «центр», и GAZE_SIDE
+    не рождается никогда. Поэтому yaw и pitch возвращаются с обратным знаком.
+    Roll вокруг оси z уже совпадает с соглашением (>0 — наклон к правому плечу).
     """
     r = [[float(rmat[i][j]) for j in range(3)] for i in range(3)]
     sy = math.sqrt(r[0][0] * r[0][0] + r[1][0] * r[1][0])
@@ -1087,8 +1110,8 @@ def _euler_from_matrix(rmat: Any) -> tuple[float, float, float]:
         pitch = math.atan2(-r[1][2], r[1][1])
         yaw = math.atan2(-r[2][0], sy)
         roll = 0.0
-    return (_wrap_deg(math.degrees(yaw)),
-            _wrap_deg(math.degrees(pitch)),
+    return (_wrap_deg(-math.degrees(yaw)),
+            _wrap_deg(-math.degrees(pitch)),
             _wrap_deg(math.degrees(roll)))
 
 

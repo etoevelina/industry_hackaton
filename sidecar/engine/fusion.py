@@ -85,6 +85,9 @@ DEFAULTS: dict[str, Any] = {
     "fusion_fast_answer_ms": 3000,      # правило 4: ответ быстрее этого
     "fusion_fast_answer_chars": 200,    # правило 4: и длиннее этого
     "fusion_paste_burst_chars": 300,    # правило 4: одиночная крупная вставка
+    # правило 4: какая доля длины ответа должна быть объяснена нажатиями клавиш
+    # по этому вопросу, чтобы «быстрый длинный ответ» не считался вставкой
+    "fusion_explained_ratio": 0.5,
 
     "fusion_typing_k": 3.0,             # правило 5: сколько робастных сигм
     "fusion_typing_min_chars": 20,      # правило 5: короткий ответ ничего не значит
@@ -219,6 +222,7 @@ class FusionEngine:
         self.fast_answer_ms = _f(self._p["fusion_fast_answer_ms"], 3000.0)
         self.fast_answer_chars = int(_f(self._p["fusion_fast_answer_chars"], 200.0))
         self.paste_burst_chars = int(_f(self._p["fusion_paste_burst_chars"], 300.0))
+        self.explained_ratio = _clamp(_f(self._p["fusion_explained_ratio"], 0.5), 0.0, 1.0)
         self.typing_k = _f(self._p["fusion_typing_k"], 3.0)
         self.typing_min_chars = int(_f(self._p["fusion_typing_min_chars"], 20.0))
         self.cooldown = _f(self._p["fusion_cooldown_sec"], 20.0)
@@ -243,6 +247,11 @@ class FusionEngine:
         self._question_difficulty = 0
         self._keystrokes = 0
         self._pastes = 0
+        #: Символьные нажатия по каждому вопросу за всю сессию. Нужны правилу 4:
+        #: оболочка в answer_submit присылает полную длину поля, а не набранное
+        #: за этот показ вопроса, и без этого счётчика повторный заход в уже
+        #: отвеченный вопрос выглядит как мгновенная вставка готового ответа.
+        self._typed_chars: dict[str, int] = {}
 
     # ----------------------------------------------------------------- сброс
     def reset(self) -> None:
@@ -259,6 +268,7 @@ class FusionEngine:
         self._question_difficulty = 0
         self._keystrokes = 0
         self._pastes = 0
+        self._typed_chars.clear()
 
     def available(self) -> bool:
         return True
@@ -337,6 +347,12 @@ class FusionEngine:
         if key_class != "char":
             # навигация и модификаторы ритм не характеризуют и бурст не ломают
             return []
+
+        # счётчик «сколько реально набрано руками» по вопросу (правило 4)
+        if question:
+            if len(self._typed_chars) > 256 and question not in self._typed_chars:
+                self._typed_chars.clear()   # защита от неограниченного роста
+            self._typed_chars[question] = self._typed_chars.get(question, 0) + 1
 
         # В профиль идут только интервалы, похожие на живой набор: ниже
         # burst_abs_ms руками не печатают, это вставка или автоповтор, и такой
@@ -463,19 +479,33 @@ class FusionEngine:
                              "chars": chars},
         }
 
-        # правило 4: ответ длиннее порога появился быстрее порога
-        if t2a > 0 and t2a < self.fast_answer_ms and length > self.fast_answer_chars:
+        # правило 4: ответ длиннее порога появился быстрее порога.
+        #
+        # `time_to_answer_ms` оболочка считает от ПОКАЗА вопроса, а `length` — это
+        # полная длина поля, а не набранное за этот показ. Поэтому самого по себе
+        # «400 символов за 2 с» недостаточно: оболочка шлёт answer_submit при любом
+        # уходе с вопроса, и возврат к уже отвеченному вопросу с последующим
+        # «Далее» через две секунды выглядел бы как вставка 200 симв./с.
+        # Третье условие: набранного с клавиатуры по этому вопросу не хватает,
+        # чтобы объяснить длину ответа (вставка символьных нажатий не даёт).
+        typed = self._typed_chars.get(question, 0)
+        explained = typed >= self.explained_ratio * length
+        if (t2a > 0 and t2a < self.fast_answer_ms and length > self.fast_answer_chars
+                and not explained):
             speed = length / max(t2a / 1000.0, 0.001)
             detail = {
                 "rule": "fast_long_answer",
                 "response": dict(response),
                 "chars_per_sec": round(speed, 1),
+                "typed_chars": typed,
                 "thresholds": {"time_to_answer_ms": self.fast_answer_ms,
-                               "length": self.fast_answer_chars},
+                               "length": self.fast_answer_chars,
+                               "explained_ratio": self.explained_ratio},
             }
             message = (f"Ответ на {length} символов отправлен через "
                        f"{t2a / 1000.0:.1f} с после показа вопроса {question or '—'} — "
-                       f"это {speed:.0f} символов в секунду, набрать вручную невозможно")
+                       f"это {speed:.0f} символов в секунду, набрать вручную невозможно "
+                       f"(с клавиатуры по этому вопросу зафиксировано {typed} нажатий)")
             event = self._emit(EventKind.PASTE_BURST, ts, detail, message, confidence=0.95)
             if event is not None:
                 out.append(event)
@@ -496,15 +526,28 @@ class FusionEngine:
         Сравнение идёт с median+MAD по первым N интервалам этой же сессии, то
         есть с самим студентом, а не с «средним человеком». Короткие ответы не
         проверяются: на десяти нажатиях любое среднее случайно.
+
+        Считается ТОЛЬКО отклонение «быстрее базы», и вот почему. Оболочка
+        присылает `typing_stats.mean_ms` — арифметическое среднее интервалов
+        длиной до 5 с, а база — медиана интервалов до 2 с: пауза «задумался»
+        попадает в среднее и не попадает в медиану. Поэтому среднее может быть
+        больше базы без всякой подмены. Пример: 95 интервалов по 150 мс и пять
+        пауз по 4 с дают mean_ms = 343 мс при базе 150 мс и MAD-сигме 30 мс,
+        то есть z = 6.4 — «медленнее» сработало бы почти на каждом ответе
+        честного студента. В обратную сторону артефакта нет: пауза среднее
+        только поднимает, поэтому mean_ms НИЖЕ базы на k сигм паузами
+        объяснить нельзя — это и есть признак чужого ритма или вставки.
         """
         if not self._baseline_ready() or mean_ms <= 0 or chars < self.typing_min_chars:
             return None
         sigma = max(self._base.std_ms, 1.0)
         delta = mean_ms - self._base.mean_ms
+        if delta >= 0:
+            return None
         z = abs(delta) / sigma
         if z < self.typing_k:
             return None
-        faster = delta < 0
+        faster = True
         detail = {
             "rule": "typing_anomaly",
             "response": dict(response),

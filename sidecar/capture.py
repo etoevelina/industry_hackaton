@@ -71,6 +71,9 @@ class CameraCapture:
         self._consumed_seq: int = 0
 
         self._ts_window: deque[float] = deque(maxlen=30)
+        #: Насколько старый последний кадр ещё считается «поток идёт».
+        #: Минимум 1.5 с: на 15 к/с это больше двадцати пропущенных кадров.
+        self._stale_after = max(1.5, 4.0 / max(self.requested_fps, 1))
         self._opened = False
         self._last_error: str = ""
         self.frames_total = 0
@@ -106,12 +109,21 @@ class CameraCapture:
 
     @property
     def fps(self) -> float:
-        """Фактический FPS — скользящее среднее по последним кадрам."""
+        """Фактический FPS — скользящее среднее по последним кадрам.
+
+        Если кадры перестали приходить (камеру выдернули, виртуальная камера
+        встала), окно таймстемпов остаётся заполненным старыми значениями и
+        среднее по нему врёт. Поэтому устаревшее окно даёт честный 0: HUD и
+        предполётная проверка не должны показывать живой поток на мёртвой камере.
+        """
         with self._cond:
             if len(self._ts_window) < 2:
                 return 0.0
-            span = self._ts_window[-1] - self._ts_window[0]
+            last = self._ts_window[-1]
+            span = last - self._ts_window[0]
             if span <= 0:
+                return 0.0
+            if time.time() - last > self._stale_after:
                 return 0.0
             return round((len(self._ts_window) - 1) / span, 2)
 

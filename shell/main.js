@@ -29,6 +29,14 @@ const { Lockdown, comboThrottle } = require('./lockdown');
 const ROOT_DIR = path.resolve(__dirname, '..');
 const RENDERER_INDEX = path.join(__dirname, 'renderer', 'index.html');
 
+/**
+ * Есть ли интерфейс теста. Если есть — сессию открывает ТОЛЬКО renderer,
+ * после экрана согласия и предполётной проверки. Автостарт допустим лишь
+ * когда интерфейса нет и показан служебный экран оболочки: иначе прокторинг
+ * начнёт писать доказательства до согласия студента.
+ */
+const HAS_RENDERER = fs.existsSync(RENDERER_INDEX);
+
 /** Аварийный выход для прокторa/жюри: иначе из kiosk-окна не выйти. */
 const ADMIN_EXIT_ACCELERATOR = 'CommandOrControl+Alt+Shift+Q';
 
@@ -54,6 +62,11 @@ function argValue(name, fallback) {
 const CLI = {
   spawnSidecar: argFlag('spawn-sidecar'),
   noKiosk: argFlag('no-kiosk'),              // отладочный режим: окно можно двигать
+  // Аварийный клапан для сцены: проектор, подключённый расширением экрана, —
+  // это второй монитор, и блокирующий экран закрывает собой весь показ, а снять
+  // его нечем. Флаг оставляет событие MULTIPLE_DISPLAYS в журнале (честно), но
+  // не блокирует экзамен. Ровно то, что обещает memory/demo-runbook.md.
+  allowMultiDisplay: argFlag('allow-multi-display'),
   studentId: argValue('student-id', 'demo-student'),
   examId: argValue('exam-id', 'demo-exam'),
   studentName: argValue('student-name', 'Демо-студент'),
@@ -65,6 +78,17 @@ function log(...args) {
   // eslint-disable-next-line no-console
   console.log('[shell]', ...args);
 }
+
+// Непойманное исключение в main-процессе Electron гасит всё приложение: kiosk-окно
+// исчезает вместе с экзаменом. Источников много и все асинхронные — таймеры
+// lockdown, события screen, обработчики окна. На показе лучше запись в лог и
+// продолжение работы, чем пустой экран, поэтому процесс мы не роняем.
+process.on('uncaughtException', (err) => {
+  log('НЕОБРАБОТАННАЯ ОШИБКА (оболочка продолжает работу):', (err && err.stack) || err);
+});
+process.on('unhandledRejection', (reason) => {
+  log('НЕОБРАБОТАННЫЙ REJECT (оболочка продолжает работу):', (reason && reason.stack) || reason);
+});
 
 // ---------------------------------------------------------------------------
 // Состояние процесса
@@ -81,6 +105,9 @@ const state = {
   sessionStarted: false,
   sessionAuto: false,
   sessionMeta: null,
+  sessionSentAt: 0,        // когда последний раз отправляли session_start
+  linkEpoch: 0,            // номер текущего соединения с сайдкаром
+  sessionEpoch: -1,        // на каком соединении уже доливали session_start
   quitting: false,
   sidecarChild: null,
   rendererReady: false,
@@ -286,24 +313,36 @@ function hideBlocking(reason) {
 // Мониторы
 // ---------------------------------------------------------------------------
 
+// Зовётся из таймера lockdown и из событий screen. Создание оверлей-окна внутри
+// может бросить (например, когда приложение уже уходит в quit), а исключение из
+// таймера без обработчика гасит main-процесс — поэтому обёрнуто целиком.
 function handleDisplays(info, source) {
-  const count = info && typeof info.count === 'number' ? info.count : screen.getAllDisplays().length;
-  const displays = (info && info.displays) || screen.getAllDisplays().map((d) => ({
-    id: d.id, internal: Boolean(d.internal), bounds: d.bounds, scale: d.scaleFactor,
-  }));
-  state.displayCount = count;
+  try {
+    const count = info && typeof info.count === 'number' ? info.count : screen.getAllDisplays().length;
+    const displays = (info && info.displays) || screen.getAllDisplays().map((d) => ({
+      id: d.id, internal: Boolean(d.internal), bounds: d.bounds, scale: d.scaleFactor,
+    }));
+    state.displayCount = count;
 
-  if (count > 1) {
-    link.sendShellEvent(EventKind.MULTIPLE_DISPLAYS, { count, displays, source });
-    showBlocking(
-      'multiple_displays',
-      'Обнаружено несколько экранов',
-      `Подключено экранов: ${count}. Отключите внешние мониторы, проекторы и приставки захвата — тест продолжится автоматически.`,
-    );
-  } else {
-    hideBlocking('multiple_displays');
+    if (count > 1 && CLI.allowMultiDisplay) {
+      link.sendShellEvent(EventKind.MULTIPLE_DISPLAYS, { count, displays, source,
+        allowed: true });
+      hideBlocking('multiple_displays');
+      log(`экранов ${count}, но блокировка снята флагом --allow-multi-display`);
+    } else if (count > 1) {
+      link.sendShellEvent(EventKind.MULTIPLE_DISPLAYS, { count, displays, source });
+      showBlocking(
+        'multiple_displays',
+        'Обнаружено несколько экранов',
+        `Подключено экранов: ${count}. Отключите внешние мониторы, проекторы и приставки захвата — тест продолжится автоматически.`,
+      );
+    } else {
+      hideBlocking('multiple_displays');
+    }
+    broadcastShellStatus();
+  } catch (err) {
+    log('обработка мониторов не удалась:', err && err.message);
   }
-  broadcastShellStatus();
 }
 
 // ---------------------------------------------------------------------------
@@ -571,7 +610,7 @@ function createWindow() {
     }
   });
 
-  if (fs.existsSync(RENDERER_INDEX)) {
+  if (HAS_RENDERER) {
     win.loadFile(RENDERER_INDEX);
   } else {
     log('shell/renderer/index.html не найден — служебный экран оболочки');
@@ -744,17 +783,14 @@ function registerIpc() {
       exam_id: (meta && (meta.exam_id || meta.examId)) || CLI.examId,
       student_name: (meta && (meta.student_name || meta.studentName)) || CLI.studentName,
     };
-    state.sessionStarted = true;
-    state.sessionAuto = false;
-    state.sessionMeta = payload;
-    link.sendSessionStart(payload);
-    broadcastShellStatus();
+    openSession(payload, false);
     return payload;
   });
 
   ipcMain.handle('proctor:session-end', (e, reason) => {
     link.sendSessionEnd(typeof reason === 'string' ? reason : 'renderer_request');
     state.sessionStarted = false;
+    state.sessionSentAt = 0;
     broadcastShellStatus();
     return true;
   });
@@ -794,6 +830,20 @@ function registerIpc() {
 // Канал сайдкара -> renderer
 // ---------------------------------------------------------------------------
 
+/**
+ * Открыть сессию в сайдкаре и запомнить, что именно и когда отправили.
+ * Единая точка: из renderer, из автостарта и из восстановления после перезапуска
+ * сайдкара — иначе состояние оболочки и состояние ядра расходятся.
+ */
+function openSession(payload, auto) {
+  state.sessionStarted = true;
+  state.sessionAuto = Boolean(auto);
+  state.sessionMeta = payload;
+  state.sessionSentAt = Date.now();
+  link.sendSessionStart(payload);
+  broadcastShellStatus();
+}
+
 function wireSidecar() {
   const channels = {
     [MsgType.HELLO]: 'proctor:hello',
@@ -819,25 +869,50 @@ function wireSidecar() {
   link.onType(MsgType.HELLO, () => {
     log('сайдкар сообщил возможности:', JSON.stringify(link.capabilities));
     broadcastShellStatus();
-    // Если renderer не стартовал сессию сам — стартуем с параметров запуска,
-    // иначе доказательная база не откроется и демо окажется пустым.
+    // Автостарт сессии — ТОЛЬКО когда интерфейса теста нет (служебный экран
+    // оболочки): там некому нажать «начать», и без сессии доказательная база
+    // не откроется. Если renderer есть, сессию открывает он сам — после экрана
+    // согласия и предполётной проверки. Автостарт при живом renderer означал бы
+    // запись доказательств (кадры с лицом студента) до того, как студент дал
+    // согласие, а это прямо противоречит docs/LIMITATIONS.md («Этика и
+    // приватность», п. 3) и README.
+    if (HAS_RENDERER) return;
     setTimeout(() => {
-      if (state.sessionStarted) return;
+      if (state.sessionStarted || state.quitting) return;
       const payload = {
         student_id: CLI.studentId,
         exam_id: CLI.examId,
         student_name: CLI.studentName,
       };
-      state.sessionStarted = true;
-      state.sessionAuto = true;
-      state.sessionMeta = payload;
-      link.sendSessionStart(payload);
+      openSession(payload, true);
       log('сессия открыта автоматически:', JSON.stringify(payload));
-      broadcastShellStatus();
     }, 3000);
   });
 
-  link.on('open', () => broadcastShellStatus());
+  // Восстановление сессии. Сайдкар может перезапуститься или потерять соединение
+  // (watchdog в ipc.js рвёт молчащий сокет) посреди демо. Оболочка при этом
+  // по-прежнему считает, что экзамен идёт, и никогда больше не пришлёт
+  // session_start: ядро остаётся без сессии — доказательства не пишутся,
+  // вердикты подавляются («вердикта нет: сессии нет»), отчёт выходит пустым.
+  // Поэтому сверяем состояния по полю `state` из status и доливаем session_start.
+  link.onType(MsgType.STATUS, (msg) => {
+    if (state.quitting || !state.sessionStarted || !state.sessionMeta) return;
+    const sidecarState = msg && typeof msg.state === 'string' ? msg.state : '';
+    if (sidecarState !== 'idle') return;           // сессия у ядра есть — не трогаем
+    // status мог быть отправлен до того, как ядро обработало наш session_start
+    if (Date.now() - state.sessionSentAt < 5000) return;
+    // Ровно одна попытка на соединение: второй session_start по тому же каналу
+    // закрыл бы только что открытую сессию и завёл второй каталог с пустым отчётом.
+    if (state.sessionEpoch === state.linkEpoch) return;
+    state.sessionEpoch = state.linkEpoch;
+    log('ядро без сессии — повторно открываю сессию после разрыва');
+    openSession(state.sessionMeta, state.sessionAuto);
+  });
+
+  link.on('open', () => {
+    state.linkEpoch += 1;
+    broadcastShellStatus();
+  });
   link.on('close', () => broadcastShellStatus());
   link.on('unavailable', () => broadcastShellStatus());
   link.on('socket-error', () => broadcastShellStatus());

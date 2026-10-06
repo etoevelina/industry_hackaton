@@ -804,6 +804,13 @@ class ProctorSidecar:
 
     # ---------------------------------------------------- приём команд оболочки
     async def _on_message(self, ws: Any, raw: Any) -> None:
+        # Во время останова команды уже не исполняем. Хендлер соединения живёт
+        # параллельно с shutdown(), и session_start, пришедший после закрытия
+        # сессии, создавал новый каталог sessions/<ts>_<id>/ — пустой, без отчёта
+        # и без закрытой hash-цепочки. Он же оказывался «последней сессией» для
+        # `make report`, то есть прятал настоящий отчёт прогона.
+        if self._shutting_down:
+            return
         try:
             msg = decode(raw)
         except Exception:
@@ -852,8 +859,11 @@ class ProctorSidecar:
         if self.gaze_calib is not None:
             self.gaze_calib.session_dir = str(session_dir)
         if self.recorder is not None:
+            # set_session_dir() внутри делает flush(wait=True): если клипы прошлой
+            # сессии ещё пишутся, он ждёт до 10 с. В лупе это 10 с без status и
+            # событий — оболочка решит, что сайдкар умер. Поэтому в поток.
             with contextlib.suppress(Exception):
-                self.recorder.set_session_dir(session_dir)
+                await asyncio.to_thread(self.recorder.set_session_dir, session_dir)
         self._reset_engines()
         self._store_open = False
         if self.store is not None:
@@ -996,73 +1006,99 @@ class ProctorSidecar:
 
     # ------------------------------------------------------------ поток CV
     def _cv_loop(self) -> None:
-        """Блокирующий цикл обработки кадров. Живёт в отдельном потоке."""
+        """Блокирующий цикл обработки кадров. Живёт в отдельном потоке.
+
+        Каждая итерация обёрнута в try/except целиком. Причина: смерть этого
+        потока необратима и НЕВИДИМА — поток камеры продолжает работать, fps в
+        status остаётся живым, а события зрения, взгляда и личности просто
+        перестают появляться. На демо это выглядит как «система ничего не
+        замечает». Поэтому любая неожиданная ошибка (детектор вернул numpy-массив
+        там, где ждали число; рекордер упал на кропе; калибровка получила мусор)
+        стоит один кадр, а не весь показ.
+        """
         cfg = self.cfg
         frame_idx = 0
         last_identity = 0.0
         no_frame_since = 0.0
+        failures = 0
 
         while not self._stop.is_set():
-            assert self.capture is not None
-            ok, frame, ts = self.capture.read(timeout=cfg.camera_read_timeout)
-            if not ok or frame is None:
-                now = time.time()
-                if no_frame_since == 0.0:
-                    no_frame_since = now
-                events = self._push_observations([(EventKind.SENSOR_LOST, True,
-                                                   {"sensor": "camera",
-                                                    "error": self.capture.last_error})], now)
-                self._post_events(events)
-                self._update_snap(face_present=False, face_count=0, phone=False)
-                continue
+            try:
+                assert self.capture is not None
+                ok, frame, ts = self.capture.read(timeout=cfg.camera_read_timeout)
+                if not ok or frame is None:
+                    now = time.time()
+                    if no_frame_since == 0.0:
+                        no_frame_since = now
+                    events = self._push_observations([(EventKind.SENSOR_LOST, True,
+                                                       {"sensor": "camera",
+                                                        "error": self.capture.last_error})], now)
+                    self._post_events(events)
+                    self._update_snap(face_present=False, face_count=0, phone=False)
+                    continue
 
-            if no_frame_since:
-                no_frame_since = 0.0
-                self._post_events(self._push_observations(
-                    [(EventKind.SENSOR_LOST, False, {})], ts))
+                if no_frame_since:
+                    no_frame_since = 0.0
+                    self._post_events(self._push_observations(
+                        [(EventKind.SENSOR_LOST, False, {})], ts))
 
-            frame_idx += 1
-            with self._frame_lock:
-                self._last_frame = frame
-                self._last_frame_ts = ts
-            if self.recorder is not None:
-                # кольцевой буфер: кадры «до» инцидента нужны для клипа
-                self._safe_call(self.recorder.push, frame, ts, what="буфер кадров")
+                frame_idx += 1
+                with self._frame_lock:
+                    self._last_frame = frame
+                    self._last_frame_ts = ts
+                if self.recorder is not None:
+                    # кольцевой буфер: кадры «до» инцидента нужны для клипа
+                    self._safe_call(self.recorder.push, frame, ts, what="буфер кадров")
 
-            obs: list[tuple[EventKind, bool, dict[str, Any]]] = []
-            face_obs: Any = None
-            face_bbox: Any = None
+                obs: list[tuple[EventKind, bool, dict[str, Any]]] = []
+                face_obs: Any = None
+                face_bbox: Any = None
 
-            # --- лицо и взгляд: каждый кадр (дешёвый FaceMesh)
-            if self.face is not None and frame_idx % max(cfg.face_every_n_frames, 1) == 0:
-                face_obs = self._safe_call(self.face.analyze, frame, what="FaceMesh")
-                if face_obs is not None:
-                    face_bbox = _get(face_obs, "face_bbox")
-                    obs.extend(self._face_observations(face_obs, ts))
+                # --- лицо и взгляд: каждый кадр (дешёвый FaceMesh)
+                if self.face is not None and frame_idx % max(cfg.face_every_n_frames, 1) == 0:
+                    face_obs = self._safe_call(self.face.analyze, frame, what="FaceMesh")
+                    if face_obs is not None:
+                        face_bbox = _get(face_obs, "face_bbox")
+                        obs.extend(self._safe_call(self._face_observations, face_obs, ts,
+                                                   what="разбор лица") or [])
 
-            # --- объекты: каждый N-й кадр (YOLO дорогой)
-            if self.objects is not None and frame_idx % max(cfg.yolo_every_n_frames, 1) == 0:
-                dets = self._safe_call(_call_flex, self.objects.detect, frame, face_bbox,
-                                       what="YOLO")
-                obs.extend(self._object_observations(list(dets or []), face_obs, face_bbox, ts))
+                # --- объекты: каждый N-й кадр (YOLO дорогой)
+                if self.objects is not None and frame_idx % max(cfg.yolo_every_n_frames, 1) == 0:
+                    dets = self._safe_call(_call_flex, self.objects.detect, frame, face_bbox,
+                                           what="YOLO")
+                    obs.extend(self._safe_call(self._object_observations, list(dets or []),
+                                               face_obs, face_bbox, ts,
+                                               what="разбор объектов") or [])
 
-            # --- личность: по таймеру (эмбеддинг дорогой, каждый кадр не нужен)
-            if (self.identity is not None and face_bbox is not None
-                    and ts - last_identity >= cfg.identity_interval):
-                last_identity = ts
-                id_obs = self._safe_call(_call_flex, self.identity.verify, frame, face_bbox,
-                                         what="identity")
-                obs.extend(self._identity_observations(id_obs))
+                # --- личность: по таймеру (эмбеддинг дорогой, каждый кадр не нужен)
+                if (self.identity is not None and face_bbox is not None
+                        and ts - last_identity >= cfg.identity_interval):
+                    last_identity = ts
+                    id_obs = self._safe_call(_call_flex, self.identity.verify, frame, face_bbox,
+                                             what="identity")
+                    obs.extend(self._safe_call(self._identity_observations, id_obs,
+                                               what="разбор личности") or [])
 
-            # --- живость: по кадрам, если модуль личности это умеет
-            obs.extend(self._liveness_observations(frame, face_obs, face_bbox, ts))
+                # --- живость: по кадрам, если модуль личности это умеет
+                obs.extend(self._safe_call(self._liveness_observations, frame, face_obs,
+                                           face_bbox, ts, what="разбор живости") or [])
 
-            events = self._push_observations(obs, ts)
-            if events:
-                self._attach_evidence(events, frame, face_bbox)
-                self._post_events(events)
+                events = self._push_observations(obs, ts)
+                if events:
+                    self._safe_call(self._attach_evidence, events, frame, face_bbox,
+                                    what="доказательства")
+                    self._post_events(events)
 
-            self._handle_calibration(frame, face_obs, face_bbox, ts)
+                self._safe_call(self._handle_calibration, frame, face_obs, face_bbox, ts,
+                                what="калибровка")
+            except Exception:
+                # Сюда попадаем только на том, что не закрыто _safe_call выше.
+                failures += 1
+                if failures <= 3 or failures % 100 == 0:
+                    log.exception("сбой в цикле обработки кадров (#%d), продолжаю", failures)
+                self._stop.wait(0.05)
+
+        log.info("цикл обработки кадров остановлен (ошибок за сессию: %d)", failures)
 
     def _safe_call(self, fn: Any, *args: Any, what: str = "детектор") -> Any:
         """Вызов детектора: любое исключение глушим — демо важнее одного канала."""
@@ -1594,23 +1630,26 @@ class ProctorSidecar:
     async def _env_ticker(self) -> None:
         """Проверки ОС: психологически важный канал (виртуалка, remote, запись экрана)."""
         while True:
+            # Вся итерация под try: упавший тикер не воскресает, и канал
+            # окружения молча исчезает до конца демо.
             try:
                 findings = await asyncio.to_thread(self.env_check, self.cfg_dict)
+                events: list[ProctorEvent] = []
+                for finding in findings or []:
+                    kind = _as_kind(_get(finding, "kind"))
+                    if kind is None:
+                        continue
+                    detail = _get(finding, "detail", {}) or {}
+                    detail = dict(detail) if isinstance(detail, dict) else {"value": detail}
+                    severity = _get(finding, "severity")
+                    if severity is not None:
+                        detail.setdefault("severity", getattr(severity, "value", severity))
+                    events.extend(self._push_external(kind, detail))
+                await self._emit(events)
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
                 log.warning("проверки окружения упали: %s", exc)
-                findings = []
-            events: list[ProctorEvent] = []
-            for finding in findings or []:
-                kind = _as_kind(_get(finding, "kind"))
-                if kind is None:
-                    continue
-                detail = _get(finding, "detail", {}) or {}
-                detail = dict(detail) if isinstance(detail, dict) else {"value": detail}
-                severity = _get(finding, "severity")
-                if severity is not None:
-                    detail.setdefault("severity", getattr(severity, "value", severity))
-                events.extend(self._push_external(kind, detail))
-            await self._emit(events)
             await asyncio.sleep(self.cfg.env_interval)
 
     async def _audio_ticker(self) -> None:
@@ -1623,47 +1662,66 @@ class ProctorSidecar:
         cfg = self.cfg
         while True:
             await asyncio.sleep(cfg.audio_interval)
-            obs = None
             try:
-                obs = self.audio.poll()
-                self._audio_ok = True
+                await self._audio_step()
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
+                # Тикер крутится 10 раз в секунду: подробный лог здесь залил бы
+                # консоль на демо, поэтому только первая ошибка после удачи.
                 if self._audio_ok:
-                    log.warning("аудио-опрос упал: %s", exc)
+                    log.warning("аудио-шаг упал: %s", exc)
                 self._audio_ok = False
-            if obs is None:
-                continue
-            ts = time.time()
-            speech = bool(_get(obs, "speech", False))
-            is_owner = _get(obs, "is_owner", None)
-            rms = float(_get(obs, "rms", 0.0) or 0.0)
-            conf = float(_get(obs, "confidence", 0.0) or 0.0)
 
-            obs_list: list[tuple[EventKind | str, bool, dict[str, Any]]] = [
-                (EventKind.VOICE_OTHER, bool(speech and is_owner is False),
-                 {"rms": round(rms, 4), "conf": conf,
-                  "similarity": round(float(_get(obs, "similarity", 0.0) or 0.0), 3)}),
-            ]
-            if self._engine_composite:
-                # связку «речь без губ» строит движок: отдаём только факт речи
-                obs_list.append(("audio.speech", speech,
-                                 {"rms": round(rms, 4), "conf": conf}))
+    async def _audio_step(self) -> None:
+        """Один опрос микрофона -> наблюдения. Вынесено, чтобы тикер не умирал."""
+        cfg = self.cfg
+        obs = None
+        try:
+            obs = self.audio.poll()
+        except Exception as exc:
+            if self._audio_ok:
+                log.warning("аудио-опрос упал: %s", exc)
+            self._audio_ok = False
+            return
+        if obs is None:
+            self._audio_ok = False
+            return
+        # Микрофон могли выдернуть посреди сессии: poll() не бросает, он просто
+        # отдаёт available/device_ok = False. Если верить одному факту «не упало»,
+        # HUD будет до конца демо показывать живой аудиоканал на мёртвом микрофоне.
+        self._audio_ok = bool(_get(obs, "available", True)) and bool(_get(obs, "device_ok", True))
+        ts = time.time()
+        speech = bool(_get(obs, "speech", False))
+        is_owner = _get(obs, "is_owner", None)
+        rms = float(_get(obs, "rms", 0.0) or 0.0)
+        conf = float(_get(obs, "confidence", 0.0) or 0.0)
+
+        obs_list: list[tuple[EventKind | str, bool, dict[str, Any]]] = [
+            (EventKind.VOICE_OTHER, bool(speech and is_owner is False),
+             {"rms": round(rms, 4), "conf": conf,
+              "similarity": round(float(_get(obs, "similarity", 0.0) or 0.0), 3)}),
+        ]
+        if self._engine_composite:
+            # связку «речь без губ» строит движок: отдаём только факт речи
+            obs_list.append(("audio.speech", speech,
+                             {"rms": round(rms, 4), "conf": conf}))
+        else:
+            lips_quiet = self._mouth_open_ratio < cfg.mouth_open_speech
+            if speech and lips_quiet:
+                if self._speech_no_lips_since == 0.0:
+                    self._speech_no_lips_since = ts
             else:
-                lips_quiet = self._mouth_open_ratio < cfg.mouth_open_speech
-                if speech and lips_quiet:
-                    if self._speech_no_lips_since == 0.0:
-                        self._speech_no_lips_since = ts
-                else:
-                    self._speech_no_lips_since = 0.0
-                no_lips = (self._speech_no_lips_since > 0.0
-                           and ts - self._speech_no_lips_since >= cfg.speech_without_lips_sec
-                           and self._snap_value("face_present"))
-                obs_list.append((EventKind.SPEECH_WITHOUT_LIP_MOTION, no_lips, {
-                    "rms": round(rms, 4),
-                    "mouth_open_ratio": round(self._mouth_open_ratio, 3),
-                    "mouth_threshold": cfg.mouth_open_speech,
-                }))
-            await self._emit(self._push_observations(obs_list, ts))
+                self._speech_no_lips_since = 0.0
+            no_lips = (self._speech_no_lips_since > 0.0
+                       and ts - self._speech_no_lips_since >= cfg.speech_without_lips_sec
+                       and self._snap_value("face_present"))
+            obs_list.append((EventKind.SPEECH_WITHOUT_LIP_MOTION, no_lips, {
+                "rms": round(rms, 4),
+                "mouth_open_ratio": round(self._mouth_open_ratio, 3),
+                "mouth_threshold": cfg.mouth_open_speech,
+            }))
+        await self._emit(self._push_observations(obs_list, ts))
 
     async def _mock_ticker(self) -> None:
         """Демо без камеры: гоняем сценарий событий через обычный конвейер."""
@@ -1671,16 +1729,28 @@ class ProctorSidecar:
                           gaze={"yaw": 2.0, "pitch": -3.0, "zone": "center"})
         self._audio_ok = True
         while True:
+            # Это план Б на сцене. Упавший тикер означает, что демо встало
+            # насовсем, поэтому любую ошибку шага просто логируем и идём дальше.
             for delay, kind, detail in MOCK_SCENARIO:
                 await asyncio.sleep(delay)
-                self._update_snap(phone=kind.value.startswith("PHONE"))
-                await self._emit(self._push_external(kind, detail))
+                try:
+                    self._update_snap(phone=kind.value.startswith("PHONE"))
+                    await self._emit(self._push_external(kind, detail))
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("шаг mock-сценария (%s) упал, продолжаю", kind.value)
             if not self.cfg.mock_loop:
                 return
             await asyncio.sleep(self.cfg.mock_pause_between_loops)
-            self._reset_engines()
-            self._last_action = VerdictAction.NONE
-            await self._push_risk(force=True)
+            try:
+                self._reset_engines()
+                self._last_action = VerdictAction.NONE
+                await self._push_risk(force=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("сброс mock-сценария упал, продолжаю")
 
     # -------------------------------------------------------------- калибровка
     def _handle_calibration(self, frame: Any, face_obs: Any, face_bbox: Any, ts: float) -> None:
@@ -1937,12 +2007,23 @@ class ProctorSidecar:
     _OBJECT_KINDS = (EventKind.PHONE_IN_FRAME, EventKind.PHONE_RAISED,
                      EventKind.PHONE_AIMED_AT_SCREEN, EventKind.FORBIDDEN_OBJECT)
 
+    #: Инциденты, для которых клип НЕ пишется. Размывать лицо постороннего
+    #: рекордер умеет только на снимке: bbox второго лица известен для кадра
+    #: инцидента, а в 15-секундном клипе человек движется, и покадровых рамок
+    #: у нас нет. Клип уехал бы на диск (и дальше — в каталог сессии, который
+    #: отдают преподавателю) с незамытой биометрией постороннего, а README и
+    #: docs/LIMITATIONS.md обещают обратное. Доказательством остаётся размытый
+    #: полный кадр: он подтверждает сам факт «в комнате второй человек».
+    _NO_CLIP_KINDS = (EventKind.SECOND_FACE,)
+
     def _attach_evidence(self, events: list[ProctorEvent], frame: Any, face_bbox: Any) -> None:
         """Сохранить кадр (и клип) инцидента, прописать пути в событие.
 
         Кроп делается только по bbox предмета-повода (телефон, книга). Для
         инцидентов про людей кроп не снимается — доказательством является
-        полный кадр, а лишние лица размываются рекордером.
+        полный кадр, а лишние лица размываются рекордером. Для инцидентов из
+        `_NO_CLIP_KINDS` клип не пишется вообще: размыть постороннего в видео
+        нечем, см. комментарий к константе.
         """
         for ev in events:
             if ev.evidence is not None or not self._should_save(ev):
@@ -1959,8 +2040,10 @@ class ProctorSidecar:
                                         ev.message[:60], blur, ev.ts, what="снимок")
                 if not isinstance(saved, dict):
                     continue
-                clip = self._safe_call(self.recorder.save_clip, ev.id, None, None, None, ev.ts,
-                                       what="клип")
+                clip = None
+                if ev.kind not in self._NO_CLIP_KINDS:
+                    clip = self._safe_call(self.recorder.save_clip, ev.id, None, None, None,
+                                           ev.ts, what="клип")
                 ev.evidence = Evidence(
                     frame_path=saved.get("frame_rel") or rel,
                     clip_path=str(clip) if clip else None,
@@ -2123,6 +2206,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-identity", action="store_true", help="выключить сверку личности")
     p.add_argument("--no-yolo", action="store_true", help="выключить детектор объектов")
     p.add_argument("--no-env", action="store_true", help="выключить проверки окружения")
+    p.add_argument("--allow-multi-display", action="store_true",
+                   help="не считать второй экран нарушением (проектор на демо)")
     p.add_argument("--headless", action="store_true",
                    help="без камеры и видео-детекторов (проверка протокола)")
     p.add_argument("--mock", action="store_true",
@@ -2150,6 +2235,9 @@ def apply_cli(cfg: ProctorConfig, args: argparse.Namespace) -> None:
         cfg.enable_vision = False
     if args.no_env:
         cfg.enable_env = False
+    if args.allow_multi_display:
+        # проектор-расширение на сцене не должен сам поднимать risk-score
+        cfg.env_allow_multiple_displays = True
     if args.headless:
         cfg.headless = True
     if args.mock:
