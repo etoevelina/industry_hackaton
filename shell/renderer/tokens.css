@@ -1,0 +1,238 @@
+/*
+ * Дизайн-система NEON/PROCTOR — токены.
+ * Семантические имена отделяют назначение от значения: перекрашивать экраны руками не нужно.
+ *
+ * Два мира поверхностей, по правилу гайда:
+ *   .sheet   — светлая среда чтения и письма (вопросы теста, настройки, отчёт)
+ *   .monitor — тёмная среда наблюдения (HUD, видео, лента инцидентов, калибровка)
+ * Экран сдачи теста совмещает оба: белый лист + тёмная панель прокторинга.
+ */
+
+:root {
+  /* --- база палитры --- */
+  --acid: #c6ff00;
+  --acid-hover: #d7ff52;
+  --acid-pressed: #9ed000;
+  --ink: #0a0a0a;
+  --ink-2: #141414;
+  --graphite: #262626;
+  --gray-500: #747474;
+  --gray-300: #b9b9b9;
+  --gray-100: #ececec;
+  --white: #ffffff;
+
+  --danger: #ff334e;
+  --warning: #ffb800;
+  --info: #35b7ff;
+  --success: #c6ff00;
+
+  /* --- семантика поверхностей --- */
+  --bg-canvas: var(--white);          /* светлая среда: лист теста, настройки */
+  --bg-monitor: var(--ink);           /* тёмная среда: наблюдение */
+  --bg-panel: var(--ink-2);           /* панели внутри тёмной среды */
+  --border-hair: var(--gray-100);     /* структура на светлом */
+  --border-hair-dark: var(--graphite);/* структура на тёмном */
+
+  /* --- семантика текста --- */
+  --text-primary: var(--ink);
+  --text-muted: var(--gray-500);
+  --text-on-dark: var(--white);
+  --text-muted-on-dark: var(--gray-300);
+
+  /* --- сигнал --- */
+  --signal: var(--acid);
+  --signal-glow: 0 0 0 1px rgba(198, 255, 0, 0.55), 0 0 32px rgba(198, 255, 0, 0.16);
+  --shadow-hard: 6px 6px 0 var(--ink);
+
+  /*
+   * ВАЖНО (a11y, прямой запрет гайда): кислотный НЕ используется как цвет текста
+   * на белом фоне — контраст #c6ff00 на #ffffff около 1.4:1.
+   * На светлом он допустим только как ЗАЛИВКА под тёмным текстом или как тонкий акцент.
+   * Цвет текста акцента на светлом фоне:
+   */
+  --signal-text-on-light: #4a6100;    /* затемнённый кислотный, контраст > 4.5:1 на белом */
+
+  /* --- уровни риска: совпадают с порогами protocol.py (30 / 60 / 90) --- */
+  --risk-ok: var(--acid);
+  --risk-warn: var(--warning);
+  --risk-pause: #ff8a1f;
+  --risk-lock: var(--danger);
+
+  /* --- severity из protocol.Severity --- */
+  --sev-info: var(--info);
+  --sev-low: var(--gray-500);
+  --sev-medium: var(--warning);
+  --sev-high: #ff8a1f;
+  --sev-critical: var(--danger);
+
+  /* --- типографика --- */
+  --font-sans: "Onest", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --font-wordmark: "Space Grotesk", var(--font-sans); /* ТОЛЬКО латиница */
+
+  --fs-display: clamp(40px, 6vw, 72px);
+  --fs-h1: clamp(30px, 4vw, 48px);
+  --fs-h2: clamp(24px, 3vw, 36px);
+  --fs-h3: 22px;
+  --fs-body: 16px;
+  --fs-small: 14px;
+  --fs-label: 13px;
+  --fs-tiny: 11px;
+
+  --lh-display: 0.9;
+  --lh-head: 1.05;
+  --lh-body: 1.55;
+
+  --tracking-display: -0.055em;
+  --tracking-label: 0.12em;
+
+  /* --- сетка 4px --- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-12: 48px;
+  --space-16: 64px;
+  --space-22: 88px;
+
+  /* --- радиусы --- */
+  --radius-xs: 4px;
+  --radius-sm: 8px;   /* кнопки, поля, статусы */
+  --radius-md: 12px;  /* карточки */
+  --radius-lg: 18px;  /* крупные панели */
+
+  /* --- интерактив --- */
+  --tap-min: 44px;            /* минимальная зона нажатия */
+  --focus-ring: 3px solid var(--info);
+  --focus-offset: 3px;
+  --transition: 0.16s ease;
+
+  --layout-max: 1440px;
+}
+
+/* Высокая контрастность системы — усиливаем границы и приглушённый текст */
+@media (prefers-contrast: more) {
+  :root {
+    --gray-500: #5e5e5e;
+    --gray-300: #d1d1d1;
+    --border-hair: #d4d4d4;
+  }
+}
+
+/* Уважаем отключённую анимацию: сканлайны и переходы гасятся полностью */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* --- базовые правила, общие для всех экранов --- */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+body {
+  font-family: var(--font-sans);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  color: var(--text-primary);
+  background: var(--bg-canvas);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  /* Выделение текста в экзамене запрещено отдельно в app.js — здесь только вид */
+  --tone: var(--gray-500);
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-offset);
+}
+
+::selection {
+  color: var(--ink);
+  background: var(--acid);
+}
+
+/* --- служебные классы --- */
+.mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.wordmark {
+  /* Space Grotesk без кириллицы: применять только к латинским строкам */
+  font-family: var(--font-wordmark);
+  font-weight: 700;
+  letter-spacing: -0.04em;
+}
+
+.caps {
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+}
+
+.tiny {
+  font-size: var(--fs-tiny);
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+.monitor .muted,
+.is-dark .muted {
+  color: var(--text-muted-on-dark);
+}
+
+/* Тёмная среда наблюдения */
+.monitor,
+.is-dark {
+  color: var(--text-on-dark);
+  background: var(--bg-monitor);
+}
+
+/* Светлая среда чтения и письма */
+.sheet {
+  color: var(--text-primary);
+  background: var(--bg-canvas);
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}

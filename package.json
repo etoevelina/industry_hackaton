@@ -1,0 +1,24 @@
+{
+  "name": "qostanai-proctor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Локальная система прокторинга: Electron-оболочка защищённого браузера + Python-сайдкар (CV/аудио)",
+  "main": "shell/main.js",
+  "author": "Qostanai Industry Hackathon team",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "electron .",
+    "dev": "ELECTRON_ENABLE_LOGGING=1 electron .",
+    "dev:spawn": "ELECTRON_ENABLE_LOGGING=1 electron . --spawn-sidecar",
+    "check": "node --check shell/main.js && node --check shell/lockdown.js && node --check shell/ipc.js && node --check shell/preload.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0"
+  }
+}

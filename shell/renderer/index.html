@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Политика безопасности содержимого. Система локальная: наружу не ходим вообще,
+       поэтому default-src 'none' и connect-src 'none' — весь обмен с сайдкаром идёт
+       через preload в main-процессе, а не из renderer. Без этого тега Electron на
+       каждом запуске печатает предупреждение «Insecure Content-Security-Policy»
+       (по умолчанию в renderer разрешён unsafe-eval) — на демо это читается как
+       дефект. script-src оставлен строгим ('self', без unsafe-eval);
+       'unsafe-inline' в style-src нужен ровно для одного места: ширина полосы
+       вклада в risk-score задаётся атрибутом style в app.js.
+       mediastream:/blob: — превью камеры в <video>, data: — кропы кадров. -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none';
+                 script-src 'self';
+                 style-src 'self' 'unsafe-inline';
+                 img-src 'self' data: blob:;
+                 media-src 'self' blob: mediastream:;
+                 font-src 'self';
+                 connect-src 'none';
+                 form-action 'none';
+                 base-uri 'none'" />
+  <title>Прокторинг — локальный контроль экзамена</title>
+  <!-- fonts.css объявляет локальные @font-face (Onest, JetBrains Mono, Space Grotesk)
+       из shell/renderer/fonts/*.woff2. Подключается ПЕРЕД styles.css, иначе
+       --font/--mono успеют примениться до появления семейств. -->
+  <link rel="stylesheet" href="fonts.css" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<div class="app" id="app">
+
+  <!-- ================= Верхняя панель ================= -->
+  <header class="topbar">
+    <div class="brand">
+      <svg class="brand__mark" viewBox="0 0 32 32" aria-hidden="true">
+        <circle cx="16" cy="16" r="14" class="brand__ring" />
+        <circle cx="16" cy="16" r="5.5" class="brand__pupil" />
+        <path d="M16 2.2 L16 7" class="brand__tick" />
+        <path d="M16 25 L16 29.8" class="brand__tick" />
+        <path d="M2.2 16 L7 16" class="brand__tick" />
+        <path d="M25 16 L29.8 16" class="brand__tick" />
+      </svg>
+      <div class="brand__text">
+        <span class="brand__name">Прокторинг</span>
+        <span class="brand__sub">локальная система контроля экзамена</span>
+      </div>
+    </div>
+
+    <nav class="stepper" id="stepper" aria-label="Этапы">
+      <div class="step" data-step="consent"><span class="step__dot"></span><span class="step__label">Согласие</span></div>
+      <div class="step" data-step="preflight"><span class="step__dot"></span><span class="step__label">Проверка</span></div>
+      <div class="step" data-step="calibration"><span class="step__dot"></span><span class="step__label">Калибровка</span></div>
+      <div class="step" data-step="exam"><span class="step__dot"></span><span class="step__label">Экзамен</span></div>
+      <div class="step" data-step="report"><span class="step__dot"></span><span class="step__label">Отчёт</span></div>
+    </nav>
+
+    <div class="link-state">
+      <span class="link-state__dot" id="link-dot"></span>
+      <span class="link-state__text" id="link-text">соединение с ядром…</span>
+    </div>
+  </header>
+
+  <!-- ================= Экраны ================= -->
+  <main class="stage" id="stage">
+
+    <!-- ---------- 1. Согласие и прозрачность ---------- -->
+    <section class="screen" id="screen-consent" data-screen="consent">
+      <div class="screen__inner screen__inner--wide">
+        <div class="screen__head">
+          <h1>Прозрачное согласие на прокторинг</h1>
+          <p class="lede">
+            Экзамен сопровождается автоматическим наблюдением. Всё вычисление идёт
+            на этом компьютере: сеть не используется, данные не передаются во внешние сервисы.
+            Ниже — полный, без исключений, перечень того, что фиксируется, и того, что не фиксируется.
+          </p>
+        </div>
+
+        <div class="cards cards--2">
+          <article class="card card--ok">
+            <h2 class="card__title">Что фиксируется</h2>
+            <ul class="list list--check">
+              <li><b>Кадры с камеры</b> анализируются в оперативной памяти: присутствие лица,
+                  количество лиц, поворот головы, направление взгляда, посторонние предметы (телефон, книга).</li>
+              <li><b>Снимки-доказательства</b> сохраняются только в момент инцидента —
+                  обрезанный кадр и короткий клип вокруг события.</li>
+              <li><b>Эталон лица</b> с этапа калибровки — чтобы убедиться, что за компьютером
+                  всё время один и тот же человек.</li>
+              <li><b>Признаки речи:</b> факт речи, оценка «ваш голос / чужой голос», громкость.</li>
+              <li><b>Проверки окружения:</b> число мониторов, виртуальная камера, ПО удалённого
+                  доступа, признаки виртуальной машины, запись экрана.</li>
+              <li><b>События окна:</b> потеря фокуса, выход из полноэкранного режима,
+                  заблокированные горячие клавиши, факт вставки из буфера.</li>
+              <li><b>Ритм набора текста:</b> интервалы между нажатиями в миллисекундах
+                  и класс клавиши — символ, навигация, служебная.</li>
+            </ul>
+          </article>
+
+          <article class="card card--no">
+            <h2 class="card__title">Что не фиксируется</h2>
+            <ul class="list list--cross">
+              <li><b>Аудио не хранится.</b> Звук обрабатывается потоково и сразу
+                  уничтожается; на диск попадают только числовые признаки.</li>
+              <li><b>Символы клавиш не передаются и не сохраняются.</b> Система видит
+                  «нажата клавиша-символ через 142 мс», но не знает, какая именно.
+                  Пароли, набранные в других окнах, физически недоступны.</li>
+              <li><b>Содержимое буфера обмена не читается</b> — фиксируется только длина вставки.</li>
+              <li><b>Непрерывная запись видео не ведётся.</b> Нет файла «весь экзамен целиком».</li>
+              <li><b>Экран не записывается,</b> другие окна и файлы не просматриваются.</li>
+              <li><b>Нет сетевых обращений.</b> Ни телеметрии, ни облака, ни аналитики.</li>
+            </ul>
+          </article>
+        </div>
+
+        <div class="cards cards--2">
+          <article class="card">
+            <h2 class="card__title">Где лежат данные</h2>
+            <ul class="list list--plain">
+              <li>Каталог сессии: <code>evidence/&lt;id-сессии&gt;/</code> на этом компьютере.</li>
+              <li>Журнал инцидентов — локальная база <code>evidence/proctor.db</code>,
+                  записи сцеплены хеш-цепочкой: удалить или подменить одну строку незаметно нельзя.</li>
+              <li>Итоговый отчёт — HTML-файл в каталоге сессии, подписывается локальным ключом.</li>
+            </ul>
+          </article>
+          <article class="card">
+            <h2 class="card__title">Ваши права</h2>
+            <ul class="list list--plain">
+              <li>Решение принимает человек. Система не выставляет оценку и не аннулирует работу —
+                  она собирает объяснимые доказательства для экзаменатора.</li>
+              <li>Каждый инцидент видно сразу: панель прокторинга показывает, что именно зафиксировано.</li>
+              <li>Отказ от согласия возможен — закройте окно, сессия не начнётся и файлы не создадутся.</li>
+            </ul>
+          </article>
+        </div>
+
+        <div class="card card--form">
+          <h2 class="card__title">Участник</h2>
+          <div class="form-grid">
+            <label class="field">
+              <span class="field__label">ФИО</span>
+              <input class="field__input" id="in-name" type="text" value="Иванов Иван Иванович" autocomplete="off" spellcheck="false" />
+            </label>
+            <label class="field">
+              <span class="field__label">Идентификатор студента</span>
+              <input class="field__input" id="in-student" type="text" value="ST-2026-0147" autocomplete="off" spellcheck="false" />
+            </label>
+            <label class="field">
+              <span class="field__label">Экзамен</span>
+              <input class="field__input" id="in-exam" type="text" value="EX-IND-01 Промышленная автоматизация" autocomplete="off" spellcheck="false" />
+            </label>
+          </div>
+        </div>
+
+        <div class="consent-bar">
+          <label class="checkbox">
+            <input type="checkbox" id="consent-check" />
+            <span class="checkbox__box" aria-hidden="true"></span>
+            <span class="checkbox__text">Я прочитал перечень выше и согласен на наблюдение в указанном объёме.</span>
+          </label>
+          <button class="btn btn--primary btn--lg" id="btn-consent" type="button" disabled>Согласен, продолжить</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------- 2. Предполётная проверка ---------- -->
+    <section class="screen" id="screen-preflight" data-screen="preflight" hidden>
+      <div class="screen__inner">
+        <div class="screen__head">
+          <h1>Проверка окружения</h1>
+          <p class="lede">
+            Проверки выполняются локально и обновляются в реальном времени.
+            Пока есть красный пункт, тест не начнётся — это защищает и участника, и результат.
+          </p>
+        </div>
+
+        <ul class="checks" id="checks"></ul>
+
+        <div class="notice notice--muted" id="preflight-note" hidden></div>
+
+        <div class="actions actions--sticky">
+          <button class="btn" id="btn-recheck" type="button">Повторить проверки</button>
+          <button class="btn btn--primary btn--lg" id="btn-start" type="button" disabled>Начать тест</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------- 3. Калибровка ---------- -->
+    <section class="screen" id="screen-calibration" data-screen="calibration" hidden>
+      <div class="screen__inner">
+        <div class="screen__head">
+          <h1>Калибровка</h1>
+          <p class="lede">
+            Четыре коротких этапа. Они задают персональную норму: без них система
+            сравнивала бы вас со «средним человеком» и ошибалась чаще.
+          </p>
+        </div>
+
+        <div class="calib">
+          <ol class="calib__steps" id="calib-steps"></ol>
+
+          <div class="calib__pane">
+            <div class="calib__stagehead">
+              <h2 id="calib-title">Подготовка</h2>
+              <p id="calib-hint" class="calib__hint">Ожидание готовности камеры…</p>
+            </div>
+
+            <div class="calib__viewport" id="calib-viewport">
+              <!-- рамка лица для этапа identity -->
+              <div class="calib__frame" id="calib-face" hidden>
+                <video class="calib__video" id="calib-video" autoplay muted playsinline hidden></video>
+                <svg class="calib__oval" viewBox="0 0 220 280" aria-hidden="true">
+                  <ellipse cx="110" cy="140" rx="78" ry="104" />
+                  <path d="M110 24 L110 48 M110 232 L110 256 M24 140 L50 140 M170 140 L196 140" />
+                </svg>
+                <div class="calib__countdown" id="calib-count"></div>
+              </div>
+
+              <!-- точка для gaze_center / gaze_grid -->
+              <div class="calib__dotfield" id="calib-dotfield" hidden>
+                <div class="calib__dot" id="calib-dot"><span class="calib__dotcore"></span></div>
+              </div>
+
+              <!-- индикатор речи для voice -->
+              <div class="calib__voice" id="calib-voice" hidden>
+                <div class="wave" aria-hidden="true">
+                  <span></span><span></span><span></span><span></span><span></span>
+                  <span></span><span></span><span></span><span></span><span></span>
+                </div>
+                <p class="calib__phrase">Прочитайте вслух, спокойным обычным голосом:</p>
+                <blockquote class="calib__quote">«Я подтверждаю, что выполняю этот экзамен самостоятельно.»</blockquote>
+              </div>
+            </div>
+
+            <div class="progress">
+              <div class="progress__bar" id="calib-progress"></div>
+            </div>
+            <div class="calib__footer">
+              <span class="calib__counter" id="calib-counter">этап 0 из 4</span>
+              <div class="actions actions--right">
+                <button class="btn btn--ghost" id="btn-calib-retry" type="button">Повторить этап</button>
+                <button class="btn btn--primary" id="btn-calib-start" type="button">Начать калибровку</button>
+                <button class="btn btn--primary" id="btn-calib-next" type="button" hidden>К экзамену</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------- 4. Экзамен ---------- -->
+    <section class="screen screen--exam" id="screen-exam" data-screen="exam" hidden>
+      <div class="exam">
+        <header class="exam__bar">
+          <div class="exam__meta">
+            <span class="exam__name" id="exam-name">Экзамен</span>
+            <span class="exam__pos" id="exam-pos">вопрос 1 из 6</span>
+          </div>
+          <div class="exam__nav" id="exam-palette"></div>
+          <div class="exam__timer" id="exam-timer">
+            <span class="exam__timerlabel">осталось</span>
+            <span class="exam__timerval" id="exam-timerval">20:00</span>
+          </div>
+        </header>
+
+        <div class="exam__body" id="exam-body"></div>
+
+        <footer class="exam__foot">
+          <button class="btn" id="btn-prev" type="button">Назад</button>
+          <div class="exam__footspacer" id="exam-savestate"></div>
+          <button class="btn btn--primary" id="btn-next" type="button">Далее</button>
+          <button class="btn btn--danger" id="btn-finish" type="button">Завершить</button>
+        </footer>
+      </div>
+    </section>
+
+    <!-- ---------- 5. Отчёт ---------- -->
+    <section class="screen" id="screen-report" data-screen="report" hidden>
+      <div class="screen__inner">
+        <div class="screen__head">
+          <h1>Сессия завершена</h1>
+          <p class="lede" id="report-lede">Сформирована доказательная база. Итоговое решение принимает экзаменатор.</p>
+        </div>
+
+        <div class="report">
+          <div class="report__score">
+            <div class="ring ring--lg" id="report-ring-wrap">
+              <svg viewBox="0 0 100 100" aria-hidden="true">
+                <circle class="ring__track" cx="50" cy="50" r="42" />
+                <circle class="ring__value" id="report-ring" cx="50" cy="50" r="42" />
+              </svg>
+              <div class="ring__center">
+                <div class="ring__num" id="report-score">0</div>
+                <div class="ring__label" id="report-level">норма</div>
+              </div>
+            </div>
+            <p class="report__scorenote">итоговый risk-score</p>
+          </div>
+
+          <div class="report__tiles">
+            <div class="tile"><div class="tile__num" id="report-incidents">0</div><div class="tile__cap">инцидентов</div></div>
+            <div class="tile"><div class="tile__num" id="report-high">0</div><div class="tile__cap">высокой важности</div></div>
+            <div class="tile"><div class="tile__num" id="report-duration">00:00</div><div class="tile__cap">длительность</div></div>
+            <div class="tile"><div class="tile__num" id="report-session">—</div><div class="tile__cap">номер сессии</div></div>
+          </div>
+        </div>
+
+        <div class="cards cards--2">
+          <article class="card">
+            <h2 class="card__title">Вклад в оценку риска</h2>
+            <ul class="bars" id="report-breakdown"><li class="bars__empty">Вклад не зафиксирован.</li></ul>
+          </article>
+          <article class="card">
+            <h2 class="card__title">Журнал инцидентов</h2>
+            <ol class="log" id="report-log"><li class="log__empty">Инцидентов не зафиксировано.</li></ol>
+          </article>
+        </div>
+
+        <div class="actions">
+          <span class="report__hint" id="report-hint">Отчёт собирается локально, рядом с доказательствами.</span>
+          <button class="btn btn--primary btn--lg" id="btn-report" type="button">Открыть отчёт</button>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<!-- ================= HUD прокторинга ================= -->
+<aside class="hud" id="hud" hidden aria-label="Панель прокторинга">
+  <header class="hud__head">
+    <span class="hud__live" id="hud-live" aria-hidden="true"></span>
+    <span class="hud__title">Наблюдение активно</span>
+    <button class="hud__toggle" id="hud-toggle" type="button" aria-label="Свернуть панель">
+      <span class="hud__chev" aria-hidden="true"></span>
+    </button>
+  </header>
+
+  <div class="hud__body" id="hud-body">
+    <div class="hud__risk">
+      <div class="ring" id="hud-ring-wrap">
+        <svg viewBox="0 0 100 100" aria-hidden="true">
+          <circle class="ring__track" cx="50" cy="50" r="42" />
+          <circle class="ring__value" id="hud-ring" cx="50" cy="50" r="42" />
+        </svg>
+        <div class="ring__center">
+          <div class="ring__num" id="hud-score">0</div>
+          <div class="ring__label" id="hud-level">норма</div>
+        </div>
+      </div>
+      <div class="hud__riskside">
+        <div class="hud__riskcap">risk-score</div>
+        <ul class="hud__contrib" id="hud-contrib"><li class="hud__contribempty">нарушений нет</li></ul>
+        <div class="hud__fps" id="hud-fps">поток: —</div>
+      </div>
+    </div>
+
+    <div class="hud__section">
+      <div class="hud__sectitle">Каналы</div>
+      <ul class="chans" id="hud-chans"></ul>
+    </div>
+
+    <div class="hud__section">
+      <div class="hud__sectitle">Последние события</div>
+      <ul class="feed" id="hud-feed"><li class="feed__empty">Пока ничего не зафиксировано.</li></ul>
+    </div>
+  </div>
+</aside>
+
+<!-- мягкие уведомления (verdict = warn) -->
+<div class="toasts" id="toasts" aria-live="polite"></div>
+
+<!-- пауза (verdict = pause) -->
+<div class="overlay overlay--pause" id="overlay-pause" hidden>
+  <div class="overlay__card">
+    <div class="overlay__badge overlay__badge--pause">пауза</div>
+    <h2 class="overlay__title">Тест приостановлен</h2>
+    <p class="overlay__text" id="pause-reason">Условия наблюдения нарушены.</p>
+    <ul class="overlay__cond">
+      <li>Сядьте так, чтобы лицо полностью попадало в кадр.</li>
+      <li>Смотрите в экран, уберите телефон и посторонние предметы.</li>
+      <li>В комнате должны быть только вы.</li>
+    </ul>
+    <p class="overlay__note">Таймер экзамена остановлен. Продолжить можно, когда наблюдение вернётся в норму.</p>
+    <button class="btn btn--primary btn--lg" id="btn-resume" type="button" disabled>Продолжить тест</button>
+    <p class="overlay__wait" id="pause-wait">Ожидание нормализации…</p>
+  </div>
+</div>
+
+<!-- блокировка (verdict = lock) -->
+<div class="overlay overlay--lock" id="overlay-lock" hidden>
+  <div class="overlay__card overlay__card--lock">
+    <svg class="lockmark" viewBox="0 0 48 48" aria-hidden="true">
+      <rect x="10" y="21" width="28" height="20" rx="4" />
+      <path d="M17 21 v-5 a7 7 0 0 1 14 0 v5" />
+      <circle cx="24" cy="31" r="2.6" />
+    </svg>
+    <div class="overlay__badge overlay__badge--lock">сессия закрыта</div>
+    <h2 class="overlay__title">Экзамен заблокирован</h2>
+    <p class="overlay__text" id="lock-reason">Накопленный риск превысил допустимый порог.</p>
+    <div class="overlay__session">
+      <span class="overlay__sesscap">номер сессии</span>
+      <span class="overlay__sessval" id="lock-session">—</span>
+    </div>
+    <p class="overlay__note">
+      Доказательная база сохранена локально и сцеплена хеш-цепочкой.
+      Решение по работе принимает экзаменатор — обратитесь к организатору.
+    </p>
+    <button class="btn btn--primary btn--lg" id="btn-lock-report" type="button">Перейти к отчёту</button>
+  </div>
+</div>
+
+<script src="telemetry.js"></script>
+<script src="hud.js"></script>
+<script src="exam.js"></script>
+<script src="calibration.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

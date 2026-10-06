@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page_title }}</title>
+<style>{{ css }}</style>
+</head>
+<body>
+<main class="page">
+
+  <header class="head">
+    <div class="brand">Локальная система прокторинга · отчёт о сессии</div>
+    <h1>{{ page_title }}</h1>
+    <div class="sub">{{ generated_at }}</div>
+    <nav class="toc">
+      <a href="#score">Integrity score</a>
+      <a href="#timeline">Таймлайн</a>
+      <a href="#fusion">Связки</a>
+      <a href="#incidents">Инциденты</a>
+      <a href="#chain">Целостность записи</a>
+      <a href="#limits">Ограничения</a>
+    </nav>
+  </header>
+
+  {{ header_html }}
+
+  <section id="score">
+    <h2>Итоговый integrity score и вклад каналов</h2>
+    {{ score_svg }}
+    {{ breakdown_html }}
+  </section>
+
+  <section id="timeline">
+    <h2>Таймлайн сессии</h2>
+    {{ timeline_svg }}
+    {{ risk_svg }}
+  </section>
+
+  <section id="fusion" class="fusion">
+    <h2>Связки сигналов (fusion) — ядро доказательной базы</h2>
+    {{ fusion_html }}
+  </section>
+
+  <section id="incidents">
+    <h2>Инциденты сессии</h2>
+    <p class="lead">Время указано локальное и смещением от начала сессии. «Доверие» —
+    уверенность детектора в момент фиксации, «длит.» — сколько держалось условие до
+    подтверждения. Миниатюра — кадр-доказательство, вшитый в этот файл.</p>
+    {{ incidents_html }}
+  </section>
+
+  <section id="chain">
+    <h2>Целостность записи</h2>
+    {{ integrity_html }}
+  </section>
+
+  <section id="limits">
+    <h2>Ограничения системы</h2>
+    {{ limits_html }}
+  </section>
+
+  <footer class="foot">{{ footer_html }}</footer>
+
+</main>
+</body>
+</html>

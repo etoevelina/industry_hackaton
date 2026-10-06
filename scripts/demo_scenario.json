@@ -1,0 +1,495 @@
+[
+  {
+    "step": 1,
+    "delay": 2.0,
+    "type": "event",
+    "kind": "SESSION_STARTED",
+    "severity": "info",
+    "channel": "system",
+    "confidence": 1.0,
+    "duration": 0.0,
+    "message": "Сессия прокторинга начата: Демо-студент, экзамен demo-exam",
+    "detail": {"student_id": "demo-student", "exam_id": "demo-exam", "mock": true},
+    "demo": {
+      "title": "Телефон в кадре (п. 2.1 ТЗ)",
+      "say": "Все системы прокторинга отвечают на вопрос «списывал или нет». Мы отвечаем на другой: насколько можно доверять результату. Всё локально, ни один кадр не уходит в сеть.",
+      "show": "Окно экзамена, HUD, risk-score 0, все пять каналов зелёные"
+    }
+  },
+  {
+    "step": 1,
+    "delay": 2.0,
+    "type": "event",
+    "kind": "CALIBRATION_DONE",
+    "severity": "info",
+    "channel": "system",
+    "confidence": 1.0,
+    "duration": 0.0,
+    "message": "Калибровка завершена: карта экрана построена (9 точек, качество good), эталон лица и профиль голоса сняты",
+    "detail": {"gaze_grade": "good", "gaze_points": 9, "identity_enrolled": true, "voice_enrolled": true, "mock": true},
+    "demo": {
+      "title": "Телефон в кадре (п. 2.1 ТЗ)",
+      "say": "Калибровка персональная: пороги считаются от базы этого студента, а не из константы в коде.",
+      "show": "Экран калибровки закрылся, HUD показывает «калибровка: good»"
+    }
+  },
+  {
+    "step": 1,
+    "delay": 4.0,
+    "type": "event",
+    "kind": "PHONE_IN_FRAME",
+    "severity": "medium",
+    "channel": "vision",
+    "confidence": 0.78,
+    "duration": 1.1,
+    "message": "В кадре обнаружен телефон (уверенность 0.78, площадь 3.1% кадра, удержание 1.1 с)",
+    "detail": {"label": "cell phone", "conf": 0.78, "area_ratio": 0.031, "bbox": [412, 288, 74, 126], "mock": true},
+    "demo": {
+      "title": "Телефон в кадре (п. 2.1 ТЗ)",
+      "say": "Требование кейса по детекции устройств. Это покажут все, поэтому проходим быстро.",
+      "show": "Рамка на телефоне в превью, инцидент в ленте, risk 20"
+    }
+  },
+  {
+    "step": 1,
+    "delay": 3.0,
+    "type": "event",
+    "kind": "PHONE_RAISED",
+    "severity": "high",
+    "channel": "vision",
+    "confidence": 0.86,
+    "duration": 0.8,
+    "message": "Телефон поднят к уровню лица (на 0.18 высоты кадра выше центра лица, удержание 0.8 с)",
+    "detail": {"label": "cell phone", "conf": 0.86, "area_ratio": 0.052, "above_face_margin": 0.18, "mock": true},
+    "demo": {
+      "title": "Телефон в кадре (п. 2.1 ТЗ)",
+      "say": "Мало увидеть телефон. Важно отличить «лежит на столе» от «поднят и наведён».",
+      "show": "risk пересёк 30, HUD жёлтый, подсказка студенту «уберите телефон из кадра»"
+    }
+  },
+  {
+    "step": 1,
+    "delay": 2.5,
+    "type": "event",
+    "kind": "PHONE_AIMED_AT_SCREEN",
+    "severity": "high",
+    "channel": "vision",
+    "confidence": 0.83,
+    "duration": 1.5,
+    "message": "Телефон направлен на экран: держат вертикально (h/w 1.42), площадь выросла в 1.9 раза, взгляд в телефон, удержание 1.5 с",
+    "detail": {"label": "cell phone", "conf": 0.83, "vertical_ratio": 1.42, "area_growth": 1.9, "gaze_zone": "down", "mock": true},
+    "demo": {
+      "title": "Телефон в кадре (п. 2.1 ТЗ)",
+      "say": "Съёмка экрана. Мы не только фиксируем её — окно защищено contentProtection, и на снимке будет чёрный прямоугольник. Мы обесцениваем результат, а не только ругаемся.",
+      "show": "risk ушёл за 60, тест на паузе, в ленте три связанных инцидента по телефону"
+    }
+  },
+  {
+    "step": 1,
+    "delay": 4.0,
+    "type": "control",
+    "name": "reset_risk",
+    "demo": {
+      "title": "Решение принимает человек",
+      "say": "Пауза снимается проктором, а не системой. Инцидент остаётся в доказательной базе навсегда, счётчик риска обнуляется решением человека — иначе первый же вектор закрыл бы сессию, и показать остальные семь было бы нельзя.",
+      "show": "Кнопка проктора «продолжить экзамен», risk снова 0, лента инцидентов не очищается"
+    }
+  },
+
+  {
+    "step": 2,
+    "delay": 3.0,
+    "type": "event",
+    "kind": "SHORTCUT_BLOCKED",
+    "severity": "info",
+    "channel": "shell",
+    "confidence": 1.0,
+    "duration": 0.0,
+    "message": "Попытка использовать заблокированное сочетание клавиш: Alt+Tab (перехвачено, в ОС не ушло)",
+    "detail": {"combo": "Alt+Tab", "blocked": true, "platform": "darwin", "mock": true},
+    "demo": {
+      "title": "Локдаун и защита экрана (п. 2.3 ТЗ)",
+      "say": "Alt+Tab перехвачен, до системы он не доходит, факт попытки записан.",
+      "show": "Нажать Alt+Tab, окно не переключилось, в ленте инцидент"
+    }
+  },
+  {
+    "step": 2,
+    "delay": 2.5,
+    "type": "event",
+    "kind": "WINDOW_BLUR",
+    "severity": "low",
+    "channel": "shell",
+    "confidence": 1.0,
+    "duration": 0.4,
+    "message": "Окно экзамена потеряло фокус на 0.4 с (Cmd+Tab на macOS перехватить нельзя), фокус возвращён принудительно",
+    "detail": {"reason": "cmd_tab_passed_through", "blur_ms": 420, "focus_restored": true, "mock": true},
+    "demo": {
+      "title": "Локдаун и защита экрана (п. 2.3 ТЗ)",
+      "say": "Cmd+Tab из пользовательского процесса не блокируется ничем, кроме kernel-драйвера. Мы это не прячем: фокус возвращается за 0.4 секунды, а сам факт попадает в отчёт. Детали — в docs/LIMITATIONS.md.",
+      "show": "Нажать Cmd+Tab: окно моргнуло и вернулось, в ленте WINDOW_BLUR с длительностью"
+    }
+  },
+  {
+    "step": 2,
+    "delay": 2.5,
+    "type": "event",
+    "kind": "SHORTCUT_BLOCKED",
+    "severity": "info",
+    "channel": "shell",
+    "confidence": 1.0,
+    "duration": 0.0,
+    "message": "Попытка использовать заблокированное сочетание клавиш: PrintScreen (перехвачено, защита содержимого включена)",
+    "detail": {"combo": "PrintScreen", "blocked": true, "content_protection": true, "mock": true},
+    "demo": {
+      "title": "Локдаун и защита экрана (п. 2.3 ТЗ)",
+      "say": "А теперь главное про скриншот.",
+      "show": "Сделать снимок экрана и открыть его: окно экзамена — чёрный прямоугольник"
+    }
+  },
+  {
+    "step": 2,
+    "delay": 2.0,
+    "type": "event",
+    "kind": "FULLSCREEN_EXIT",
+    "severity": "low",
+    "channel": "shell",
+    "confidence": 1.0,
+    "duration": 0.3,
+    "message": "Выход из полноэкранного режима зафиксирован, режим восстановлен автоматически за 0.3 с",
+    "detail": {"reason": "left_fullscreen", "restored": true, "restore_ms": 300, "mock": true},
+    "demo": {
+      "title": "Локдаун и защита экрана (п. 2.3 ТЗ)",
+      "say": "Выйти из полного экрана тоже можно — и это тоже инцидент с длительностью.",
+      "show": "risk ~40, HUD показывает четыре события оболочки"
+    }
+  },
+  {
+    "step": 2,
+    "delay": 3.0,
+    "type": "control",
+    "name": "reset_risk",
+    "demo": {
+      "title": "Решение принимает человек",
+      "say": "",
+      "show": "Проктор снимает предупреждение, идём к следующему вектору"
+    }
+  },
+
+  {
+    "step": 3,
+    "delay": 3.0,
+    "type": "event",
+    "kind": "NO_FACE",
+    "severity": "low",
+    "channel": "vision",
+    "confidence": 1.0,
+    "duration": 2.6,
+    "message": "Лицо не видно в кадре 2.6 с",
+    "detail": {"gap_s": 2.6, "frames_without_face": 39, "mock": true},
+    "demo": {
+      "title": "Подмена человека после калибровки",
+      "say": "Смотрите на кадр: студент встал.",
+      "show": "Второй участник команды садится на место первого"
+    }
+  },
+  {
+    "step": 3,
+    "delay": 3.0,
+    "type": "event",
+    "kind": "SECOND_FACE",
+    "severity": "high",
+    "channel": "vision",
+    "confidence": 0.91,
+    "duration": 1.2,
+    "message": "В кадре второй человек (2 лица, удержание 1.2 с)",
+    "detail": {"faces": 2, "conf": 0.91, "boxes": [[180, 140, 190, 230], [420, 150, 175, 215]], "mock": true},
+    "demo": {
+      "title": "Подмена человека после калибровки",
+      "say": "В момент пересадки в кадре два лица.",
+      "show": "Две рамки в превью, risk растёт"
+    }
+  },
+  {
+    "step": 3,
+    "delay": 3.0,
+    "type": "event",
+    "kind": "IDENTITY_MISMATCH",
+    "severity": "critical",
+    "channel": "identity",
+    "confidence": 0.93,
+    "duration": 2.0,
+    "message": "За компьютером другой человек: близость к эталону 0.21 при пороге 0.35, 5 из 6 последних проверок не совпали",
+    "detail": {"similarity": 0.21, "threshold": 0.35, "fail_streak": 5, "window": 6, "check_interval_s": 3.0, "mock": true},
+    "demo": {
+      "title": "Подмена человека после калибровки",
+      "say": "Классический прокторинг проверяет личность один раз на входе. Дальше за клавиатуру может сесть кто угодно. У нас сверка идёт каждые три секунды всю сессию, решение — по скользящему окну, а не по одному кадру.",
+      "show": "risk 100, тест заблокирован, HUD красный, кроп лица подшит к инциденту"
+    }
+  },
+  {
+    "step": 3,
+    "delay": 4.0,
+    "type": "control",
+    "name": "reset_risk",
+    "demo": {
+      "title": "Решение принимает человек",
+      "say": "Блокировку снимает проктор — система не выносит приговор сама.",
+      "show": "Возврат первого участника на место, экзамен продолжен"
+    }
+  },
+
+  {
+    "step": 4,
+    "delay": 3.0,
+    "type": "event",
+    "kind": "VIRTUAL_CAMERA",
+    "severity": "critical",
+    "channel": "environment",
+    "confidence": 1.0,
+    "duration": 0.0,
+    "message": "Используется виртуальная камера: устройство «OBS Virtual Camera» (видеопоток подменён)",
+    "detail": {"device": "OBS Virtual Camera", "backend": "avfoundation", "device_index": 1, "mock": true},
+    "demo": {
+      "title": "Виртуальная камера и живость",
+      "say": "Запускаю OBS и подаю в камеру записанное заранее видео студента.",
+      "show": "Запустить виртуальную камеру, инцидент появляется мгновенно"
+    }
+  },
+  {
+    "step": 4,
+    "delay": 3.0,
+    "type": "event",
+    "kind": "SCREEN_RECORDING",
+    "severity": "high",
+    "channel": "environment",
+    "confidence": 1.0,
+    "duration": 0.0,
+    "message": "Идёт запись или трансляция экрана: процесс «obs» использует API захвата экрана",
+    "detail": {"process": "obs", "pid": 4821, "method": "screen_capture_api", "mock": true},
+    "demo": {
+      "title": "Виртуальная камера и живость",
+      "say": "Тот же процесс видно и с другой стороны — по захвату экрана. Две независимые проверки, а не одна.",
+      "show": "Второй инцидент того же вектора, канал «окружение» красный"
+    }
+  },
+  {
+    "step": 4,
+    "delay": 3.0,
+    "type": "event",
+    "kind": "LIVENESS_FAIL",
+    "severity": "high",
+    "channel": "identity",
+    "confidence": 0.88,
+    "duration": 3.2,
+    "message": "Признаки подмены видеопотока: за 60 с ни одного моргания, область лица статична, последовательность кадров повторяется с периодом 12.4 с",
+    "detail": {"blinks_60s": 0, "face_motion": 0.004, "loop_detected": true, "loop_period_s": 12.4, "mock": true},
+    "demo": {
+      "title": "Виртуальная камера и живость",
+      "say": "И даже если бы устройство называлось безобидно — в кадре нет живого человека: нет морганий, нет микродвижений, и кадры идут по кругу с периодом 12 секунд.",
+      "show": "risk 100, блокировка, в ленте три инцидента одного вектора с разных каналов"
+    }
+  },
+  {
+    "step": 4,
+    "delay": 4.0,
+    "type": "control",
+    "name": "reset_risk",
+    "demo": {
+      "title": "Решение принимает человек",
+      "say": "",
+      "show": "Выключить виртуальную камеру, проктор продолжает экзамен"
+    }
+  },
+
+  {
+    "step": 5,
+    "delay": 3.0,
+    "type": "event",
+    "kind": "VOICE_OTHER",
+    "severity": "high",
+    "channel": "audio",
+    "confidence": 0.79,
+    "duration": 1.4,
+    "message": "Слышен посторонний голос: близость к профилю студента 0.21 при пороге 0.60, речь держится 1.4 с",
+    "detail": {"similarity": 0.21, "owner_threshold": 0.60, "rms": 0.041, "speech_ratio": 0.76, "mock": true},
+    "demo": {
+      "title": "Чужой голос и наушник",
+      "say": "Второй участник произносит фразу из-за кадра.",
+      "show": "Канал «аудио» подсветился, инцидент в ленте. Звук при этом не записывается — только признаки"
+    }
+  },
+  {
+    "step": 5,
+    "delay": 3.0,
+    "type": "event",
+    "kind": "SPEECH_WITHOUT_LIP_MOTION",
+    "severity": "high",
+    "channel": "audio",
+    "confidence": 0.84,
+    "duration": 2.6,
+    "message": "Речь слышна 2.6 с, губы студента при этом неподвижны (открытие рта 0.04 при пороге 0.22) — вероятна связь через наушник",
+    "detail": {"speech_duration": 2.6, "speech_ratio": 0.82, "mouth_open_ratio": 0.04, "mouth_open_threshold": 0.22, "mouth_variance": 0.001, "mock": true},
+    "demo": {
+      "title": "Чужой голос и наушник",
+      "say": "Речь есть, губы не двигаются. Это не распознавание речи и не профиль голоса — это рассинхрон, который дёшево считается и однозначно означает наушник со связью.",
+      "show": "risk ~70, пауза, формулировка инцидента с двумя числами"
+    }
+  },
+  {
+    "step": 5,
+    "delay": 3.0,
+    "type": "control",
+    "name": "reset_risk",
+    "demo": {
+      "title": "Решение принимает человек",
+      "say": "",
+      "show": "Готовимся к главному шагу: студент возвращается к вопросу q7"
+    }
+  },
+
+  {
+    "step": 6,
+    "delay": 2.0,
+    "type": "status",
+    "fps": 14.8,
+    "face_present": true,
+    "face_count": 1,
+    "gaze": {"yaw": 21.4, "pitch": -14.8, "zone": "right_down"},
+    "phone": false,
+    "identity_ok": true,
+    "audio_ok": true,
+    "risk": 0.0,
+    "state": "running",
+    "demo": {
+      "title": "Fusion поведения и содержания",
+      "say": "Смотрите на карту взгляда: точка ушла за правый нижний край экрана. Телефона в кадре нет, второго человека нет — по отдельности это ничего не доказывает.",
+      "show": "Отвести взгляд вправо-вниз и держать 5 секунд. На HUD — точка взгляда вне рамки экрана"
+    }
+  },
+  {
+    "step": 6,
+    "delay": 3.0,
+    "type": "event",
+    "kind": "GAZE_OFF_SCREEN",
+    "severity": "low",
+    "channel": "gaze",
+    "confidence": 0.90,
+    "duration": 5.2,
+    "message": "Точка взгляда вне области экрана 5.2 с: карта экрана даёт (1.34, 1.12) — вправо-вниз за пределы монитора",
+    "detail": {"zone": "right_down", "screen_x": 1.34, "screen_y": 1.12, "dev_h": 2.1, "dev_v": 1.7, "calibrated": true, "mock": true},
+    "demo": {
+      "title": "Fusion поведения и содержания",
+      "say": "Калибровка по девяти точкам даёт не «смотрит вбок», а координату: 1.34 по горизонтали — это за краем экрана, там лежит второе устройство.",
+      "show": "Вернуть взгляд на экран"
+    }
+  },
+  {
+    "step": 6,
+    "delay": 2.0,
+    "type": "event",
+    "kind": "CLIPBOARD_PASTE",
+    "severity": "low",
+    "channel": "shell",
+    "confidence": 1.0,
+    "duration": 0.0,
+    "message": "Вставка из буфера обмена в ответ на вопрос q7: 312 символов",
+    "detail": {"question_id": "q7", "length": 312, "source": "clipboard", "mock": true},
+    "demo": {
+      "title": "Fusion поведения и содержания",
+      "say": "Вставка.",
+      "show": "Нажать Cmd+V в поле ответа на вопрос q7"
+    }
+  },
+  {
+    "step": 6,
+    "delay": 1.0,
+    "type": "event",
+    "kind": "PASTE_BURST",
+    "severity": "medium",
+    "channel": "fusion",
+    "confidence": 1.0,
+    "duration": 0.0,
+    "message": "Вставлен большой блок текста: 312 символов за одну операцию (базовая скорость набора студента — 170 мс на знак)",
+    "detail": {"question_id": "q7", "length": 312, "typing_mean_ms": 11, "baseline_mean_ms": 170, "mock": true},
+    "demo": {
+      "title": "Fusion поведения и содержания",
+      "say": "Сама вставка — это ещё не списывание. Важна связка.",
+      "show": "risk ~48, два события по одному вопросу"
+    }
+  },
+  {
+    "step": 6,
+    "delay": 1.5,
+    "type": "event",
+    "kind": "FUSION_GAZE_THEN_ANSWER",
+    "severity": "critical",
+    "channel": "fusion",
+    "confidence": 0.95,
+    "duration": 6.3,
+    "message": "Взгляд отведён вправо-вниз на 5.2 с, через 1.1 с введено 312 символов со средним интервалом 11 мс при базовой скорости студента 170 мс (вопрос q7)",
+    "detail": {"question_id": "q7", "gaze_away_s": 5.2, "gaze_zone": "right_down", "lag_ms": 1100, "chars": 312, "mean_interval_ms": 11, "baseline_interval_ms": 170, "speed_ratio": 15.5, "difficulty": 4, "mock": true},
+    "demo": {
+      "title": "Fusion поведения и содержания",
+      "say": "Читаю дословно из ленты: «Взгляд отведён вправо-вниз на 5.2 секунды, через 1.1 секунды введено 312 символов со средним интервалом 11 миллисекунд при базовой скорости студента 170». Ни один из этих сигналов по отдельности ничего не доказывает. Вместе — это связка с таймингами, которую мы кладём в отчёт. Вот это и есть разница между детектором и системой доверия.",
+      "show": "risk 100, блокировка, инцидент с полной формулировкой — читать вслух с экрана"
+    }
+  },
+
+  {
+    "step": 7,
+    "delay": 3.0,
+    "type": "event",
+    "kind": "SESSION_ENDED",
+    "severity": "info",
+    "channel": "system",
+    "confidence": 1.0,
+    "duration": 0.0,
+    "message": "Сессия прокторинга завершена: integrity score 100, 17 инцидентов, 9 доказательств, отчёт подписан, хеш-цепочка цела (17 записей)",
+    "detail": {"reason": "risk_lock", "final_action": "lock", "score": 100.0, "events": 17, "evidence": 9, "report": "sessions/<id>/report.html", "signature": "sessions/<id>/report.html.sig", "chain_ok": true, "chain_records": 17, "mock": true},
+    "demo": {
+      "title": "Отчёт и его неподделываемость",
+      "say": "Отчёт собирается сам при закрытии сессии: integrity score с разложением по каналам, таймлайн, кропы кадров, формулировки на русском. Открывается с флешки, без интернета.",
+      "show": "Завершить тест, открыть sessions/<id>/report.html"
+    }
+  },
+  {
+    "step": 7,
+    "delay": 2.0,
+    "type": "status",
+    "fps": 14.6,
+    "face_present": true,
+    "face_count": 1,
+    "gaze": {"yaw": 1.8, "pitch": -2.4, "zone": "center"},
+    "phone": false,
+    "identity_ok": true,
+    "audio_ok": true,
+    "risk": 100.0,
+    "state": "locked",
+    "demo": {
+      "title": "Отчёт и его неподделываемость",
+      "say": "Каждая запись связана хешем с предыдущей, отчёт подписан локальным ключом Ed25519. Меняю один байт в базе и запускаю проверку: падает и показывает номер записи. Преподаватель проверяет одной командой, студент не может переписать историю.",
+      "show": "В терминале: make verify (всё ок) -> правка байта в evidence.sqlite -> make verify (цепочка рвётся на записи N)"
+    }
+  },
+
+  {
+    "step": 8,
+    "delay": 3.0,
+    "type": "status",
+    "fps": 14.9,
+    "face_present": true,
+    "face_count": 1,
+    "gaze": {"yaw": 0.6, "pitch": -1.2, "zone": "center"},
+    "phone": false,
+    "identity_ok": true,
+    "audio_ok": true,
+    "risk": 0.0,
+    "state": "idle",
+    "demo": {
+      "title": "Цифры и граница модели угроз",
+      "say": "Мы измерили собственные ложные срабатывания и показываем их числом, а не словом «работает». 15 кадров в секунду на ноутбуке без дискретной видеокарты, CPU под 60 процентов. Система экономит преподавателю два часа просмотра записи и оставляет решение за человеком.",
+      "show": "Слайд: precision/recall по собственной выборке, FPS и CPU, таблица деградации при отказе компонентов, граница модели угроз из docs/LIMITATIONS.md"
+    }
+  }
+]
