@@ -336,6 +336,9 @@
   function ruleSvg(state) {
     var o = svgOpen(16);
     if (state === 'ok') return o + '<path d="M3.2 8.6 L6.3 11.6 L12.8 4.6"></path></svg>';
+    // «Запрещено» — крестик, а не галочка: галочку рядом с «Поисковые системы»
+    // читают как «разрешены», хотя правило действует (тон строки остаётся ok).
+    if (state === 'deny') return o + '<path d="M4.4 4.4 L11.6 11.6 M11.6 4.4 L4.4 11.6"></path></svg>';
     if (state === 'warn') {
       return o + '<path d="M8 1.6 L14.6 13.4 L1.4 13.4 Z"></path>' +
                  '<path d="M8 6 L8 9.4 M8 11.3 L8 11.4"></path></svg>';
@@ -545,14 +548,26 @@
    * Ответа не ждём: решение принимает main-процесс, он же вернёт реальное
    * состояние через onProtection.
    */
-  Bridge.prototype.setExamState = function (next) {
+  /**
+   * Сообщить оболочке о смене экрана.
+   *
+   * `onReject` обязателен по смыслу, а не по вкусу. Оболочка может отвергнуть
+   * переход (canTransition в shell/state.js), и раньше об этом узнавала только
+   * консоль: интерфейс рисовал экран экзамена с HUD, оболочка оставалась,
+   * например, в `consent`, блокировок не включала и страницу теста не
+   * открывала. На экране при этом «идёт экзамен». Поймано на живом проходе
+   * 08.10: расхождение двух половин программы, о котором человеку не сказали.
+   */
+  Bridge.prototype.setExamState = function (next, onReject) {
     if (!this.api || typeof this.api.setExamState !== 'function') return false;
     try {
       Promise.resolve(this.api.setExamState(next)).then(function (res) {
         if (res && res.ok === false) {
-          // Оболочка отвергла переход — это не ошибка интерфейса, но знать полезно.
           // eslint-disable-next-line no-console
           console.warn('[proctor] оболочка отвергла состояние', next, res.reason);
+          if (typeof onReject === 'function') {
+            try { onReject(res); } catch (e) { /* обработчик не ломает канал */ }
+          }
         }
       }).catch(function () { /* канала нет — интерфейс не рвётся */ });
       return true;
@@ -605,6 +620,15 @@
     this.examResult = null;
     this.sessionStartedAt = 0;
     this.locked = false;
+    // Пригоден ли ЗАПУСК для настоящего экзамена (protectionInfo().examReady).
+    // По умолчанию считаем, что да: пока оболочка не сказала иного, ослаблять
+    // предполётный шлюз не на основании чего.
+    this.launchExamReady = true;
+    this.launchWarning = '';
+    // Чем именно шлюз был обойдён, если был. Уходит в шапку отчёта.
+    this.preflightOverride = null;
+    // Идёт ли экзамен на чужой странице (LMS) вместо локального мок-теста.
+    this.externalExam = false;
   }
 
   /** Экранирование: своё, если hud.js не отдал общий помощник. */
@@ -676,7 +700,22 @@
 
     this.exam.init({
       telemetry: this.telemetry,
-      onFinish: function (res) { self.onExamFinished(res); }
+      onFinish: function (res) { self.onExamFinished(res); },
+      // Нажали «Завершить», а теста нет. Молчать нельзя: именно так выглядит
+      // «кнопка не работает». Говорим, что видим, и уводим на отчёт, потому
+      // что из экрана экзамена без сессии другого выхода у человека нет.
+      onIdleFinish: function () {
+        self.hud.alert({
+          tone: 'var(--sev-warn)',
+          title: 'Тест не запущен',
+          text: 'Эта сессия не начиналась: завершать нечего. Открываем отчёт '
+            + 'по тому, что зафиксировано.',
+          code: 'SHL_011',
+          rank: 2
+        });
+        self.bridge.setExamState('finished');
+        self.showReport();
+      }
     });
 
     this.calibration.init({
@@ -687,6 +726,7 @@
     this._wireConsent();
     this._wirePreflight();
     this._wireCalibration();
+    this._wireHudFinish();
     this._wireReport();
 
     this._renderDisclosure();
@@ -741,14 +781,20 @@
 
   // --- экраны ---
 
-  App.prototype.show = function (name) {
+  App.prototype.show = function (name, quiet) {
     if (SCREENS.indexOf(name) === -1) return;
     this.screen = name;
     // скрытый экран не подгоняется — пока его не было видно, окно могло измениться
     if (name === 'consent' && this._scheduleConsentFit) this._scheduleConsentFit();
     // Оболочка узнаёт о смене экрана до отрисовки: блокировки должны стоять
     // к моменту, когда студент увидит первый вопрос, и сняться к отчёту.
-    if (SCREEN_STATE[name]) this.bridge.setExamState(SCREEN_STATE[name]);
+    // Отказ оболочки больше не остаётся между нами и консолью: см. _onStateRejected.
+    if (SCREEN_STATE[name] && !quiet) {
+      var selfShow = this;
+      this.bridge.setExamState(SCREEN_STATE[name], function (res) {
+        selfShow._onStateRejected(name, res);
+      });
+    }
     for (var i = 0; i < SCREENS.length; i++) {
       var key = SCREENS[i];
       var node = el('screen-' + key);
@@ -782,6 +828,12 @@
       root.classList.toggle('has-hud', withHud);
       root.setAttribute('data-screen', name);
     }
+    // Выход из теста живёт на панели наблюдения и обязан исчезнуть вместе с
+    // тестом: кнопка «Завершить» на калибровке или в отчёте — это кнопка,
+    // которая ничего не делает, то есть ровно та же жалоба.
+    var foot = el('hud-foot');
+    if (foot && name !== 'exam') foot.hidden = true;
+
     // Раскладка изменилась — пересчитываем место под страницу экзамена.
     // Второй вызов на следующем кадре: классы уже проставлены, но браузер
     // ещё не пересчитал геометрию, и измерять сейчас рано.
@@ -790,6 +842,48 @@
     if (typeof window.requestAnimationFrame === 'function') {
       window.requestAnimationFrame(function () { self2._reportExamViewInset(); });
     }
+  };
+
+  /**
+   * Оболочка отвергла переход, а экран уже нарисован.
+   *
+   * Двум половинам программы нельзя расходиться МОЛЧА. Отвергнутый переход
+   * означает: блокировок нет, страница теста не открыта, наблюдение в том
+   * состоянии, в котором было. Рисовать при этом «идёт экзамен» — вводить
+   * человека в заблуждение самым дорогим способом из возможных.
+   *
+   * Поэтому: говорим словами и возвращаем интерфейс на экран, который
+   * СООТВЕТСТВУЕТ состоянию оболочки (res.state). Возврат тихий (quiet) —
+   * повторно слать состояние нельзя, иначе два отказа гоняли бы экраны по
+   * кругу.
+   */
+  App.prototype._onStateRejected = function (wanted, res) {
+    if (this.screen !== wanted) return;         // мы уже ушли дальше сами
+    var back = null;
+    var shellState = res && res.state;
+    for (var key in SCREEN_STATE) {
+      if (!Object.prototype.hasOwnProperty.call(SCREEN_STATE, key)) continue;
+      if (SCREEN_STATE[key] === shellState) { back = key; break; }
+    }
+    if (wanted === 'exam' && this.exam && this.exam.running) {
+      // Тест, которого оболочка не разрешила, не продолжается: он не
+      // наблюдается. Именно abort(), а не finish(): отчёт о несостоявшемся
+      // тесте утверждал бы, что тест был.
+      this.exam.abort();
+      this.externalExam = false;
+    }
+    this.hud.alert({
+      tone: 'var(--sev-high)',
+      title: 'Переход не разрешён оболочкой',
+      text: 'Экран «' + wanted + '» не открыт: оболочка осталась в состоянии «'
+        + (shellState || 'неизвестно') + '»'
+        + (res && res.reason ? ' (' + res.reason + ')' : '')
+        + '. Наблюдение и блокировки не включались, страница теста не открыта.',
+      code: 'SHL_012',
+      rank: 3
+    });
+    this._updateHudFinish();
+    if (back && back !== wanted) this.show(back, true);
   };
 
   /**
@@ -896,14 +990,62 @@
     // Защищённый режим: включился или снялся. Канал оболочки, не сайдкара.
     this.bridge.subscribeRaw('onProtection', null, function (p) {
       self.hud.setProtection(p);
+      self._applyProtection(p);
     });
+  };
+
+  /**
+   * Режим запуска: пригоден ли он для настоящего экзамена.
+   *
+   * Нужен предполётному шлюзу. Запуск с ослабляющими флагами (--no-lockdown,
+   * --no-kiosk) оболочка УЖЕ объявила непригодным — вслух, в журнал, в
+   * хеш-цепочку и в шапку отчёта. В таком запуске шлюз не имеет права быть
+   * тупиком: на живом запуске 08.10 он блокировал старт пунктом «запущен
+   * ИИ-клиент: Claude; запущен мессенджер: Slack, Telegram» — то есть в режиме
+   * разработки дойти даже до своей страницы LMS было нельзя, а закрыть пункт
+   * нечем: это рабочие программы на машине разработчика.
+   *
+   * Ослабления ПРАВИЛ здесь не происходит. Пункт остаётся «не пройдено»,
+   * обход делается отдельной кнопкой, называется словами и попадает в отчёт.
+   */
+  App.prototype._applyProtection = function (p) {
+    if (!p || typeof p !== 'object') return;
+    var ready = p.examReady !== false;
+    var warning = String(p.warning || '');
+    if (this.launchExamReady === ready && this.launchWarning === warning) return;
+    this.launchExamReady = ready;
+    this.launchWarning = warning;
+    this._updateStartGate();
   };
 
   /** Применить карту каналов сайдкара к HUD и проверкам. */
   App.prototype._applyCaps = function (caps) {
     if (!caps) return;
+    /*
+     * Карта каналов приходит и в hello, и в состоянии оболочки раз в секунду.
+     * Повторять по ней работу каждую секунду нельзя: _setCheck перерисовывает
+     * список проверок через innerHTML, то есть раз в секунду сбрасывал бы его
+     * целиком. Сравниваем по пяти ключам, а не ссылкой: объект каждый раз новый.
+     */
+    var sig = ['vision', 'gaze', 'identity', 'audio', 'env'].map(function (k) {
+      return k + '=' + String(caps[k]);
+    }).join(',');
+    if (this._capsSig === sig) return;
+    this._capsSig = sig;
     this.caps = caps;
     this.hud.setCapabilities(caps);
+    /*
+     * Карту каналов получает и калибровка — иначе она ведёт студента по
+     * этапам, измерить которые нечем. Своя подписка у неё есть (api.onHello),
+     * но на живом проходе 08.10 она не сработала: ядро отдало
+     * vision/gaze/identity/audio = false, а студента всё равно провели через
+     * «Эталон лица», «Центр взгляда», «Карту экрана» и «Эталон голоса» — семь
+     * десятков секунд бессмысленных указаний. Передаём явно: у кого карта
+     * каналов на руках, тот и обязан её раздать.
+     */
+    if (this.calibration && typeof this.calibration.setCapabilities === 'function') {
+      this.calibration.setCapabilities(caps);
+    }
     // предпросмотр камеры в оболочке допустим только если сайдкар её не держит
     this.calibration.setPreviewAllowed(caps.vision === false);
     if (!this.envGraceStartedAt) this.envGraceStartedAt = Date.now();
@@ -923,11 +1065,29 @@
     if (!st || typeof st !== 'object') return;
     // Профиль экзамена задаёт оболочка, и его состояние может приехать здесь.
     this._feedProfile(st);
+    /*
+     * КАРТА КАНАЛОВ ЯДРА — ТОЖЕ ОТСЮДА.
+     *
+     * Единственным её источником был push `proctor:hello`, то есть ОДНО
+     * сообщение в начале сессии. Renderer грузится дольше, чем ядро успевает
+     * поздороваться, и на живом запуске 08.10 это сообщение проходило мимо:
+     * `this.caps` оставался null, предполётный пункт «Камера» висел
+     * «проверяется…» навсегда, а калибровка вела студента через «Эталон
+     * лица» и «Карту экрана» на машине без камеры. Ровно те же симптомы
+     * давал бы любой реконнект ядра.
+     *
+     * При этом карта всё время лежала в состоянии оболочки: ipc.js запоминает
+     * последний hello, и shellStatus() кладёт его в `sidecar.capabilities`
+     * КАЖДУЮ секунду. Одно пропущенное сообщение больше ничего не решает.
+     */
+    var fromShell = st.sidecar && pickSidecarCaps(st.sidecar.capabilities);
+    if (fromShell) this._applyCaps(fromShell);
     // Состояние защищённого режима приходит и отдельным событием, и здесь:
     // статус оболочки — страховка на случай, если renderer загрузился позже
     // первого push и пропустил его.
     if (st.protection && typeof st.protection === 'object') {
       this.hud.setProtection(st.protection);
+      this._applyProtection(st.protection);
     }
     if (typeof st.displayCount === 'number') {
       // живое состояние оболочки — ведущее: отключили второй экран, пункт зеленеет сам
@@ -1338,7 +1498,7 @@
         : 'разрешены правилами этого экзамена';
       rows.push({ key: 'search', state: 'warn', html: this._esc(by) });
     } else {
-      rows.push({ key: 'search', state: 'ok',
+      rows.push({ key: 'search', state: 'ok', icon: 'deny',
                   html: p.present ? 'запрещены' : 'запрещены: правила не задавались' });
     }
 
@@ -1460,7 +1620,7 @@
       var r = rows[i];
       body += '<div class="rules__row" data-state="' + r.state + '" data-rule="' + r.key + '">' +
                 '<dt class="rules__term">' +
-                  '<span class="rules__mark" aria-hidden="true">' + ruleSvg(r.state) + '</span>' +
+                  '<span class="rules__mark" aria-hidden="true">' + ruleSvg(r.icon || r.state) + '</span>' +
                   '<span>' + this._esc(RULE_TERMS[r.key]) + '</span>' +
                 '</dt>' +
                 '<dd class="rules__value">' + r.html + '</dd>' +
@@ -1534,6 +1694,40 @@
       '<span>' + html + '</span>';
   };
 
+  /**
+   * Отметка в шапке отчёта о том, что предполётный шлюз был обойдён.
+   *
+   * Обход без записи в отчёте — это подделка: читающий отчёт обязан видеть, что
+   * сессия началась с незакрытыми пунктами, иначе оценка риска выглядит
+   * полученной в нормальных условиях. Отсутствие отметки — тоже утверждение
+   * («шлюз пройден честно»), поэтому узел создаётся только при обходе, а не
+   * пустым на всякий случай.
+   */
+  App.prototype._renderReportOverride = function () {
+    var o = this.preflightOverride;
+    var node = el('report-preflight');
+    if (!o) { if (node) node.hidden = true; return; }
+    if (!node) {
+      var anchor = el('report-rules') || el('report-lede');
+      if (!anchor || !anchor.parentNode) return;
+      try {
+        node = document.createElement('p');
+        node.id = 'report-preflight';
+        node.className = 'report__rules';
+        anchor.parentNode.insertBefore(node, anchor.nextSibling);
+      } catch (e) { return; }
+    }
+    node.hidden = false;
+    node.setAttribute('data-state', 'warn');
+    var names = (o.checks || []).join(', ') || '—';
+    node.innerHTML =
+      '<span class="rules__mark" aria-hidden="true">' + ruleSvg('warn') + '</span> ' +
+      '<span>' + this._esc('Предполётная проверка была обойдена вручную. '
+        + 'Незакрытые пункты: ' + names + '. '
+        + (o.launchWarning || 'Запуск помечен как непригодный для настоящего экзамена.')) +
+      '</span>';
+  };
+
   /** Перерисовать все три места, где показаны правила. Идемпотентно. */
   App.prototype._renderRules = function () {
     var p = this._profile();
@@ -1600,8 +1794,25 @@
       this._setCheck('mic', this.caps && this.caps.audio === false ? 'warn' : 'ok',
         this.caps && this.caps.audio === false ? 'аудиоканал отключён' : 'микрофон доступен');
     }
-    if (this.checks.camera.state === 'pending' && this.caps && this.caps.vision !== false) {
-      this._setCheck('camera', 'ok', 'камера доступна');
+    /*
+     * Камера. Прежнее условие закрывало пункт только при `this.caps &&
+     * caps.vision !== false`, то есть НИКОГДА, если карта каналов не приехала
+     * вовсе: ядро без камеры (и ядро, запущенное без проверок окружения)
+     * оставляло пункт в «проверяется…» навсегда, а шлюз из-за одного
+     * бесконечного ожидания не включал «Начать тест» ни при какой конфигурации.
+     * Поймано на живом запуске 08.10 — дойти до экзамена было нельзя.
+     *
+     * Теперь у пункта есть статус в любом случае, и статус честный: молчание
+     * ядра — это «недоступно», а не «в порядке» и не вечное ожидание.
+     */
+    if (this.checks.camera.state === 'pending') {
+      if (!this.caps) {
+        this._setCheck('camera', 'warn', 'ядро не сообщило о канале камеры');
+      } else if (this.caps.vision === false) {
+        this._setCheck('camera', 'fail', 'камера или модули зрения недоступны');
+      } else {
+        this._setCheck('camera', 'ok', 'камера доступна');
+      }
     }
     this._renderChecks();
   };
@@ -1705,6 +1916,74 @@
       btn.setAttribute('aria-describedby', 'preflight-block');
       btn.setAttribute('title', blocked ? text : 'Начать тест');
     }
+    this._updateStartOverride(blocked, failed, pending);
+  };
+
+  /**
+   * Выход вперёд из непригодного запуска.
+   *
+   * Показывается ТОЛЬКО когда одновременно: шлюз закрыт и сам запуск уже
+   * объявлен непригодным для настоящего экзамена (флаги --no-lockdown /
+   * --no-kiosk, protectionInfo().examReady === false). На настоящем экзамене
+   * этой кнопки не существует — там закрытый пункт означает «устраните», и
+   * обойти его нечем.
+   *
+   * Названа тем, что делает, а не «Продолжить»: человек должен понимать, что
+   * он запускает не экзамен, а прогон интерфейса.
+   */
+  App.prototype._updateStartOverride = function (blocked, failed, pending) {
+    var show = Boolean(blocked) && this.launchExamReady === false;
+    var btn = el('btn-start-anyway');
+    if (!btn) {
+      if (!show) return;
+      var start = el('btn-start');
+      if (!start || !start.parentNode) return;
+      try {
+        btn = document.createElement('button');
+        btn.id = 'btn-start-anyway';
+        btn.type = 'button';
+        btn.className = 'btn btn--secondary';
+        btn.textContent = 'Открыть страницу теста без экзаменационного режима';
+        var self = this;
+        btn.addEventListener('click', function () {
+          self._overrideStartGate();
+        });
+        // Перед «Начать тест»: главное действие остаётся последним в строке.
+        start.parentNode.insertBefore(btn, start);
+      } catch (e) { return; }
+    }
+    btn.hidden = !show;
+    if (!show) return;
+
+    var names = [];
+    var i;
+    for (i = 0; i < (failed || []).length; i++) names.push(failed[i].def.title);
+    for (i = 0; i < (pending || []).length; i++) names.push(pending[i].def.title);
+    this._overrideNames = names;
+    btn.setAttribute('title',
+      'Запуск уже помечен как непригодный для настоящего экзамена. '
+      + 'Незакрытые пункты (' + names.join(', ') + ') останутся незакрытыми '
+      + 'и будут названы в отчёте.');
+  };
+
+  /** Обход шлюза: фиксируем, чем именно он был обойдён, и только потом идём. */
+  App.prototype._overrideStartGate = function () {
+    var names = this._overrideNames || [];
+    this.preflightOverride = {
+      at: Date.now(),
+      checks: names.slice(),
+      launchWarning: this.launchWarning || ''
+    };
+    this.hud.alert({
+      tone: 'var(--sev-warn)',
+      title: 'Предполётная проверка обойдена',
+      text: 'Запуск непригоден для настоящего экзамена, незакрытые пункты: '
+        + (names.length ? names.join(', ') : '—')
+        + '. Это прогон интерфейса, и так написано в отчёте.',
+      code: 'SHL_010',
+      rank: 2            // medium: сообщение не должно быть заглушено потоком info
+    });
+    this._beginSession();
   };
 
   /** Строка причины блокировки — рядом с кнопкой старта. Создаётся при нужде. */
@@ -1789,17 +2068,66 @@
     var self = this;
     var next = el('btn-calib-next');
     if (next) {
-      next.addEventListener('click', function () {
-        self.show('exam');
-        self.exam.start(self.meta ? self.meta.exam_id : 'Экзамен');
-      });
+      next.addEventListener('click', function () { self._startExam(); });
     }
+  };
+
+  /**
+   * Начать тест. Два случая, и различает их профиль экзамена, а не настройка.
+   *
+   * Профиль задаёт адрес (p.url, не локальный) — тест идёт на странице учебной
+   * системы, её открывает оболочка нативным слоем поверх нашей вёрстки. Своего
+   * листа вопросов в этом случае быть не должно: он оказался бы ПОД чужой
+   * страницей вместе с таймером и кнопками, а в отчёт уехало бы «отвечено 0 из
+   * 6». Профиля с адресом нет — работает локальный мок-тест, как раньше.
+   */
+  App.prototype._startExam = function () {
+    var p = this._profile();
+    var external = Boolean(p && p.present && p.url && !p.local);
+    this.externalExam = external;
+    this.show('exam');
+    if (external) {
+      this.exam.startExternal(p.host || p.url);
+    } else {
+      this.exam.start(this.meta ? this.meta.exam_id : 'Экзамен');
+    }
+    this._updateHudFinish();
+  };
+
+  /**
+   * Кнопка «Завершить тест» на панели наблюдения. Единственный выход из теста,
+   * который гарантированно не накрыт нативным слоем страницы LMS.
+   */
+  App.prototype._wireHudFinish = function () {
+    var self = this;
+    var btn = el('btn-hud-finish');
+    if (!btn) return;
+    btn.addEventListener('click', function () {
+      self.exam.finish('student');
+    });
+  };
+
+  /** Подвал панели: виден, пока тест идёт. */
+  App.prototype._updateHudFinish = function () {
+    var foot = el('hud-foot');
+    if (!foot) return;
+    var running = Boolean(this.exam && this.exam.running);
+    foot.hidden = !running;
+    var note = el('hud-footnote');
+    if (note) {
+      note.textContent = this.externalExam
+        ? 'Ответы останутся в учебной системе. Наблюдение прекратится, и откроется отчёт.'
+        : 'Наблюдение прекратится, и откроется отчёт.';
+    }
+    // Подвал появился или исчез — свободное место под страницу изменилось.
+    this._reportExamViewInset();
   };
 
   // --- отчёт ---
 
   App.prototype.onExamFinished = function (res) {
     this.examResult = res;
+    this._updateHudFinish();
     this.telemetry.detachAll();
     if (res && res.reason !== 'lock') this.bridge.sessionEnd(res.reason || 'student');
     if (this.locked) return;   // при блокировке отчёт откроется с экрана блокировки
@@ -1818,6 +2146,7 @@
     // Отметка о правилах — в шапке, рядом с вердиктом, и обновляется здесь же:
     // профиль мог дойти уже во время теста.
     this._renderReportRules(this._profile());
+    this._renderReportOverride();
 
     var score = Math.max(0, Math.min(100, sum.score || 0));
     var lv = this._levelOf(score);
@@ -1850,11 +2179,26 @@
       lock: 'Сессия закрыта системой: накопленный риск превысил порог блокировки.'
     };
     var lede = (this.examResult && reasonText[this.examResult.reason]) || 'Сессия завершена.';
-    lede += ' Отвечено ' + answered + ' из ' + total + ' вопросов. ' +
-            'Телеметрия набора: ' + tele.keystrokes + ' интервалов, средний ' +
-            (tele.mean_ms ? tele.mean_ms + ' мс' : '—') +
-            (tele.pastes ? ', вставок: ' + tele.pastes : '') + '. ' +
-            'Итоговое решение принимает экзаменатор.';
+    /*
+     * Счёт ответов — только для локального теста. На стороннем тесте ответы
+     * остались в учебной системе: эта программа их не видит, и «отвечено 0 из
+     * 6» означало бы, что студент не ответил ни на один вопрос. Молчать об
+     * этом тоже нельзя — читающий отчёт обязан знать, где лежит работа.
+     */
+    var external = Boolean(this.examResult && this.examResult.external);
+    if (external) {
+      var host = (this.examResult && this.examResult.external_host) || '';
+      lede += ' Тест проходил на странице учебной системы'
+            + (host ? ' (' + host + ')' : '')
+            + ': ответы остались там и в этот отчёт не попадают — здесь только'
+            + ' наблюдение за сеансом. ';
+    } else {
+      lede += ' Отвечено ' + answered + ' из ' + total + ' вопросов. ' +
+              'Телеметрия набора: ' + tele.keystrokes + ' интервалов, средний ' +
+              (tele.mean_ms ? tele.mean_ms + ' мс' : '—') +
+              (tele.pastes ? ', вставок: ' + tele.pastes : '') + '. ';
+    }
+    lede += 'Итоговое решение принимает экзаменатор.';
     setText('report-lede', lede);
 
     this._renderBreakdown(sum.breakdown, sum.events);

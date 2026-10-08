@@ -1617,6 +1617,32 @@ code {
 }
 .exam__footspacer { flex: 1; font-size: var(--fs-small); color: var(--text-muted); }
 
+/* ---------------------- тест на СТОРОННЕЙ странице (LMS) -------------------
+   Нативный слой с чужой страницей накрывает этот экран целиком, поэтому своих
+   органов управления у него здесь быть не должно: таймер на 20 минут,
+   палитра вопросов и строка «Назад/Далее/Завершить» в этом режиме лежат под
+   чужой страницей и не принимают ни клика, ни ввода (замер живого прохода:
+   доля под слоем 1.00 у каждой из них). Нажимаемое действие одно — «Завершить
+   тест» на панели наблюдения, она вне прямоугольника представления.
+   Остаётся спокойная страница-заглушка: её видно в момент, когда
+   представление снимается (пауза, потеря фокуса, конец теста). */
+.exam--external .exam__timer,
+.exam--external .exam__navwrap,
+.exam--external .exam__foot { display: none; }
+.exam--external .exam__bar { grid-template-columns: minmax(0, 1fr); }
+.exam__external {
+  max-width: 64ch;
+  margin: 0 auto;
+  padding: var(--space-12) var(--space-8);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  color: var(--text-primary);
+}
+.exam__external p { margin: 0; }
+
 /* ===========================================================================
    7. ЭКРАН 5 — ОТЧЁТ (светлая среда анализа)
    =========================================================================== */
@@ -1847,12 +1873,22 @@ code {
 .hud.is-collapsed .hud__chev { transform: rotate(45deg); }
 .hud.is-collapsed .hud__body { display: none; }
 
+/* min-height:0 здесь обязателен, а не косметика. .hud — флекс-колонка с
+   max-height и overflow:hidden; у флекс-элемента min-height по умолчанию auto,
+   то есть «не меньше содержимого». Без этой строки .hud__body вырастал до
+   высоты содержимого, overflow-y:auto прокручивать было нечего (scrollHeight
+   == clientHeight), а всё, что не влезло в окно, обрезала уже .hud. На живом
+   запуске так пропала лента «Последние наблюдения»: #hud-feed лежал на y≈1039
+   при высоте окна 832, и доказательств своих переходов студент не видел. */
 .hud__body {
+  flex: 1 1 auto;
+  min-height: 0;
   padding: var(--space-4);
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
   overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .hud__risk { display: grid; grid-template-columns: var(--ring-size) minmax(0, 1fr); gap: var(--space-4); align-items: center; }
@@ -1863,6 +1899,25 @@ code {
 .hud__contrib .c__n { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hud__contrib .c__v { flex: none; font-family: var(--font-mono); font-variant-numeric: tabular-nums; color: var(--text-muted-on-dark); }
 .hud__fps { font-size: var(--fs-small); color: var(--text-muted-on-dark); font-variant-numeric: tabular-nums; }
+
+/* Подвал панели наблюдения: выход из теста. Вне прокручиваемого .hud__body —
+   единственное действие экзамена не должно уезжать из виду вместе с лентой. */
+.hud__foot {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-4);
+  border-top: 1px solid var(--border-hair-dark);
+}
+.hud__foot[hidden] { display: none !important; }
+.hud__foot .btn { width: 100%; justify-content: center; }
+.hud__footnote {
+  margin: 0;
+  font-size: var(--fs-small);
+  line-height: var(--lh-body);
+  color: var(--text-muted-on-dark);
+}
 
 .hud__section { display: flex; flex-direction: column; gap: var(--space-3); }
 .hud__sectitle {
@@ -1943,26 +1998,74 @@ code {
    10. ТОСТЫ И ОВЕРЛЕИ
    =========================================================================== */
 
-/* Контейнер неблокирующих сообщений. hud.js пишет сюда .alert--toast.
-   Правый нижний угол: не закрывает ни вопрос, ни HUD. */
+/* Плавающий контейнер неблокирующих сообщений для экранов БЕЗ панели
+ * наблюдения (согласие, предполётная, отчёт). hud.js пишет сюда .alert--toast;
+ * во время наблюдения он пишет в .hud__alerts внутри самой панели.
+ *
+ * ПОЧЕМУ ВВЕРХУ, А НЕ В УГЛУ. Любой угол окна занят делом: в правом нижнем
+ * стоит главное действие каждого экрана (.actions--sticky выравнивает вправо),
+ * в левом нижнем — галочка согласия. На живом запуске 08.10 карточка с
+ * сообщением о режиме запуска стояла в правом нижнем и физически накрывала
+ * «Согласен, продолжить» и «Начать тест»: elementFromPoint в центре кнопки
+ * возвращал <p> внутри .alert--toast, настоящий клик экран не менял. Это и
+ * есть дословная жалоба заказчика — «я там никуда нажимать не могу», — причём
+ * первые десять секунд КАЖДОГО запуска через scripts/run-safe.command.
+ * Перенос в левый нижний угол ровно это же сделал с галочкой согласия
+ * (проверено живым кликом). Свободна от органов управления в окне ровно одна
+ * полоса — верхняя панель: в ней только вордмарк, шаги и состояние связи, ни
+ * одной кнопки и ни одного поля, и она не уезжает при прокрутке.
+ */
 .toasts,
 .alerts {
   position: fixed;
+  top: var(--space-2);
   right: var(--space-6);
-  bottom: var(--space-6);
   z-index: 60;
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
   width: min(calc(var(--space-22) * 5), calc(100vw - var(--space-12)));
+  /*
+   * Второй эшелон той же защиты, уже не зависящий от выбора места. Ни
+   * контейнер, ни карточка указателя не принимают: клик проходит СКВОЗЬ
+   * сообщение к тому, что под ним. Принимает только кнопка «✕» (правило
+   * ниже) — её площадь 44x44, и она стоит в полосе верхней панели.
+   * Сообщение неблокирующее по замыслу; «неблокирующее» обязано означать
+   * и то, что оно не блокирует нажатия.
+   */
+  pointer-events: none;
 }
-/* При открытом HUD сообщение встаёт левее панели и выше нижней строки кнопок
-   экзамена: перекрывать «Далее» и «Завершить» оно не должно. */
-.app.has-hud ~ .toasts,
-.app.has-hud ~ .alerts {
-  right: calc(var(--hud-w) + var(--space-12));
-  bottom: calc(var(--space-22) + var(--space-4));
+.toasts > *,
+.alerts > * { pointer-events: none; }
+.toasts .alert__close,
+.alerts .alert__close { pointer-events: auto; }
+
+/*
+ * Сообщения ВНУТРИ панели наблюдения: калибровка и экзамен.
+ *
+ * Во время экзамена страница теста живёт в нативном слое ПОВЕРХ вёрстки, и
+ * всё, что попало под его прямоугольник, не видно вообще — z-index на
+ * нативный слой не действует. Свободна только площадь панели, и сообщение
+ * стоит здесь в ПОТОКЕ: оно сдвигает содержимое панели вниз, а не накрывает
+ * его, поэтому ни «Завершить тест», ни риск-индикатор им не закрыть.
+ */
+.hud__alerts {
+  /* Сжимается, но не растёт: три длинных сообщения подряд (MAX_ALERTS = 3)
+     занимают до 640px и иначе выдавили бы из панели и риск-индикатор, и
+     кнопку выхода. Сверх предела — прокрутка, а не обрезка: сообщение,
+     которого не видно и не достать, доказательством не является. */
+  flex: 0 1 auto;
+  min-height: 0;
+  max-height: 42vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4) 0;
 }
+.hud__alerts:empty { display: none; }
+.hud__alerts .alert--toast { box-shadow: none; }
 /* На согласии внизу кнопка «Продолжить» — сообщение встаёт под шапку окна. */
 .app[data-screen="consent"] ~ .toasts {
   top: calc(var(--topbar-h) + var(--space-6));
@@ -2446,9 +2549,10 @@ code {
     max-height: 46vh;
   }
   .app.has-hud .screen { right: 0; bottom: calc(46vh + var(--space-4)); }
-  /* HUD занял низ экрана — сообщения поднимаются над ним */
-  .app.has-hud ~ .toasts,
-  .app.has-hud ~ .alerts { bottom: calc(46vh + var(--space-4)); }
+  /* Сообщения во время наблюдения лежат внутри панели (.hud__alerts), и на
+     узкой раскладке это тем более верно: над нижней полосой HUD начинается
+     прямоугольник представления, и плавающая карточка ушла бы под страницу
+     теста. Плавающий контейнер здесь остаётся только для экранов без панели. */
 }
 
 @media (max-width: 767.98px) {
@@ -2483,6 +2587,16 @@ code {
   .consent-bar { padding: var(--space-4); }
   .alert { grid-template-columns: var(--space-1) minmax(0, 1fr); }
   .alert__code { grid-column: 2; }
+
+  /* Полоса верхней панели на узком экране выше (шаги уехали во вторую
+     строку), и сообщение занимает её во всю ширину: иначе оно наезжает на
+     состояние связи и читается хуже, чем могло бы. */
+  .toasts,
+  .alerts {
+    left: var(--space-4);
+    right: var(--space-4);
+    width: auto;
+  }
 }
 
 @media (max-width: 320px) {
@@ -2552,4 +2666,43 @@ code {
   .chk__mark circle { opacity: 1; }
   .btn:disabled { opacity: 0.6; }
   .calib__video { opacity: 1; }
+}
+
+/* ------------------------------------------------------------------------
+   Решение проктора на оверлее паузы.
+   Блок скрыт и открывается сочетанием, которое знает проктор. Оформлен
+   намеренно сдержанно: это служебное действие ведущего экзамен, а не
+   ещё одна кнопка выхода для студента.
+   ------------------------------------------------------------------------ */
+.overlay__proctor {
+  margin-top: var(--space-6);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--border-hair-dark);
+  display: grid;
+  gap: var(--space-3);
+  text-align: left;
+}
+
+.overlay__field {
+  display: grid;
+  gap: var(--space-1);
+  font-size: var(--fs-small);
+  color: var(--text-muted-on-dark);
+}
+
+.overlay__field input {
+  min-height: var(--tap-min);
+  padding: 0 var(--space-3);
+  color: var(--text-on-dark);
+  background: var(--bg-monitor);
+  border: 1px solid var(--border-hair-dark);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-sans);
+  font-size: var(--fs-body);
+}
+
+.overlay__field input:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-offset);
+  border-color: var(--signal);
 }

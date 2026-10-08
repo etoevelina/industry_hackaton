@@ -429,9 +429,20 @@
     ':where(.event__body) b{font-weight:600;}',
     ':where(.event__time){white-space:nowrap;font-size:var(--fs-label,13px);}',
     // неблокирующие сообщения
-    ':where(.alerts){position:fixed;right:var(--space-6,24px);bottom:var(--space-6,24px);' +
+    // Полоса верхней панели, а не угол: во всех углах окна стоят органы
+    // управления (главная кнопка, галочка согласия), и карточка их накрывала —
+    // живой запуск 08.10. Указатель сообщение не принимает вовсе, кроме «✕»:
+    // неблокирующее сообщение не должно блокировать нажатия.
+    ':where(.alerts),:where(.toasts){position:fixed;top:var(--space-2,8px);' +
+      'right:var(--space-6,24px);' +
       'z-index:40;display:flex;flex-direction:column;gap:var(--space-3,12px);' +
-      'max-width:min(440px,calc(100vw - 48px));}',
+      'max-width:min(440px,calc(100vw - 48px));pointer-events:none;}',
+    ':where(.alerts)>*,:where(.toasts)>*{pointer-events:none;}',
+    ':where(.alerts) :where(.alert__close),:where(.toasts) :where(.alert__close)' +
+      '{pointer-events:auto;}',
+    ':where(.hud__alerts){flex:none;display:flex;flex-direction:column;' +
+      'gap:var(--space-2,8px);padding:var(--space-3,12px) var(--space-4,16px) 0;}',
+    ':where(.hud__alerts):empty{display:none;}',
     ':where(.alert--toast){display:grid;grid-template-columns:5px minmax(0,1fr) auto auto;' +
       'gap:var(--space-3,12px);align-items:start;padding:var(--space-4,16px);' +
       'border:1px solid var(--border-hair-dark);border-radius:var(--radius-sm,8px);' +
@@ -1599,6 +1610,25 @@
       box.setAttribute('aria-live', 'polite');
     }
     this.dom.alerts = box;
+    // Контейнер внутри самой панели: пока панель на экране, сообщения идут
+    // туда (см. _alertHost). Может отсутствовать в старой разметке — тогда
+    // всё работает по-прежнему, через плавающий контейнер.
+    this.dom.hudAlerts = el('hud-alerts') || null;
+  };
+
+  /**
+   * Куда положить сообщение.
+   *
+   * Панель наблюдения на экране — внутрь панели: во время экзамена это
+   * единственная площадь окна, не накрытая нативным слоем страницы теста, и
+   * там сообщение стоит в потоке, то есть не закрывает ни одной кнопки.
+   * Панели нет (согласие, предполётная, отчёт) — плавающий контейнер.
+   */
+  Hud.prototype._alertHost = function () {
+    var panel = this.dom.hudAlerts;
+    var hud = this.dom.root || el('hud');
+    if (panel && hud && !hud.hidden) return panel;
+    return this.dom.alerts;
   };
 
   /**
@@ -1649,6 +1679,34 @@
             'Продолжить можно, когда наблюдение вернётся в норму.</p>' +
           '<button class="btn btn--primary btn--lg" id="btn-resume" type="button" disabled>Продолжить тест</button>' +
           '<p class="overlay__wait" id="pause-wait">Ожидание нормализации…</p>' +
+          /*
+           * Решение проктора. Приостановку с review_required снимает только
+           * человек — так и задумано. Но до 08.10 вызвать это решение было
+           * НЕЧЕМ: путь proctorRelease в мосте есть и доходит до цепочки
+           * событием PROCTOR_DECISION, а показать его в интерфейсе забыли.
+           * В одиночном прогоне без проктора единственным выходом оставалось
+           * «Перейти к отчёту», то есть сдать работу — и это ровно то, на что
+           * пожаловалась владелец продукта.
+           *
+           * Блок скрыт и открывается сочетанием, которое знает проктор, а не
+           * студент. Имя обязательно: решение попадает в подписанную цепочку
+           * с указанием, КТО его принял, иначе оно ничего не значит.
+           */
+          '<div class="overlay__proctor" id="pause-proctor" hidden>' +
+            '<p class="overlay__note">Решение проктора. Снятие будет записано ' +
+              'в журнал с вашим именем и причиной.</p>' +
+            '<label class="overlay__field">Кто снимает' +
+              '<input type="text" id="pause-actor" autocomplete="off" ' +
+                'placeholder="фамилия и должность">' +
+            '</label>' +
+            '<label class="overlay__field">Причина' +
+              '<input type="text" id="pause-why" autocomplete="off" ' +
+                'placeholder="например: проверено лично, нарушения нет">' +
+            '</label>' +
+            '<button class="btn btn--secondary" id="btn-proctor-release" type="button">' +
+              'Снять приостановку</button>' +
+            '<p class="overlay__wait" id="pause-proctor-note"></p>' +
+          '</div>' +
         '</div>';
       document.body.appendChild(ov);
     }
@@ -1690,6 +1748,80 @@
     this.dom.pauseReview = review;
     this.dom.pauseNote = ov.querySelector('.overlay__note');
     this.dom.resumeBtn = el('btn-resume');
+    this.dom.proctorBox = el('pause-proctor');
+    this.dom.proctorActor = el('pause-actor');
+    this.dom.proctorWhy = el('pause-why');
+    this.dom.proctorBtn = el('btn-proctor-release');
+    this.dom.proctorNote = el('pause-proctor-note');
+    this._bindProctorRelease();
+  };
+
+  /**
+   * Сочетание проктора, открывающее блок решения на оверлее паузы.
+   *
+   * Почему сочетание, а не кнопка на виду: приостановку, которая ждёт решения
+   * человека, не должен снимать студент. Видимая кнопка превратила бы решение
+   * проктора в обычный выход из блокировки. Сочетание знает тот, кто ведёт
+   * экзамен, — ровно как с аварийным выходом Cmd+Alt+Shift+Q.
+   *
+   * Снятие уходит через api.proctorRelease и попадает в подписанную цепочку
+   * событием PROCTOR_DECISION с именем и причиной: решение без автора ничего
+   * не доказывает и разбору не помогает.
+   */
+  Hud.prototype._bindProctorRelease = function () {
+    var self = this;
+    if (!this._onProctorKey) {
+      this._onProctorKey = function (e) {
+        var combo = (e.metaKey || e.ctrlKey) && e.altKey && e.shiftKey &&
+                    String(e.key || '').toLowerCase() === 'r';
+        if (!combo) return;
+        if (!self.dom.pause || self.dom.pause.hidden) return;
+        if (!self.dom.proctorBox) return;
+        e.preventDefault();
+        self.dom.proctorBox.hidden = false;
+        try { self.dom.proctorActor.focus(); } catch (err) {}
+      };
+      document.addEventListener('keydown', this._onProctorKey, true);
+    }
+    if (this.dom.proctorBtn && !this._onProctorRelease) {
+      this._onProctorRelease = function () {
+        var actor = String((self.dom.proctorActor || {}).value || '').trim();
+        var why = String((self.dom.proctorWhy || {}).value || '').trim();
+        if (!actor) {
+          if (self.dom.proctorNote) {
+            self.dom.proctorNote.textContent =
+              'Укажите, кто снимает приостановку: решение записывается с именем.';
+          }
+          try { self.dom.proctorActor.focus(); } catch (err) {}
+          return;
+        }
+        if (self.dom.proctorNote) {
+          self.dom.proctorNote.textContent = 'Решение отправлено в журнал…';
+        }
+        var api = (typeof window !== 'undefined' && window.proctor) || null;
+        if (!api || typeof api.proctorRelease !== 'function') {
+          if (self.dom.proctorNote) {
+            self.dom.proctorNote.textContent =
+              'Ядро недоступно — решение не записано. Приостановка остаётся.';
+          }
+          return;
+        }
+        Promise.resolve(api.proctorRelease(actor, why || 'без указания причины'))
+          .then(function () {
+            if (self.dom.proctorNote) {
+              self.dom.proctorNote.textContent =
+                'Решение записано. Приостановка снимается по ответу ядра.';
+            }
+          })
+          .catch(function () {
+            if (self.dom.proctorNote) {
+              self.dom.proctorNote.textContent =
+                'Ядро не приняло решение. Приостановка остаётся.';
+            }
+          });
+      };
+      this.dom.proctorBtn.addEventListener('click', this._onProctorRelease);
+    }
   };
 
   /**
@@ -1818,8 +1950,34 @@
     if (this.dom.lockSession) this.dom.lockSession.textContent = this.sessionId;
   };
 
-  Hud.prototype.show = function () { if (this.dom.root) this.dom.root.hidden = false; };
-  Hud.prototype.hide = function () { if (this.dom.root) this.dom.root.hidden = true; };
+  Hud.prototype.show = function () {
+    if (this.dom.root) this.dom.root.hidden = false;
+    this._rehomeAlerts();
+  };
+  Hud.prototype.hide = function () {
+    if (this.dom.root) this.dom.root.hidden = true;
+    this._rehomeAlerts();
+  };
+
+  /**
+   * Переселить ЖИВЫЕ сообщения в контейнер, который сейчас подходит.
+   *
+   * Сообщение, поднятое за секунду до перехода на экзамен, осталось бы в
+   * плавающем контейнере — то есть частично под нативным слоем страницы
+   * теста, и студент дочитать бы его не смог. Срок жизни у сообщения свой
+   * (ALERT_MS), и обрывать его из-за смены экрана неправильно: оно про то,
+   * что уже случилось. Поэтому не гасим, а переносим.
+   */
+  Hud.prototype._rehomeAlerts = function () {
+    var host = this._alertHost();
+    if (!host) return;
+    for (var i = 0; i < this._alerts.length; i++) {
+      var node = this._alerts[i];
+      if (node && node.parentNode !== host) {
+        try { host.appendChild(node); } catch (e) { /* узел уже убран */ }
+      }
+    }
+  };
 
   /* --------------------------------------------- батчинг обновлений в rAF */
 
@@ -2376,7 +2534,8 @@
    * Не модалка, не отбирает фокус, закрывается само или кнопкой.
    */
   Hud.prototype.alert = function (spec) {
-    if (!this.dom.alerts || !spec) return null;
+    var host = this._alertHost();
+    if (!host || !spec) return null;
     var now = Date.now();
     var rank = typeof spec.rank === 'number' ? spec.rank : SEV_RANK.info;
     /*
@@ -2406,7 +2565,7 @@
     var btn = node.querySelector('.alert__close');
     if (btn) btn.addEventListener('click', close);
 
-    this.dom.alerts.appendChild(node);
+    host.appendChild(node);
     this._alerts.push(node);
     while (this._alerts.length > MAX_ALERTS) this._removeAlert(this._alerts[0]);
 

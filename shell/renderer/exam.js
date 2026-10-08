@@ -1,5 +1,5 @@
 /* ===========================================================================
- * exam.js — мок-тест на 6 вопросов: 3 с выбором варианта, 3 с развёрнутым
+ * exam.js — демо-тест на 6 простых вопросов: 4 с выбором варианта, 2 с развёрнутым
  * текстовым ответом. На развёрнутых ответах работает телеметрия набора
  * (telemetry.js) — именно она питает fusion-движок.
  *
@@ -27,7 +27,7 @@
 (function () {
   'use strict';
 
-  var TOTAL_SECONDS = 20 * 60;   // длительность мок-теста
+  var TOTAL_SECONDS = 10 * 60;   // длительность демо-теста
 
   var LOW_SECONDS = 300;         // «мало времени» — дублируется подписью
   var CRIT_SECONDS = 60;         // «меньше минуты»
@@ -38,61 +38,47 @@
       id: 'Q1',
       type: 'choice',
       difficulty: 1,
-      text: 'Какой показатель описывает долю времени, в течение которого оборудование реально выпускает годную продукцию на номинальной скорости?',
-      options: [
-        'MTBF — среднее время между отказами',
-        'OEE — общая эффективность оборудования',
-        'MTTR — среднее время восстановления',
-        'SPC — статистическое управление процессом'
-      ],
+      text: 'Какой город — столица Казахстана?',
+      options: ['Алматы', 'Астана', 'Шымкент', 'Костанай'],
       correct: 1
     },
     {
       id: 'Q2',
-      type: 'open',
-      difficulty: 2,
-      text: 'Датчик вибрации на конвейерном редукторе раз в сутки выдаёт короткий выброс амплитуды, но смена об этом не сообщает. Опишите, как вы отличите реальный зарождающийся дефект от помехи измерения, и какие данные для этого потребуются.',
-      placeholder: 'Ответ в свободной форме: 4–8 предложений…'
-    },
-    {
-      id: 'Q3',
       type: 'choice',
-      difficulty: 2,
-      text: 'Контроллер опрашивает 400 тегов с периодом 100 мс, канал связи до SCADA держит не более 1500 значений в секунду. Что корректнее сделать в первую очередь?',
-      options: [
-        'Увеличить период опроса всех тегов до 1 секунды',
-        'Передавать значения по изменению с зоной нечувствительности',
-        'Поставить второй контроллер и разделить теги пополам',
-        'Отключить часть тегов из передачи в SCADA'
-      ],
+      difficulty: 1,
+      text: 'Сколько будет 7 × 8?',
+      options: ['54', '56', '58', '64'],
       correct: 1
     },
     {
-      id: 'Q4',
+      id: 'Q3',
       type: 'open',
-      difficulty: 3,
-      text: 'Цех просит «предсказывать поломки насосов». Исторических отказов за два года — девять штук, разметка аварий ведётся вручную в журнале мастера. Сформулируйте, какую задачу вы на самом деле будете решать и как измерите пользу от решения.',
-      placeholder: 'Ответ в свободной форме: постановка задачи, данные, метрика…'
+      difficulty: 1,
+      text: 'Напишите два-три предложения о том, как прошло ваше сегодняшнее утро.',
+      placeholder: 'Ответ в свободной форме: 2–3 предложения…'
+    },
+    {
+      id: 'Q4',
+      type: 'choice',
+      difficulty: 1,
+      text: 'Какая планета ближе всего к Солнцу?',
+      options: ['Венера', 'Марс', 'Меркурий', 'Земля'],
+      correct: 2
     },
     {
       id: 'Q5',
       type: 'choice',
-      difficulty: 3,
-      text: 'Модель предсказания брака на обучении даёт ROC-AUC 0.94, на проде — около 0.62. Доля брака в выборке 1.5 %. Что наиболее вероятно?',
-      options: [
-        'Модель недоучена, нужно больше эпох',
-        'В обучающие признаки попали данные, недоступные в момент предсказания',
-        'ROC-AUC не применим к бинарной классификации',
-        'Нужно просто понизить порог отсечения'
-      ],
+      difficulty: 1,
+      text: 'В каком городе проходит Qostanai Industry Hackathon?',
+      options: ['Астана', 'Костанай', 'Караганда', 'Павлодар'],
       correct: 1
     },
     {
       id: 'Q6',
       type: 'open',
-      difficulty: 3,
-      text: 'Вы внедряете систему контроля качества на основе машинного зрения. Опишите, как организуете разбор ложных срабатываний, чтобы операторы не начали игнорировать систему через месяц работы.',
-      placeholder: 'Ответ в свободной форме: процесс, роли, обратная связь…'
+      difficulty: 2,
+      text: 'Зачем, по-вашему, на экзамене нужен прокторинг и чем он может мешать честному студенту? Два-три предложения.',
+      placeholder: 'Ответ в свободной форме: 2–3 предложения…'
     }
   ];
 
@@ -217,6 +203,10 @@
     this.telemetry = null;
     this.onFinish = null;
     this.onQuestionShown = null;
+    // Тест идёт на СТОРОННЕЙ странице (LMS из профиля экзамена), а не здесь.
+    this.external = false;
+    this.externalHost = '';
+    this.onIdleFinish = null;
   }
 
   Exam.prototype.init = function (opts) {
@@ -225,6 +215,7 @@
     this.telemetry = opts.telemetry || (window.Proctor && window.Proctor.telemetry) || null;
     this.onFinish = opts.onFinish || null;
     this.onQuestionShown = opts.onQuestionShown || null;
+    this.onIdleFinish = opts.onIdleFinish || null;
 
     installFallbackStyles();
 
@@ -268,8 +259,68 @@
 
   Exam.prototype.questionCount = function () { return QUESTIONS.length; };
 
+  /**
+   * Запуск экзамена на СТОРОННЕЙ странице: тест открыт в BrowserView (LMS из
+   * профиля), локального листа вопросов нет.
+   *
+   * ПОЧЕМУ ОТДЕЛЬНЫЙ РЕЖИМ, А НЕ «просто не смотреть на мок-тест». Нативный
+   * слой страницы LMS лежит ПОВЕРХ нашей вёрстки и накрывает #screen-exam
+   * целиком: палитра вопросов, таймер, «Назад/Далее/Завершить» оказываются под
+   * чужой страницей — замер живого прохода 08.10 дал долю под слоем 1.00 для
+   * каждой из этих кнопок. То есть локальный тест в этом режиме не просто
+   * лишний: он неработающий, а его таймер на 20 минут и счёт «отвечено 0 из 6»
+   * попадали в отчёт, где означали бы, что студент ничего не ответил.
+   *
+   * Поэтому: вопросов нет, таймера нет, экран оболочки под страницей пуст, а
+   * единственное действие — «Завершить» — живёт в HUD, вне прямоугольника
+   * представления (его ставит app.js).
+   */
+  Exam.prototype.startExternal = function (host) {
+    this.external = true;
+    this.externalHost = String(host || '');
+    this.index = 0;
+    this.answers = {};
+    this.visited = {};
+    this.submitted = {};
+    this.remaining = 0;
+    this.paused = false;
+    this.running = true;
+    this.startedAt = Date.now();
+    this.pausedMs = 0;
+    if (this._timer) { clearInterval(this._timer); this._timer = null; }
+    if (this.dom.screen) this.dom.screen.classList.add('exam--external');
+    this._renderExternalPlaceholder();
+  };
+
+  /**
+   * Что стоит на экране оболочки под страницей LMS. Человек этого не увидит,
+   * пока представление прикреплено, — но увидит в ту секунду, когда оно
+   * снимается (пауза, потеря фокуса, конец экзамена), и пустой белый лист там
+   * читался бы как сломанный экран.
+   */
+  Exam.prototype._renderExternalPlaceholder = function () {
+    if (this.dom.name) this.dom.name.textContent = 'Тест открыт на странице учебной системы';
+    if (this.dom.pos) this.dom.pos.textContent = this.externalHost || 'страница экзамена';
+    if (this.dom.palette) this.dom.palette.innerHTML = '';
+    if (this.dom.legend) this.dom.legend.innerHTML = '';
+    if (this.dom.saveState) this.dom.saveState.textContent = '';
+    if (this.dom.body) {
+      this.dom.body.innerHTML =
+        '<div class="exam__external">' +
+          '<p>Тест идёт на странице <b>' + esc(this.externalHost || 'учебной системы') +
+          '</b>. Она открыта поверх этого экрана.</p>' +
+          '<p>Ответы остаются в учебной системе: эта программа их не видит и ' +
+          'не сохраняет. Завершить наблюдение можно кнопкой «Завершить тест» ' +
+          'на панели наблюдения справа.</p>' +
+        '</div>';
+    }
+  };
+
   /** Запуск экзамена: отрисовать первый вопрос и пустить таймер. */
   Exam.prototype.start = function (examTitle) {
+    this.external = false;
+    this.externalHost = '';
+    if (this.dom.screen) this.dom.screen.classList.remove('exam--external');
     this.index = 0;
     this.answers = {};
     this.visited = {};
@@ -410,6 +461,8 @@
 
   Exam.prototype.go = function (nextIndex) {
     if (!this.running) return;
+    // Локальных вопросов в стороннем тесте нет — навигации тоже.
+    if (this.external) return;
     // На паузе вопрос не меняется. Без этой проверки навигация работала прямо
     // поверх оверлея: `_leaveCurrent()` отправлял answer_submit, а счётчик
     // времени стоял — то есть билет можно было пройти целиком на остановленных
@@ -816,14 +869,27 @@
 
   /** Завершение: 'student' | 'timeout' | 'lock'. */
   Exam.prototype.finish = function (reason) {
-    if (!this.running) return;
-    var q = QUESTIONS[this.index];
-    if (q) { this._captureAnswer(q); this._submitAnswer(q); }
+    /*
+     * Тест не запущен. Раньше здесь стоял молчаливый return, и это давало
+     * кнопку «Завершить», которая не делает НИЧЕГО: ни перехода, ни сообщения,
+     * ни записи в журнал. Попасть в это состояние просто — экран экзамена
+     * показан в обход _beginSession() (на живом проходе 08.10 так вышло дважды).
+     * Молчащая кнопка — это та же жалоба «нажимаю, ничего не происходит»,
+     * поэтому о пустом нажатии теперь сообщаем зовущему.
+     */
+    if (!this.running) {
+      if (this.onIdleFinish) { try { this.onIdleFinish(reason || 'student'); } catch (e) {} }
+      return null;
+    }
+    if (!this.external) {
+      var q = QUESTIONS[this.index];
+      if (q) { this._captureAnswer(q); this._submitAnswer(q); }
 
-    // добираем всё, что было отвечено, но не зафиксировано (на всякий случай)
-    for (var i = 0; i < QUESTIONS.length; i++) {
-      var qq = QUESTIONS[i];
-      if (!this.submitted[qq.id] && this.answers[qq.id]) this._submitAnswer(qq);
+      // добираем всё, что было отвечено, но не зафиксировано (на всякий случай)
+      for (var i = 0; i < QUESTIONS.length; i++) {
+        var qq = QUESTIONS[i];
+        if (!this.submitted[qq.id] && this.answers[qq.id]) this._submitAnswer(qq);
+      }
     }
 
     this.running = false;
@@ -831,19 +897,42 @@
     if (this._timer) { clearInterval(this._timer); this._timer = null; }
     if (this.telemetry) this.telemetry.detachAll();
 
-    var answered = this.answeredCount();
-    this._syncPalette();
+    var answered = this.external ? 0 : this.answeredCount();
+    if (!this.external) this._syncPalette();
 
     var res = {
       reason: reason || 'student',
+      // На стороннем тесте ответов у нас НЕТ, и «0 из 6» здесь было бы ложью:
+      // ноль означал бы, что студент не ответил ни на что. Поэтому счёт
+      // отсутствует (total 0), а отчёт говорит об этом словами.
+      external: this.external === true,
+      external_host: this.externalHost || '',
       answered: answered,
-      total: QUESTIONS.length,
+      total: this.external ? 0 : QUESTIONS.length,
       elapsed_ms: Date.now() - this.startedAt - this.pausedMs,
       paused_ms: this.pausedMs,
-      remaining_s: Math.round(this.remaining)
+      remaining_s: this.external ? null : Math.round(this.remaining)
     };
     if (this.onFinish) { try { this.onFinish(res); } catch (e) {} }
     return res;
+  };
+
+  /**
+   * Остановить тест БЕЗ отчёта и без onFinish.
+   *
+   * Нужен ровно для одного случая: оболочка отвергла переход в состояние
+   * экзамена, то есть наблюдения нет и теста нет. Это не «завершённый тест»
+   * (отчёт о нём означал бы, что он был), а несостоявшийся — поэтому отдельный
+   * метод, а не finish().
+   */
+  Exam.prototype.abort = function () {
+    this.running = false;
+    this.paused = true;
+    if (this._timer) { clearInterval(this._timer); this._timer = null; }
+    if (this.telemetry) this.telemetry.detachAll();
+    this.external = false;
+    this.externalHost = '';
+    if (this.dom.screen) this.dom.screen.classList.remove('exam--external');
   };
 
   Exam.prototype.questions = function () { return QUESTIONS; };
