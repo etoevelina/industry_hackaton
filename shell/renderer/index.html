@@ -115,10 +115,14 @@
         <div class="screen__head">
           <p class="eyebrow"><span class="eyebrow__mark" aria-hidden="true"></span><span class="wordmark">CONSENT</span></p>
           <h1 class="consent__title">Согласие на прокторинг</h1>
+          <!-- Видимый текст обязан сам называть, ЧТО проверяется: полный перечень
+               свёрнут, и согласие можно дать, не раскрывая его. Отказ — через
+               экзаменатора: kiosk-окно студент закрыть не может. -->
           <p class="lede">
-            Камера и окно теста проверяются автоматически, всё считается на этом компьютере —
-            в сеть ничего не уходит. Решение по итогам принимает экзаменатор, а не система.
-            Не согласны — закройте окно: сессия не начнётся.
+            Проверяются лицо и взгляд, телефон и посторонние предметы, окно теста и запущенные
+            программы, при удалённой сдаче — микрофон. Всё считается на этом компьютере, в сеть
+            ничего не уходит. При высоком риске тест приостанавливается до решения экзаменатора.
+            Не согласны — скажите экзаменатору: сессия не начнётся.
           </p>
         </div>
 
@@ -144,7 +148,7 @@
           <section class="consent-sum__col" data-mode="no" aria-labelledby="sum-no">
             <h2 class="consent-sum__title" id="sum-no">Не записывается</h2>
             <ul class="consent-sum__list">
-              <li>Видео целиком — камера разбирается в памяти</li>
+              <li>Видео целиком — кадры разбираются в памяти</li>
               <li>Звук и речь</li>
               <li>Текст ответа, нажатые клавиши, буфер обмена</li>
               <li>Экран и другие окна</li>
@@ -176,9 +180,9 @@
           <label class="checkbox">
             <input type="checkbox" id="consent-check" />
             <span class="checkbox__box" aria-hidden="true"></span>
-            <span class="checkbox__text">Согласен на наблюдение в указанном объёме</span>
+            <span class="checkbox__text">С перечнем ознакомлен(а), даю согласие на наблюдение</span>
           </label>
-          <button class="btn btn--primary btn--lg" id="btn-consent" type="button" disabled>Согласен, продолжить</button>
+          <button class="btn btn--primary btn--lg" id="btn-consent" type="button" disabled>Продолжить</button>
         </div>
       </div>
     </section>

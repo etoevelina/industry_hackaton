@@ -437,7 +437,10 @@ class ObjectDetector:
             self._backend_info = msg
             return False
         try:
-            os.environ.setdefault("YOLO_OFFLINE", "1")  # без проверок обновлений
+            # ultralytics считает себя офлайн ТОЛЬКО при YOLO_OFFLINE == "true"
+            # (utils.is_online). С "1" при импорте шли DNS-запросы и включалась
+            # аналитика — это нарушало обещание «в сеть ничего не уходит».
+            os.environ["YOLO_OFFLINE"] = "True"
             from ultralytics import YOLO  # ленивый импорт тяжёлой зависимости
 
             self._yolo = YOLO(str(weights))
