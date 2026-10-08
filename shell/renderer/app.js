@@ -269,7 +269,12 @@
 
   var DELIVERY_STAYS = 'пакет останется на этом компьютере';
 
-  /** {configured, dir, source, writable, reason} из hello/status; иначе null. */
+  /**
+   * {configured, dir, source, writable, reason, created, package_on_end,
+   * same_dir, provisional} из hello/status/состояния оболочки; иначе null.
+   * provisional — запись самой оболочки по её флагу или переменной до hello
+   * ядра (main.js, provisionalDelivery): папка задана, но ядром не проверена.
+   */
   function normDelivery(raw) {
     if (!raw || typeof raw !== 'object') return null;
     return {
@@ -277,11 +282,19 @@
       dir: typeof raw.dir === 'string' ? raw.dir.trim() : '',
       source: typeof raw.source === 'string' ? raw.source : '',
       writable: raw.writable === true,
-      reason: typeof raw.reason === 'string' ? raw.reason.trim() : ''
+      reason: typeof raw.reason === 'string' ? raw.reason.trim() : '',
+      created: raw.created === true,
+      // нет поля — ядро старше --no-package в delivery: пакет собирается
+      package_on_end: raw.package_on_end !== false,
+      same_dir: raw.same_dir === true,
+      provisional: raw.provisional === true
     };
   }
 
-  /** Итог deliver_package: {ok, dest, bytes, sha256, verified, at, error}; иначе null. */
+  /**
+   * Итог deliver_package: {ok, dest, bytes, sha256, verified, at, error, note,
+   * same_dir, skipped, timed_out}; иначе null.
+   */
   function normDeliveryResult(raw) {
     if (!raw || typeof raw !== 'object') return null;
     var at = Number(raw.at);
@@ -293,45 +306,158 @@
       sha256: typeof raw.sha256 === 'string' ? raw.sha256 : '',
       verified: raw.verified === true,
       at: isFinite(at) ? at : 0,
-      error: typeof raw.error === 'string' ? raw.error.trim() : ''
+      error: typeof raw.error === 'string' ? raw.error.trim() : '',
+      note: typeof raw.note === 'string' ? raw.note.trim() : '',
+      // пакет уже в папке проктора: каталог сессий задан туда же, копии не было
+      same_dir: raw.same_dir === true,
+      // 'already_delivered' — пересборка после удачной доставки: новый пакет
+      // остался здесь, ok/dest/verified — прежней доставки
+      skipped: typeof raw.skipped === 'string' ? raw.skipped : '',
+      // папка не ответила к сроку; копирование идёт дальше, итог придёт позже
+      timed_out: raw.timed_out === true
     };
   }
 
-  /** Задана ли папка: от этого зависят тексты согласия. */
+  /** Задана ли папка. */
   function deliveryOn(d) { return Boolean(d && d.configured); }
 
   /**
-   * Фраза о сети в шапке согласия. Длина варианта с папкой подобрана под
-   * экран без прокрутки от 1024×728: путь к папке сюда не входит, он — в
-   * полном перечне и в предполётной проверке.
+   * Уходит ли пакет копией после экзамена: папка задана, пакет собирается
+   * (не --no-package) и не лежит в ней и так (same_dir).
    */
-  function consentNetText(d) {
-    if (!deliveryOn(d)) return 'Всё считается на этом компьютере, данные наблюдения в сеть не уходят.';
-    return 'Во время экзамена данные не покидают компьютер, после — подписанный пакет ' +
+  function deliveryCopies(d) { return deliveryOn(d) && d.package_on_end && !d.same_dir; }
+
+  /**
+   * Каталог сессий со слов ядра (`handover` из hello/status; копия — в
+   * состоянии оболочки): {dir, source, away}. away — сессия пишется в каталог,
+   * заданный явно (флаг, переменная, config.json) и не пониженный до запасного
+   * локального. Такой каталог бывает сетевой папкой вуза или флешкой проктора:
+   * тогда журнал сессии уходит с компьютера уже во время экзамена.
+   */
+  function normSessionsTarget(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    var eff = typeof raw.effective_dir === 'string' ? raw.effective_dir.trim() : '';
+    var req = typeof raw.requested_dir === 'string' ? raw.requested_dir.trim() : '';
+    var dir = eff || req;
+    var source = typeof raw.source === 'string' ? raw.source : '';
+    return {
+      dir: dir,
+      source: source,
+      away: Boolean(dir) && source !== '' && source !== 'default' && raw.degraded_handover !== true
+    };
+  }
+
+  function sessionsAway(s) { return Boolean(s && s.away); }
+
+  /** Предел длины пути в фразе о сети: с копией пакета фраза длиннее. */
+  function netPathMax(d) { return deliveryCopies(d) ? 32 : 64; }
+
+  /**
+   * Путь для шапки согласия. Экран обязан помещаться без прокрутки, а путь
+   * бывает любой длины: длинный сокращается в середине — остаются начало (том,
+   * сервер) и конец (сама папка), пропуск отмечен «…». Полный путь — в полном
+   * перечне данных и в подсказке над фразой.
+   */
+  function shortPath(p, max) {
+    p = String(p || '');
+    if (p.length <= max) return p;
+    var sep = p.indexOf('/') === -1 && p.indexOf('\\') !== -1 ? '\\' : '/';
+    var lead = (p.match(/^[\\/]+/) || [''])[0];
+    var parts = p.slice(lead.length).split(/[\\/]+/).filter(Boolean);
+    var head = lead + (parts.length ? parts[0] : '');
+    var tail = '';
+    for (var i = parts.length - 1; i >= 1; i--) {
+      var next = parts[i] + (tail ? sep + tail : '');
+      if ((head + sep + '…' + sep + next).length > max) break;
+      tail = next;
+    }
+    if (tail) return head + sep + '…' + sep + tail;
+    return '…' + p.slice(-(max - 1));
+  }
+
+  /**
+   * Фраза о сети в шапке согласия. Варианта четыре: всё на месте; пакет
+   * копируется после экзамена; каталог сессий задан явно (журнал пишется туда
+   * уже во время экзамена — путь назван); оба сразу. «Данные наблюдения», а не
+   * «данные»: страницу LMS окно теста грузит из сети. Длины подобраны под
+   * экран без прокрутки от 1024×728 (лид — не больше трёх строк): отсюда и
+   * сокращённый путь. `max` — предел длины пути (Infinity — полный путь, для
+   * подсказки); не задан — netPathMax(). Широкие буквы в пути всё равно могут
+   * дать лишнюю строку — тогда путь дожимает _fitConsent.
+   */
+  function consentNetText(d, s, max) {
+    var copies = deliveryCopies(d);
+    if (sessionsAway(s)) {
+      return 'Всё считается на этом компьютере, но журнал сессии во время экзамена пишется в ' +
+             shortPath(s.dir, max || netPathMax(d)) +
+             (copies ? ', после — пакет копируется в папку проктора.' : '.');
+    }
+    if (!copies) return 'Всё считается на этом компьютере, данные наблюдения в сеть не уходят.';
+    return 'Во время экзамена данные наблюдения не покидают компьютер, после — подписанный пакет ' +
            'копируется в папку проктора.';
   }
 
-  function disclosureLede(d) {
-    var head = 'Перечень полный: других данных система не собирает. ';
-    if (!deliveryOn(d)) return head + 'Всё вычисление идёт на этом компьютере, сеть не используется.';
-    return head + 'Всё вычисление идёт на этом компьютере. Во время экзамена данные его не ' +
-           'покидают; после экзамена подписанный пакет копируется в папку проктора.';
+  function disclosureLede(d, s) {
+    var head = 'Перечень полный: других данных система не собирает. Всё вычисление идёт на этом ' +
+               'компьютере';
+    var copies = deliveryCopies(d);
+    if (sessionsAway(s)) {
+      return head + '; журнал и доказательства сессии во время экзамена пишутся в каталог ' +
+             s.dir + (copies ? ', после экзамена подписанный пакет копируется в папку проктора' : '') + '.';
+    }
+    if (!copies) return head + ', данные наблюдения в сеть не уходят.';
+    return head + '. Во время экзамена данные наблюдения его не покидают; после экзамена ' +
+           'подписанный пакет копируется в папку проктора.';
   }
 
   /** Строка «Сетевые обращения» полного перечня. */
-  function networkDetail(d, fallback) {
-    if (!deliveryOn(d)) return fallback;
-    var where = d.dir ? ' (' + d.dir + ')' : '';
-    var text = 'Во время экзамена система ничего не отправляет: наблюдение и доказательства ' +
-               'остаются на этом компьютере, облака и внешней аналитики нет. После экзамена ' +
-               'подписанный пакет — отчёт, журнал, кадры и снимки окна теста — копируется в ' +
-               'папку проктора' + where + ': на USB-носитель или в сетевую папку вуза, тогда по ' +
-               'сети. Если правила экзамена открывают страницу LMS, с ней работает только окно теста.';
-    if (!d.writable) {
-      text += ' Сейчас папка недоступна' + (d.reason ? ' (' + d.reason + ')' : '') +
-              ' — если так и останется, ' + DELIVERY_STAYS + '.';
+  function networkDetail(d, s, fallback) {
+    var away = sessionsAway(s);
+    var copies = deliveryCopies(d);
+    var lms = ' Если правила экзамена открывают страницу LMS, с ней работает только окно теста.';
+    var text;
+    if (!away && !copies) {
+      text = fallback;
+    } else {
+      text = 'Облака и внешней аналитики нет, вычисление идёт на этом компьютере. ';
+      if (away) {
+        text += 'Журнал сессии и доказательства — кадры, клипы, снимки окна теста — уже во время ' +
+                'экзамена пишутся в каталог сессий ' + s.dir + ': если это сетевая папка, то по сети.';
+      } else {
+        text += 'Во время экзамена система ничего не отправляет: наблюдение и доказательства ' +
+                'остаются на этом компьютере.';
+      }
+      if (copies) {
+        text += ' После экзамена подписанный пакет — отчёт, журнал, кадры и снимки окна теста — ' +
+                'копируется в папку проктора' + (d.dir ? ' (' + d.dir + ')' : '') + ': на USB-носитель ' +
+                'или в сетевую папку вуза, тогда по сети.';
+      }
+      text += lms;
+    }
+    if (deliveryOn(d) && d.same_dir) {
+      text += ' Папка проктора' + (d.dir ? ' (' + d.dir + ')' : '') + ' совпадает с каталогом ' +
+              'сессий: пакет ложится туда сам, отдельной копии нет.';
+    } else if (deliveryOn(d) && !d.package_on_end) {
+      text += ' Папка проктора задана' + (d.dir ? ' (' + d.dir + ')' : '') + ', но пакет не ' +
+              'собирается (--no-package) — копировать туда нечего.';
+    } else if (copies && !d.writable) {
+      text += ' Сейчас папка ' + (d.provisional ? 'ещё не проверена' : 'недоступна' +
+              (d.reason ? ' (' + d.reason + ')' : '')) + ' — если так и останется, ' + DELIVERY_STAYS + '.';
     }
     return text;
+  }
+
+  /**
+   * Подпись режима строки «Сетевые обращения»: «не пишется» верно, только
+   * пока с компьютера ничего не уходит.
+   */
+  function networkMode(d, s) {
+    var away = sessionsAway(s);
+    var copies = deliveryCopies(d);
+    if (away && copies) return { mode: 'yes', text: 'журнал — в каталог сессий, после экзамена — копия пакета' };
+    if (away) return { mode: 'yes', text: 'журнал — в каталог сессий' };
+    if (copies) return { mode: 'yes', text: 'после экзамена — копия пакета' };
+    return null;
   }
 
   var MODE_TEXT = {
@@ -788,6 +914,10 @@
     this.deliveryNote = '';
     // Ядро сейчас копирует пакет (status.delivery.in_progress).
     this.deliveryInProgress = false;
+    // Каталог сессий со слов ядра (normSessionsTarget): задан явно — текст
+    // согласия называет его, журнал пишется туда уже во время экзамена.
+    this.sessionsTarget = null;
+    this._sessionsTargetSig = '';
   }
 
   /** Экранирование: своё, если hud.js не отдал общий помощник. */
@@ -1134,9 +1264,12 @@
       var caps = pickSidecarCaps(h);
       if (caps) self._applyCaps(caps);
       self._feedProfile(h);
-      // Папка проктора — с первого сообщения: экран согласия уже открыт, и
-      // его текст о сети зависит от неё.
-      if (h && typeof h === 'object') self._applyDelivery(h.delivery);
+      // Папка проктора и каталог сессий — с первого сообщения: экран согласия
+      // уже открыт, и его текст о сети зависит от них.
+      if (h && typeof h === 'object') {
+        self._applySessionsTarget(h.handover);
+        self._applyDelivery(h.delivery);
+      }
     });
     this.bridge.subscribe('onError', null, function (err) {
       if (!err || typeof err !== 'object') return;
@@ -1258,8 +1391,10 @@
       this._applySessionFiles(st.sessionReport);
       this._applyDeliveryResult(st.sessionReport.delivery);
     }
-    // Папка проктора: тот же `delivery`, что в hello/status, но из памяти
-    // оболочки — для renderer, загрузившегося позже рукопожатия.
+    // Папка проктора и каталог сессий: те же `delivery` и `handover`, что в
+    // hello/status, но из памяти оболочки — для renderer, загрузившегося позже
+    // рукопожатия; до hello там предварительная запись по флагам оболочки.
+    if (st.sessionsTarget) this._applySessionsTarget(st.sessionsTarget);
     if (st.delivery) this._applyDelivery(st.delivery);
     // Состояние защищённого режима приходит и отдельным событием, и здесь:
     // статус оболочки — страховка на случай, если renderer загрузился позже
@@ -1290,6 +1425,7 @@
     if (!st || typeof st !== 'object') return;
     this._setLink('up', 'ядро прокторинга на связи');
     this.hud.applyStatus(st);
+    this._applySessionsTarget(st.handover);
     this._applyDelivery(st.delivery);
     if (st.package && typeof st.package === 'object') this._applyDeliveryResult(st.package.delivery);
 
@@ -1482,19 +1618,34 @@
     if (!screen || !rules || screen.hidden || (more && more.open)) return;
     var keepTop = rules.scrollTop;
     rules.style.maxHeight = '';
+    // путь в фразе о сети — сначала с пределом по умолчанию
+    this._setConsentNet(0);
     // узкий экран: колонки стопкой, страница прокручивается штатно — правила не режем
     var sum = rules.parentNode;
     if (window.getComputedStyle(sum).gridTemplateColumns.split(' ').length < 2) return;
     var floor = 0;
     var cols = screen.querySelectorAll('.consent-sum__col');
     for (var i = 0; i < cols.length; i++) floor = Math.max(floor, contentHeight(cols[i]));
-    // второй проход добирает пиксель, потерянный на округлении дробных высот
-    for (var pass = 0; pass < 2; pass++) {
-      var over = screen.scrollHeight - screen.clientHeight;
-      if (over <= 0) break;
-      var cap = Math.max(Math.floor(rules.getBoundingClientRect().height) - over, floor);
-      if (rules.style.maxHeight === cap + 'px') break;
-      rules.style.maxHeight = cap + 'px';
+    var overNow = function () { return screen.scrollHeight - screen.clientHeight; };
+    var capRules = function () {
+      // второй проход добирает пиксель, потерянный на округлении дробных высот
+      for (var pass = 0; pass < 2; pass++) {
+        var over = overNow();
+        if (over <= 0) break;
+        var cap = Math.max(Math.floor(rules.getBoundingClientRect().height) - over, floor);
+        if (rules.style.maxHeight === cap + 'px') break;
+        rules.style.maxHeight = cap + 'px';
+      }
+    };
+    capRules();
+    // Колонки уже на полу, а шапка с длинным путём (широкие буквы) выросла на
+    // строку — дожать путь в фразе о сети; полный остаётся в подсказке и перечне.
+    if (overNow() > 0 && sessionsAway(this.sessionsTarget)) {
+      for (var max = netPathMax(this.delivery) - 4; max >= 12 && overNow() > 0; max -= 4) {
+        this._setConsentNet(max);
+      }
+      rules.style.maxHeight = '';
+      capRules();
     }
     // снятие потолка сбросило прокрутку колонки — вернуть, где читал человек
     rules.scrollTop = keepTop;
@@ -1560,13 +1711,18 @@
     var host = this._disclosureHost();
     if (!host) return;
     var rows = '';
+    // каталог сессий задан явно — «локально» про него уже не обещаем
+    var away = sessionsAway(this.sessionsTarget);
     for (var i = 0; i < DISCLOSURE.length; i++) {
       var r = DISCLOSURE[i];
-      var detail = r.id === 'network' ? networkDetail(this.delivery, r.detail) : r.detail;
-      rows += '<tr data-mode="' + r.mode + '"' + (r.id ? ' data-row="' + r.id + '"' : '') + '>' +
+      var detail = r.id === 'network' ? networkDetail(this.delivery, this.sessionsTarget, r.detail) : r.detail;
+      var net = r.id === 'network' ? networkMode(this.delivery, this.sessionsTarget) : null;
+      var mode = net ? net.mode : r.mode;
+      var modeText = net ? net.text : (mode === 'yes' && away ? 'пишется в каталог сессий' : MODE_TEXT[mode]);
+      rows += '<tr data-mode="' + mode + '"' + (r.id ? ' data-row="' + r.id + '"' : '') + '>' +
                 '<th scope="row">' + this._esc(r.signal) + '</th>' +
-                '<td><span class="disclose__mode" data-mode="' + r.mode + '">' +
-                  modeSvg(r.mode) + '<span>' + this._esc(MODE_TEXT[r.mode]) + '</span>' +
+                '<td><span class="disclose__mode" data-mode="' + mode + '">' +
+                  modeSvg(mode) + '<span>' + this._esc(modeText) + '</span>' +
                 '</span></td>' +
                 '<td class="disclose__detail">' + this._esc(detail) + '</td>' +
               '</tr>';
@@ -1574,7 +1730,7 @@
     host.innerHTML =
       '<div class="disclose__head">' +
         '<h2 class="card__title" id="disclose-title">Что пишется и что не пишется</h2>' +
-        '<p class="disclose__lede muted">' + this._esc(disclosureLede(this.delivery)) + '</p>' +
+        '<p class="disclose__lede muted">' + this._esc(disclosureLede(this.delivery, this.sessionsTarget)) + '</p>' +
       '</div>' +
       '<div class="table-wrap">' +
         // .data-table из гайда описана для тёмной поверхности; экран согласия
@@ -1594,9 +1750,47 @@
 
   // --- папка проктора: согласие, предполётная проверка, финальный экран ---
 
-  /** Фраза о сети в шапке согласия — по тому, что ядро сообщило о папке. */
+  /**
+   * Фраза о сети в шапке согласия и заголовок колонки «Сохраняется…» — по
+   * тому, что ядро сообщило о папке проктора и каталоге сессий. Шапка могла
+   * вырасти или сжаться на строку — тогда пересчитать потолок колонки правил.
+   */
   App.prototype._renderConsentNetwork = function () {
-    setText('consent-net', consentNetText(this.delivery));
+    var changed = this._setConsentNet(0);
+    setText('sum-yes', sessionsAway(this.sessionsTarget)
+      ? 'Сохраняется в каталоге сессий' : 'Сохраняется на этом компьютере');
+    if (changed && this.screen === 'consent' && this._scheduleConsentFit) this._scheduleConsentFit();
+  };
+
+  /**
+   * Фраза о сети с путём не длиннее `max` (0 — предел по умолчанию). Путь
+   * сокращён — полный в подсказке (и в полном перечне). true — текст изменился.
+   */
+  App.prototype._setConsentNet = function (max) {
+    var node = el('consent-net');
+    if (!node) return false;
+    var text = consentNetText(this.delivery, this.sessionsTarget, max);
+    var full = consentNetText(this.delivery, this.sessionsTarget, Infinity);
+    var changed = node.textContent !== text;
+    if (changed) node.textContent = text;
+    node.title = full !== text ? full : '';
+    return changed;
+  };
+
+  /**
+   * `handover` из hello / status / состояния оболочки: куда пишется сессия.
+   * Перерисовка — только по изменению, как у папки проктора.
+   */
+  App.prototype._applySessionsTarget = function (raw) {
+    var s = normSessionsTarget(raw);
+    if (!s) return;
+    var sig;
+    try { sig = JSON.stringify(s); } catch (e) { return; }
+    if (sig === this._sessionsTargetSig) return;
+    this._sessionsTargetSig = sig;
+    this.sessionsTarget = s;
+    this._renderConsentNetwork();
+    this._renderDisclosure();
   };
 
   /**
@@ -1617,13 +1811,11 @@
     var sig;
     try { sig = JSON.stringify(d); } catch (e) { return; }
     if (sig === this._deliverySig) return;
-    var onChanged = deliveryOn(d) !== deliveryOn(this.delivery);
     this._deliverySig = sig;
     this.delivery = d;
+    // фраза о сети сама пересчитает потолок колонки правил, если шапка изменилась
     this._renderConsentNetwork();
     this._renderDisclosure();
-    // шапка согласия могла вырасти на строку — пересчитать потолок колонки правил
-    if (onChanged && this.screen === 'consent' && this._scheduleConsentFit) this._scheduleConsentFit();
     this._renderChecks();
     if (this.screen === 'report') this._renderReportFiles();
   };
@@ -1659,17 +1851,38 @@
    */
   App.prototype._deliveryCheck = function () {
     var d = this.delivery;
+    var waited = this.demoMode || (this.bridge.sawAny && this.envGraceStartedAt &&
+      Date.now() - this.envGraceStartedAt >= ENV_GRACE_MS);
     if (!d) {
-      var waited = this.demoMode || (this.bridge.sawAny && this.envGraceStartedAt &&
-        Date.now() - this.envGraceStartedAt >= ENV_GRACE_MS);
       return waited
         ? { state: 'warn', word: 'внимание', note: 'ядро не сообщило о папке проктора — ' + DELIVERY_STAYS }
         : { state: 'pending', word: STATE_TEXT.pending, note: '' };
     }
     if (!d.configured) return { state: 'warn', word: 'внимание', note: 'не задана — ' + DELIVERY_STAYS };
+    // папка задана флагом оболочки, ядро её ещё не проверяло (до hello)
+    if (d.provisional) {
+      return waited
+        ? { state: 'warn', word: 'внимание',
+            note: 'ядро не проверило папку ' + (d.dir || '—') + ' — если так и останется, ' + DELIVERY_STAYS }
+        : { state: 'pending', word: STATE_TEXT.pending, note: '' };
+    }
+    if (!d.package_on_end) {
+      return { state: 'warn', word: 'внимание', note: 'пакет не собирается (--no-package) — копировать нечего' };
+    }
+    if (d.same_dir) {
+      return { state: d.writable ? 'ok' : 'warn', word: d.writable ? STATE_TEXT.ok : 'внимание',
+        note: 'папка проктора совпадает с каталогом сессий — пакет и так там' + (d.dir ? ': ' + d.dir : '') };
+    }
     if (!d.writable) {
       return { state: 'warn', word: 'внимание',
         note: 'недоступна: ' + (d.reason || 'причина не сообщена') + ' — ' + DELIVERY_STAYS };
+    }
+    if (d.created) {
+      // Точка монтирования без носителя — обычный каталог локального диска:
+      // ядро создало папку, запись в неё пройдёт, но до проктора пакет не дойдёт.
+      return { state: 'warn', word: 'внимание',
+        note: 'папки не было — создана сейчас (' + d.dir + '); если это флешка или сетевой диск, ' +
+              'проверьте, что он подключён' };
     }
     return { state: 'ok', word: STATE_TEXT.ok, note: 'пакет будет скопирован в ' + d.dir };
   };
@@ -2680,7 +2893,9 @@
         rows.push(['Итоговый отчёт', f.reportPath || '—', reportState]);
 
         var pkgState;
+        var dcfg = this.delivery;
         if (f.packageReady) pkgState = 'собран: отчёт, журнал, кадры, снимки окна, manifest.json';
+        else if (dcfg && !dcfg.package_on_end) pkgState = 'не собирается (--no-package): забирайте каталог сессии целиком';
         else if (f.packageOk === false) {
           pkgState = 'не собран' + (f.packageMessage ? ': ' + f.packageMessage : '') +
                      '. Забирайте каталог сессии целиком';
@@ -2691,15 +2906,22 @@
         // Копия в папке проктора — только когда папка задана: иначе строка
         // повторяла бы «не задана» из блока доставки выше.
         var dres = this.deliveryResult;
-        if (deliveryOn(this.delivery) || dres) {
+        if (deliveryOn(dcfg) || dres) {
           var dState;
-          if (dres && dres.ok && dres.verified) dState = 'доставлен, sha256 копии сверен с пакетом';
+          var sameDir = Boolean((dres && dres.same_dir) || (!dres && dcfg && dcfg.same_dir));
+          if (sameDir) dState = 'копии нет: каталог сессий задан в папку проктора, пакет уже там';
+          else if (dres && dres.ok && dres.skipped === 'already_delivered') {
+            dState = 'там пакет до пересборки' + (dres.verified ? ' (sha256 сверен)' : ', sha256 не сверен') +
+                     '; пересобранный остался на этом компьютере';
+          } else if (dres && dres.ok && dres.verified) dState = 'доставлен, sha256 копии сверен с пакетом';
           else if (dres && dres.ok) dState = 'записан, sha256 копии не сверен' + (dres.error ? ': ' + dres.error : '');
-          else if (dres) dState = 'не доставлен' + (dres.error ? ': ' + dres.error : '');
           else if (f.packageOk === false) dState = 'не копировался: пакет не собран';
+          else if (dres && dres.timed_out) dState = 'папка не ответила к сроку, копирование продолжается';
+          else if (dres) dState = 'не доставлен' + (dres.error ? ': ' + dres.error : '');
+          else if (dcfg && !dcfg.package_on_end) dState = 'не копируется: пакет не собирается (--no-package)';
           else dState = f.packageReady ? 'копируется…' : 'скопируется после сборки пакета';
           rows.push(['Копия в папке проктора',
-            (dres && dres.dest) || (this.delivery && this.delivery.dir) || '—', dState]);
+            (dres && dres.dest) || (sameDir ? f.packagePath : '') || (dcfg && dcfg.dir) || '—', dState]);
         }
 
         rows.push(['Каталог сессии', f.sessionDir || '—',
@@ -2714,6 +2936,15 @@
 
     // --- доставка в папку проктора ---
     this._renderReportDelivery();
+    // Пересборка после удачной доставки второй копии не делает — сказать это
+    // и на самой кнопке, до нажатия.
+    var rebuildBtn = el('btn-report-rebuild');
+    if (rebuildBtn) {
+      var done = this.deliveryResult;
+      rebuildBtn.title = done && done.ok && !done.same_dir
+        ? 'Пакет уже доставлен в папку проктора: пересобранный останется на этом компьютере'
+        : '';
+    }
 
     // --- кнопка «Открыть отчёт» и подсказка ---
     var btn = el('btn-report');
@@ -2728,7 +2959,8 @@
       } else if (f.canOpen) {
         text = 'Отчёт готов: откроется браузером по умолчанию.';
       } else if (f.ended) {
-        text = 'Ядро собирает отчёт и пакет — кнопка включится, когда файл будет на месте.';
+        text = 'Ядро собирает отчёт' + (this.delivery && !this.delivery.package_on_end ? '' : ' и пакет') +
+               ' — кнопка включится, когда файл будет на месте.';
       } else {
         text = 'Отчёт соберётся после завершения сессии.';
       }
@@ -2739,11 +2971,15 @@
   /**
    * Финальный экран: дошёл ли пакет до папки проктора.
    *
-   * Четыре исхода, и каждый назван словами, а не только цветом полосы:
-   * доставлен и сверен по sha256; НЕ доставлен — причина, где лежит пакет
-   * здесь и кнопка повтора; папка не задана — пакет остался на этом
-   * компьютере; итога ещё нет — копируется. Пока о сессии ничего не известно,
-   * блок скрыт: обещать доставку пакета, которого нет, нельзя.
+   * Каждый исход назван словами, а не только цветом полосы: доставлен и
+   * сверен по sha256; записан, но не сверен; НЕ доставлен — причина, где лежит
+   * пакет здесь и кнопка повтора; папка не ответила к сроку — копирование идёт
+   * дальше; пакет и так в папке проктора (каталог сессий задан туда же);
+   * пересобранный пакет остался здесь, у проктора — прежний; пакет не собран
+   * или не собирается (--no-package) — копировать нечего; папка не задана —
+   * пакет остался на этом компьютере; итога ещё нет — копируется. «sha256
+   * сверен» — только при verified:true. Пока о сессии ничего не известно, блок
+   * скрыт: обещать доставку пакета, которого нет, нельзя.
    */
   App.prototype._renderReportDelivery = function () {
     var box = el('report-delivery');
@@ -2760,10 +2996,32 @@
     }
     var local = (f && f.packagePath) || '';
     var built = Boolean(f && f.ended && (f.packageReady || f.packageOk === true));
+    // Пакет не собран: копировать нечего, повторять нечего, и «он лежит здесь»
+    // было бы неправдой — забирать надо каталог сессии.
+    var pkgFailed = Boolean(f && f.packageOk === false);
+    var noPackage = Boolean(d && !d.package_on_end);
+    var takeDir = 'Забирайте каталог сессии целиком' + (f && f.sessionDir ? ': ' + f.sessionDir : '') + '.';
+    var sentence = function (str) {
+      str = String(str || '').replace(/[.\s]+$/, '');
+      return str ? str.charAt(0).toUpperCase() + str.slice(1) : '';
+    };
     var state;
     var title;
     var text = '';
-    if (res && res.ok && res.verified) {
+    if (res && res.same_dir) {
+      // Копии нет и сверять нечего: пакет собран прямо в папке проктора.
+      state = 'same';
+      title = 'Пакет уже лежит в папке проктора' + (local ? ': ' + local : '');
+      text = 'Каталог сессий задан туда же, поэтому отдельная копия не делалась.';
+    } else if (res && res.ok && res.skipped === 'already_delivered') {
+      // export_report после удачной доставки: вторую копию ядро не делает, у
+      // проктора остаётся пакет ДО пересборки.
+      state = 'stale';
+      title = 'В папке проктора — пакет до пересборки: ' + (res.dest || (d && d.dir) || '—') +
+              (res.verified ? ' (sha256 сверен)' : ', sha256 копии НЕ сверен');
+      text = 'Пересобранный пакет остался на этом компьютере' + (local ? ': ' + local : '') +
+             ' — вторая копия в папку проктора не делается. Нужен новый — передайте его проктору вручную.';
+    } else if (res && res.ok && res.verified) {
       state = 'ok';
       title = 'Пакет доставлен в папку проктора: ' + (res.dest || (d && d.dir) || '—') + ' (sha256 сверен)';
       text = (res.sha256 ? 'sha256 ' + res.sha256.slice(0, 12) + '…' + res.sha256.slice(-6) + '. ' : '') +
@@ -2776,9 +3034,24 @@
       state = 'unverified';
       title = 'Пакет записан в папку проктора: ' + (res.dest || (d && d.dir) || '—') +
               ', но sha256 копии НЕ сверен';
-      text = (res.error ? res.error.charAt(0).toUpperCase() + res.error.slice(1).replace(/[.\s]+$/, '') + '. ' : '') +
+      text = (res.error ? sentence(res.error) + '. ' : '') +
              'Проктору стоит проверить копию (scripts/verify_report.py).' +
              (local ? ' Пакет остаётся и здесь: ' + local + '.' : '');
+    } else if (pkgFailed) {
+      state = 'none';
+      title = 'Пакет не собран' + (deliveryOn(d) ? ' — в папку проктора копировать нечего' : '');
+      text = (f.packageMessage ? sentence(f.packageMessage) + '. ' : '') + takeDir;
+    } else if (res && res.timed_out) {
+      // Мягкий срок вышел, но поток ядра ещё копирует: поздний итог заменит
+      // этот сам. Повтор сейчас ответил бы delivery_busy — кнопки нет, пока
+      // копирование идёт.
+      state = 'timeout';
+      title = res.error ? sentence(res.error)
+        : 'Папка проктора не отвечает — пакет лежит здесь: ' + (local || '—');
+      text = this.deliveryInProgress
+        ? 'Копирование продолжается: если папка ответит, итог появится здесь сам. Не дожидаясь, ' +
+          'можно передать этот файл проктору вручную.'
+        : 'Повторите доставку или передайте этот файл проктору вручную.';
     } else if (res) {
       state = 'fail';
       var why = res.error || 'причина не сообщена';
@@ -2788,15 +3061,21 @@
       state = 'none';
       title = 'Ядро не сообщило о папке проктора — пакет ' +
               (built && local ? 'остался на этом компьютере: ' + local : 'останется на этом компьютере');
+    } else if (noPackage) {
+      // --no-package: пакета не будет — не ждать «копируется…» вечно.
+      state = 'none';
+      title = 'Пакет не собирается (--no-package)' + (deliveryOn(d) ? ' — в папку проктора копировать нечего' : '');
+      text = takeDir;
     } else if (!d.configured) {
       state = 'none';
       title = 'Не задана папка проктора — пакет ' +
               (built && local ? 'остался на этом компьютере: ' + local : 'останется на этом компьютере');
       text = 'Передайте пакет проктору вручную.';
-    } else if (f && f.packageOk === false) {
-      state = 'none';
-      title = 'Пакет не собран — в папку проктора копировать нечего';
-      text = 'Забирайте каталог сессии целиком' + (f.sessionDir ? ': ' + f.sessionDir : '') + '.';
+    } else if (d.same_dir) {
+      state = 'same';
+      title = built && local ? 'Пакет уже лежит в папке проктора: ' + local
+        : 'Пакет ляжет в папку проктора сам: каталог сессий задан туда же';
+      text = 'Отдельная копия не делается.';
     } else if (built) {
       state = 'pending';
       title = 'Пакет копируется в папку проктора: ' + (d.dir || '—') + '…';
@@ -2805,6 +3084,9 @@
       title = 'После сборки пакет будет скопирован в папку проктора: ' + (d.dir || '—');
     }
 
+    // Повтор осмыслен только после неудачи — и после срыва срока, когда
+    // копирование уже не идёт.
+    var canRetry = state === 'fail' || (state === 'timeout' && !this.deliveryInProgress);
     var busy = Boolean(this.deliveryRetry) || (this.deliveryInProgress && state === 'fail');
     if (this.deliveryRetry) text = 'Повторная доставка запрошена — ждём итога от ядра…';
     else if (busy) text = 'Ядро копирует пакет в папку проктора — ждём итога…';
@@ -2819,8 +3101,8 @@
       p.hidden = !text;
     }
     if (retryBtn) {
-      // Повтор осмыслен только после неудачи; пока он в пути — кнопка выключена.
-      retryBtn.hidden = state !== 'fail';
+      // пока повтор в пути — кнопка видна, но выключена
+      retryBtn.hidden = !canRetry && !this.deliveryRetry;
       retryBtn.disabled = busy;
       if (busy) retryBtn.setAttribute('aria-busy', 'true');
       else retryBtn.removeAttribute('aria-busy');
@@ -2899,8 +3181,26 @@
     if (rebuild) {
       rebuild.addEventListener('click', function () {
         var ok = self.bridge.sendCommand('export_report');
-        hint(ok
-          ? 'Запрошена пересборка: ядро соберёт отчёт и пакет заново в каталоге сессии.'
+        // После удачной доставки ядро вторую копию не делает: пересобранный
+        // пакет остаётся здесь, у проктора — прежний. Сказать сразу, а не
+        // ждать итога пересборки (до нажатия это же говорит title кнопки).
+        var res = self.deliveryResult;
+        var d = self.delivery;
+        var text;
+        if (d && !d.package_on_end) {
+          text = 'Запрошена пересборка: ядро соберёт отчёт заново в каталоге сессии; пакет не ' +
+                 'собирается (--no-package).';
+        } else {
+          text = 'Запрошена пересборка: ядро соберёт отчёт и пакет заново в каталоге сессии.';
+          if (res && res.ok && !res.same_dir) {
+            text += ' Пакет уже доставлен в папку проктора — пересобранный останется на этом ' +
+                    'компьютере, вторая копия не делается.';
+          } else if (deliveryCopies(d)) {
+            text += res ? ' Затем ядро снова попробует скопировать его в папку проктора.'
+              : ' Затем ядро скопирует его в папку проктора.';
+          }
+        }
+        hint(ok ? text
           : 'Ядро недоступно — пересобрать отчёт нельзя. Файлы сессии остаются в её каталоге.');
       });
     }

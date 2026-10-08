@@ -54,7 +54,7 @@ import argparse
 import shutil
 import sys
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any
 
 _HERE = Path(__file__).resolve().parent
@@ -851,6 +851,35 @@ def _list_profiles(report_mod: Any) -> int:
 # ===========================================================================
 # Передача: код сверки и degraded_handover
 # ===========================================================================
+def _delivery_lines(info: dict[str, Any]) -> list[str]:
+    """Папка проктора (`deliver_dir`): что о ней сказать. Пусто — не задавалась.
+
+    Манифест собран ДО копирования (пакет копируется готовым), поэтому итога
+    копии в нём нет и быть не может: только то, что копирование назначено.
+    Пути — с машины экзамена: без признака ядра сравниваются как строки.
+    """
+    deliver_dir = str(info.get("deliver_dir") or "").strip()
+    if not deliver_dir:
+        return []
+    written = str(info.get("effective_dir") or info.get("sessions_dir") or "").strip()
+    same = False
+    if "deliver_same_dir" in info:   # признак ядра, вычисленный при старте
+        same = bool(info.get("deliver_same_dir"))
+    elif written:
+        outer, inner = PurePath(deliver_dir), PurePath(written)
+        same = outer == inner or outer in inner.parents
+    lines = [f"  Папка проктора:    {deliver_dir}"]
+    if same:
+        lines.append("  Это каталог записи или папка над ним: пакет собирался прямо в ней,")
+        lines.append("  отдельной копии (и её сверки по sha256) не было.")
+    else:
+        lines.append("  После экзамена машина экзамена копирует пакет туда и сверяет копию")
+        lines.append("  по sha256. Манифест собран ДО копирования и её итога не знает.")
+    lines.append("  Это тоже слова процесса на машине экзамена. Проверяемый признак один:")
+    lines.append("  число пакетов в папке проктора сходится со списком группы.")
+    return lines
+
+
 def _check_handover(target: Target, handover_mod: Any) -> list[str]:
     """Что сказать проктору про саму передачу. Это не вердикт, а контекст.
 
@@ -867,6 +896,7 @@ def _check_handover(target: Target, handover_mod: Any) -> list[str]:
     lines: list[str] = []
     manifest = target.manifest or {}
     info = manifest.get("handover") if isinstance(manifest.get("handover"), dict) else {}
+    delivery = _delivery_lines(info)
     code = str(manifest.get("session_code") or "")
     if handover_mod is not None and code:
         code = handover_mod.format_code(code)
@@ -881,6 +911,7 @@ def _check_handover(target: Target, handover_mod: Any) -> list[str]:
         lines.append("  Доказательства писались на машину экзамена, то есть всё время")
         lines.append("  находились под контролем того, кто за ней работает. Это не")
         lines.append("  подделка, но и не та сохранность, на которую рассчитывали.")
+        lines.extend(delivery)
     elif info.get("requested_dir"):
         lines.append("  Каталог при запуске был задан. ЧЕГО ЭТО НЕ ЗНАЧИТ: что его "
                      "задал экзаменатор.")
@@ -893,6 +924,12 @@ def _check_handover(target: Target, handover_mod: Any) -> list[str]:
         lines.append("  сходится со списком группы. Отсутствие пакета видно по "
                      "содержимому шары, а не по")
         lines.append("  отчёту: у пропавшей сессии отчёта просто нет.")
+        lines.extend(delivery)
+    elif info and delivery:
+        lines.append("  Каталог при запуске НЕ задавался: во время экзамена комплект "
+                     "писался на машине")
+        lines.append("  экзамена и был под контролем того, кто за ней работает.")
+        lines.extend(delivery)
     elif info:
         lines.append("  Каталог при запуске НЕ задавался: комплект остался на машине "
                      "экзамена и всё время")

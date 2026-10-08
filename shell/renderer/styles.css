@@ -1723,6 +1723,13 @@ code {
 .sheet .alert.delivery[data-state="unverified"] { border-color: var(--warning); }
 .alert.delivery[data-state="pending"] { --tone: var(--info); }
 .alert.delivery[data-state="none"] { --tone: var(--gray-500); }
+/* пакет и так в папке проктора (каталог сессий там же): копии и сверки нет */
+.alert.delivery[data-state="same"] { --tone: var(--info); }
+/* у проктора пакет до пересборки; папка не ответила к сроку */
+.alert.delivery[data-state="stale"],
+.alert.delivery[data-state="timeout"] { --tone: var(--warning); }
+.sheet .alert.delivery[data-state="stale"],
+.sheet .alert.delivery[data-state="timeout"] { border-color: var(--warning); }
 /* в заголовке — путь к файлу: переносим в любом месте, иначе он уедет вбок */
 .alert.delivery strong { overflow-wrap: anywhere; }
 .delivery__retry { align-self: center; white-space: nowrap; }
@@ -2328,6 +2335,9 @@ code {
 .disclose__mode[data-mode="ram"] { color: var(--text-muted); }
 .disclose__mode[data-mode="no"]  { color: var(--text-primary); }
 .disclose__detail { max-width: 62ch; color: var(--text-muted); }
+/* «Сетевые обращения» при папке проктора или каталоге сессий, заданном явно:
+   подпись длиннее остальных — переносится, а не раздвигает столбец */
+.disclose__table tr[data-row="network"] .disclose__mode { white-space: normal; max-width: 24ch; }
 
 /* ----------- app.js: правила экзамена (#consent-rules, #preflight-rules) ---
    Один и тот же блок стоит на ДВУХ поверхностях: светлое согласие (.sheet) и

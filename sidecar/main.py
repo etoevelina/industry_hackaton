@@ -110,6 +110,7 @@ from protocol import (  # noqa: E402
 from capture import CameraCapture  # noqa: E402
 from config import (  # noqa: E402
     ALLOW_SEARCH_ENV_VAR,
+    DEFAULT_DELIVER_TIMEOUT_SEC,
     DELIVER_DIR_ENV_VAR,
     EXAM_PROFILE_ENV_VAR,
     EXAM_PROFILE_FILENAME,
@@ -1302,9 +1303,26 @@ class ProctorSidecar:
         #: уйдёт ли пакет с этой машины, ДО начала экзамена.
         self.delivery: dict[str, Any] = dict(getattr(cfg, "delivery_resolved", None)
                                              or _delivery_unprobed(cfg))
-        #: Идёт копирование в папку проктора: повторная команда не запускает
-        #: вторую копию параллельно (иначе рядом легли бы `-2` и `-3`).
-        self._delivering: bool = False
+        #: Фоновая доставка (`_deliver`): завершение сессии её не ждёт. Пока
+        #: задача не кончилась, копирование «идёт» (`delivery.in_progress`), и
+        #: повторная команда не запускает вторую копию параллельно (иначе рядом
+        #: легли бы `-2` и `-3`); следующая доставка встаёт за этой.
+        self._delivery_task: asyncio.Task[Any] | None = None
+        #: Выставляется на останове: поток копирования бросает копию между
+        #: кусками и удаляет свою недописанную (`deliver_package(cancel=…)`).
+        self._deliver_abort = threading.Event()
+        #: Каталог сессии -> успешная доставка её пакета. Пересборка
+        #: (`export_report`) после неё вторую копию не делает: лишний пакет на
+        #: шаре ломает сверку числа пакетов со списком группы.
+        self._delivered: dict[str, dict[str, Any]] = {}
+        #: `handover.json` правят и сборка пакета, и фоновая доставка (в том
+        #: числе поздний итог) — каждая чтением и перезаписью. Без замка одна
+        #: затирала бы запись другой.
+        self._note_lock = asyncio.Lock()
+        #: Идёт завершение сессии: второй `session_end` (останов, повтор
+        #: оболочки, `session_start` поверх) ждёт его, а не собирает второй
+        #: отчёт и второй пакет, который ушёл бы в папку проктора как `-2`.
+        self._ending: asyncio.Future[None] | None = None
         self.capture: CameraCapture | None = None
 
         self._engine_lock = threading.Lock()
@@ -2362,7 +2380,9 @@ class ProctorSidecar:
                                           fatal=False))
 
     async def _cmd_session_start(self, msg: dict[str, Any]) -> None:
-        if self.session.active:
+        # Завершение может ещё идти и после `session.end()` (отчёт, пакет):
+        # новая сессия поверх него получила бы чужой `last_package`.
+        if self.session.active or self._ending is not None:
             await self._cmd_session_end({"reason": "перезапуск сессии"})
         student_id = str(msg.get("student_id") or "anon")
         exam_id = str(msg.get("exam_id") or "")
@@ -2611,6 +2631,30 @@ class ProctorSidecar:
             return ""
 
     async def _cmd_session_end(self, msg: dict[str, Any]) -> None:
+        """Завершить сессию ровно один раз.
+
+        Между проверкой `session.active` и `session.end()` десяток await: пока
+        первое завершение пишет итоговые записи и собирает отчёт, сюда входили
+        останов по сигналу, повторный `session_end` или `session_start` поверх.
+        Второй проход собирал второй пакет и второй раз копировал его в папку
+        проктора (`-2`), а останов, не дождавшись первого, гасил модули и
+        цикл под незаконченной сборкой. Теперь второй вызов ждёт первый.
+        """
+        ending = self._ending
+        if ending is not None:
+            await asyncio.shield(ending)
+            return
+        if not self.session.active:
+            return
+        self._ending = asyncio.get_running_loop().create_future()
+        try:
+            await self._end_session(msg)
+        finally:
+            ending, self._ending = self._ending, None
+            if ending is not None and not ending.done():
+                ending.set_result(None)
+
+    async def _end_session(self, msg: dict[str, Any]) -> None:
         if not self.session.active:
             return
         reason = str(msg.get("reason") or "завершение по команде оболочки")
@@ -3562,8 +3606,11 @@ class ProctorSidecar:
             return
         path = str(self.last_package.get("package") or "") if self.last_package.get("ok") else ""
         if not path or not Path(path).is_file():
-            await self._error("no_package", "Пакета для доставки нет: сессия ещё не "
-                                            "завершалась или пакет не собран")
+            await self._error("no_package", (
+                "Пакет не собирается (--no-package): копировать в папку проктора "
+                "нечего — забирайте каталог сессии целиком"
+                if not self.cfg.package_on_end else
+                "Пакета для доставки нет: сессия ещё не завершалась или пакет не собран"))
             return
         if not self.delivery.get("configured"):
             await self._error("delivery_not_configured", (
@@ -3579,10 +3626,14 @@ class ProctorSidecar:
             # надёжную проверку на стороне проктора — число пакетов на шаре
             # против списка группы. Повтор — только после неудачи.
             await self._error("already_delivered", (
+                f"Пакет уже лежит в папке проктора: {done.get('dest') or '—'}. "
+                f"Копия не делается" if done.get("same_dir") else
                 f"Пакет уже скопирован в папку проктора: {done.get('dest') or '—'}. "
                 f"Повторная копия не делается"))
             return
-        await self._deliver(path, self._package_dir)
+        # Фоном, как и после сборки: зависшая шара не должна держать канал
+        # оболочки — итог придёт отдельным status.
+        self._schedule_delivery(self.last_package, self._package_dir)
         await self._broadcast(self._status_message())
 
     # ------------------------------------------------------------ поток CV
@@ -5744,7 +5795,11 @@ class ProctorSidecar:
             payload = {"ok": False, "reason": str(exc),
                        "message": f"Пакет не собран: {exc}"}
 
-        self.last_package = dict(payload)
+        # Итог доставки дописывается в ЭТОТ словарь — в тот пакет, который
+        # копировали. К концу копирования `last_package` может быть уже другим
+        # (пересборка, следующая сессия), и чужой итог там был бы неправдой.
+        pkg = dict(payload)
+        self.last_package = pkg
         self._package_dir = sdir
         note = {
             "created_at": handover_mod.now_iso(),
@@ -5756,14 +5811,16 @@ class ProctorSidecar:
             "package": payload,
         }
         # Пересборка (export_report) переписывает записку целиком, но прежние
-        # попытки доставки терять нельзя: «первая копия не ушла» — факт.
-        with contextlib.suppress(Exception):
-            prev = await asyncio.to_thread(handover_mod.read_handover_note, sdir)
-            attempts = prev.get("delivery_attempts")
-            if isinstance(attempts, list) and attempts:
-                note["delivery_attempts"] = attempts
-        with contextlib.suppress(Exception):
-            await asyncio.to_thread(handover_mod.write_handover_note, sdir, note)
+        # попытки доставки терять нельзя: «первая копия не ушла» — факт. Под
+        # замком: поздний итог фоновой доставки пишет в тот же файл.
+        async with self._note_lock:
+            with contextlib.suppress(Exception):
+                prev = await asyncio.to_thread(handover_mod.read_handover_note, sdir)
+                attempts = prev.get("delivery_attempts")
+                if isinstance(attempts, list) and attempts:
+                    note["delivery_attempts"] = attempts
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(handover_mod.write_handover_note, sdir, note)
 
         if payload.get("ok"):
             for line in str(payload.get("message") or "").splitlines():
@@ -5781,62 +5838,171 @@ class ProctorSidecar:
         # в тот же handover.json. Только по завершённой сессии: export_report
         # посреди экзамена пересобирает пакет локально, но с машины во время
         # экзамена не уходит ничего — так сказано на экране согласия.
-        # SESSION_ENDED к этому моменту уже разослан, поэтому итог доставки
-        # уходит оболочке отдельным status.
+        # Копирование идёт ФОНОМ (`_schedule_delivery`): завершение сессии его
+        # не ждёт, и зависшая шара не держит ни канал оболочки, ни финальный
+        # экран. Итог — и `timed_out`, если мягкий срок вышел, — уходит
+        # оболочке отдельным status.
         if self.delivery.get("configured"):
             if self.session.active:
                 log.info("сессия идёт: пакет в папку проктора не копируется до её "
                          "завершения")
             elif payload.get("ok"):
-                await self._deliver(str(payload.get("package") or ""), sdir)
-                await self._broadcast(self._status_message())
+                self._schedule_delivery(pkg, sdir)
             else:
                 failed = {"ok": False, "dest": "", "bytes": 0, "sha256": "",
                           "verified": False, "at": time.time(),
                           "error": ("пакет не собран — копировать в папку проктора "
                                     "нечего: " + str(payload.get("reason")
                                                      or "причина не определена"))}
-                self.last_package["delivery"] = failed
-                with contextlib.suppress(Exception):
-                    await asyncio.to_thread(handover_mod.record_delivery, sdir, failed, "")
-                await self._broadcast(self._status_message())
-        return dict(self.last_package)
+                await self._settle_delivery(pkg, sdir, "", failed)
+        return dict(pkg)
 
-    async def _deliver(self, package: str, session_dir: str) -> dict[str, Any]:
-        """Скопировать пакет в папку проктора, записать итог и сказать о нём.
+    @property
+    def _delivering(self) -> bool:
+        """Идёт копирование в папку проктора — в том числе после мягкого срока."""
+        task = self._delivery_task
+        return task is not None and not task.done()
 
-        Копирует `handover.deliver_package`: исключительное создание, соседнее
-        имя при занятом, fsync, сверка sha256 перечитыванием. Итог — в
-        `last_package["delivery"]` (оттуда в `status.package.delivery`) и в
-        `handover.json` каталога сессии (`delivery` + `delivery_attempts`).
+    def _schedule_delivery(self, pkg: dict[str, Any], session_dir: str) -> None:
+        """Запустить доставку пакета фоном; идёт предыдущая — встать за ней."""
+        prev = self._delivery_task if self._delivering else None
+        self._delivery_task = asyncio.create_task(
+            self._deliver(pkg, session_dir, prev), name="deliver")
+
+    async def _settle_delivery(self, pkg: dict[str, Any], session_dir: str,
+                               package: str, result: dict[str, Any], *,
+                               replace: bool = False, attempt: bool = True,
+                               running: bool = False) -> None:
+        """Итог доставки — в словарь пакета, в `handover.json` и оболочке.
+
+        `replace` — поздний итог попытки, уже записанной как `timed_out`: он
+        заменяет ту запись. `attempt=False` — копии не было (`skipped`).
+        `running` — копирование после этого итога ещё идёт (`timed_out`).
         Ошибкой (`error`) неудачу не рассылаем: оболочка показывает её строкой
         на финальном экране по `status`, а всплывающее «Сбой наблюдения» здесь
         было бы неправдой — наблюдение ни при чём.
         """
+        pkg["delivery"] = result
+        if session_dir and handover_mod is not None:
+            async with self._note_lock:
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(handover_mod.record_delivery, session_dir,
+                                            result, package, replace, attempt)
+        with contextlib.suppress(Exception):
+            msg = self._status_message()
+            if not running and self._delivery_task is asyncio.current_task():
+                # Итог шлёт сама задача доставки, пока она формально «идёт»:
+                # копирование уже кончилось, и status с итогом не должен
+                # говорить in_progress:true (кнопка повтора была бы выключена
+                # до следующего тика статуса).
+                msg["delivery"]["in_progress"] = False
+            await self._broadcast(msg)
+
+    async def _deliver(self, pkg: dict[str, Any], session_dir: str,
+                       prev: asyncio.Task[Any] | None = None) -> dict[str, Any]:
+        """Скопировать пакет `pkg` в папку проктора, записать итог и сказать о нём.
+
+        Копирует `handover.deliver_package`: исключительное создание, соседнее
+        имя при занятом, fsync, сверка sha256 перечитыванием. Итог — в
+        `pkg["delivery"]` (оттуда в `status.package.delivery`) и в
+        `handover.json` каталога сессии (`delivery` + `delivery_attempts`).
+
+        Мягкий срок — `deliver_timeout_sec`: не уложились — итогом становится
+        `timed_out` («папка проктора не отвечает N с — пакет лежит здесь: …»),
+        копирование идёт дальше, и поздний итог заменяет этот и в status, и в
+        `handover.json`. Копия идёт в отдельном фоновом (daemon) потоке, а не в
+        пуле `asyncio.to_thread`: поток пула процесс при выходе дожидается, и
+        зависшая шара держала бы выход ядра сколько угодно.
+        """
+        if prev is not None:
+            # Две копии одновременно не делаем: пересборка или повтор во время
+            # идущего копирования ждут его окончания (и его итога ниже).
+            await asyncio.wait({prev})
+        package = str(pkg.get("package") or "")
+        key = os.path.abspath(session_dir) if session_dir else ""
+        prior = pkg.get("delivery") or {}
+        if prior.get("ok"):
+            # Этот самый пакет уже доставлен: второй копии нет.
+            return dict(prior)
+        delivered = self._delivered.get(key) if key else None
+        if delivered is not None:
+            # Пересборка (export_report) после успешной доставки: в папке
+            # проктора уже лежит пакет этой сессии. Вторая копия рядом ломает
+            # сверку числа пакетов со списком группы, поэтому её нет, а status
+            # говорит прямо: пересобранный пакет остался здесь.
+            result = {**delivered, "skipped": "already_delivered",
+                      "note": (f"пакет пересобран после доставки и остался на этом "
+                               f"компьютере: {package}. В папке проктора — копия "
+                               f"прежней сборки: {delivered.get('dest') or '—'}; "
+                               f"вторая копия не делается")}
+            log.info("пакет пересобран после доставки: вторая копия в папку проктора "
+                     "не делается (там уже %s), новый пакет остался здесь: %s",
+                     delivered.get("dest") or "—", package)
+            await self._settle_delivery(pkg, session_dir, package, result, attempt=False)
+            return result
+        if self._deliver_abort.is_set():
+            result = {"ok": False, "dest": "", "bytes": 0, "sha256": "",
+                      "verified": False, "at": time.time(),
+                      "error": (f"ядро останавливается — копирование в папку проктора "
+                                f"не начиналось, пакет лежит здесь: {package}")}
+            await self._settle_delivery(pkg, session_dir, package, result)
+            return result
+
         target = str(self.cfg.deliver_path or self.delivery.get("dir") or "")
-        # Две копии одновременно не делаем: пересборка (export_report) во время
-        # повтора из оболочки ждёт его окончания. Между проверкой и флагом нет
-        # await, поэтому в одном цикле событий гонки здесь нет.
-        while self._delivering:
-            await asyncio.sleep(0.2)
-        self._delivering = True
+        timeout = float(getattr(self.cfg, "deliver_timeout", 0)
+                        or DEFAULT_DELIVER_TIMEOUT_SEC)
+        timed_out = False
         try:
-            result = await asyncio.to_thread(handover_mod.deliver_package,
-                                             package, target)
+            fut = _in_daemon_thread(handover_mod.deliver_package, package, target,
+                                    self._deliver_abort)
+            try:
+                result = await asyncio.wait_for(asyncio.shield(fut), timeout)
+            except asyncio.TimeoutError:
+                timed_out = True
+                stalled = {"ok": False, "dest": "", "bytes": 0, "sha256": "",
+                           "verified": False, "at": time.time(), "timed_out": True,
+                           "error": (f"папка проктора не отвечает {timeout:g} с — "
+                                     f"пакет лежит здесь: {package}")}
+                log.warning("пакет НЕ доставлен в папку проктора за %g с: папка не "
+                            "отвечает. Копирование продолжается, его итог заменит этот; "
+                            "пакет лежит здесь: %s", timeout, package)
+                await self._settle_delivery(pkg, session_dir, package, stalled, running=True)
+                result = await fut
+        except asyncio.CancelledError:
+            # Останов не дождался копирования (`_finish_delivery_on_shutdown`).
+            self._deliver_abort.set()
+            gone = {"ok": False, "dest": "", "bytes": 0, "sha256": "",
+                    "verified": False, "at": time.time(), "timed_out": True,
+                    "error": (f"ядро остановлено, не дождавшись конца копирования в "
+                              f"папку проктора — пакет лежит здесь: {package}")}
+            with contextlib.suppress(Exception):
+                await self._settle_delivery(pkg, session_dir, package, gone,
+                                            replace=timed_out)
+            raise
         except Exception as exc:  # deliver_package не бросает, но страхуемся
             log.exception("доставка пакета в папку проктора упала")
             result = {"ok": False, "dest": "", "bytes": 0, "sha256": "",
                       "verified": False, "at": time.time(),
                       "error": f"доставка не удалась: {exc}"}
-        finally:
-            self._delivering = False
         result = dict(result)
-        self.last_package["delivery"] = result
-        if session_dir:
-            with contextlib.suppress(Exception):
-                await asyncio.to_thread(handover_mod.record_delivery,
-                                        session_dir, result, package)
-        if result.get("ok") and result.get("verified"):
+        if not result.get("ok") and self._deliver_abort.is_set():
+            # Копию бросил останов (`_finish_delivery_on_shutdown`), а не папка:
+            # итог тот же, что у снятой задачи (docs/CONTRACT.md) — с путём к
+            # пакету; причина потока — в скобках.
+            result.update(timed_out=True, error=(
+                f"ядро остановлено, не дождавшись конца копирования в папку проктора — "
+                f"пакет лежит здесь: {package} ({result.get('error') or 'причина не определена'})"))
+        elif timed_out:
+            # Поздний итог той же попытки: помечен, чтобы в handover.json было
+            # видно, что мягкий срок она не уложила.
+            result["late"] = True
+        if result.get("ok") and not result.get("same_dir") and key:
+            self._delivered[key] = result
+        await self._settle_delivery(pkg, session_dir, package, result, replace=timed_out)
+        if result.get("same_dir"):
+            log.info("пакет уже лежит в папке проктора (каталог сессий задан туда же): "
+                     "%s — копия не делалась", result.get("dest"))
+        elif result.get("ok") and result.get("verified"):
             log.info("пакет доставлен в папку проктора: %s (sha256 сверен: %s…)",
                      result.get("dest"), str(result.get("sha256") or "")[:16])
         elif result.get("ok"):
@@ -5846,6 +6012,33 @@ class ProctorSidecar:
             log.warning("пакет НЕ доставлен в папку проктора: %s. Он лежит здесь: %s",
                         result.get("error") or "причина не определена", package)
         return result
+
+    async def _finish_delivery_on_shutdown(self) -> None:
+        """Дать незаконченной доставке несколько секунд на останове — не больше.
+
+        Дольше ждать нельзя: оболочка уходит, а зависшая шара держала бы процесс
+        сколько угодно. Не успела — поток просим бросить копию (свою
+        недописанную он удаляет, обрезанный файл под именем пакета в папке
+        проктора не остаётся), задачу снимаем, и она записывает в
+        `handover.json`, что копирование не закончилось и где лежит пакет.
+        """
+        task = self._delivery_task
+        if task is None or task.done():
+            return
+        log.info("останов: копирование пакета в папку проктора ещё идёт — жду не "
+                 "дольше %g с", DELIVER_SHUTDOWN_GRACE_SEC)
+        done, _ = await asyncio.wait({task}, timeout=DELIVER_SHUTDOWN_GRACE_SEC)
+        if done:
+            return
+        self._deliver_abort.set()
+        done, _ = await asyncio.wait({task}, timeout=DELIVER_ABORT_GRACE_SEC)
+        if not done:
+            task.cancel()
+            await asyncio.wait({task}, timeout=DELIVER_ABORT_GRACE_SEC)
+        log.warning("останов: копирование в папку проктора не уложилось в %g с и "
+                    "брошено — итог записан в handover.json, пакет остался на этом "
+                    "компьютере: %s",
+                    DELIVER_SHUTDOWN_GRACE_SEC, self.last_package.get("package") or "—")
 
     def _chain_state(self) -> dict[str, Any]:
         """Состояние цепочки для манифеста: genesis, голова, число записей."""
@@ -5884,9 +6077,14 @@ class ProctorSidecar:
         if thread is not None and thread.is_alive():
             thread.join(timeout=2.0)
 
-        if self.session.active:
+        # Завершение могло уже идти (оболочка прислала session_end и сразу
+        # SIGTERM): тогда ждём его, а не гасим модули под незаконченной сборкой.
+        if self.session.active or self._ending is not None:
             with contextlib.suppress(Exception):
                 await self._cmd_session_end({"reason": reason or "остановка сайдкара"})
+        # Доставка в папку проктора идёт фоном — ей несколько секунд, не больше.
+        with contextlib.suppress(Exception):
+            await self._finish_delivery_on_shutdown()
 
         if self.audio is not None:
             with contextlib.suppress(Exception):
@@ -6221,6 +6419,69 @@ def apply_cli(cfg: ProctorConfig, args: argparse.Namespace) -> None:
         cfg.risk_lock = float(args.risk_lock)
 
 
+#: Сколько останов ждёт незаконченную доставку в папку проктора, секунды.
+#: Оболочка на выходе шлёт session_end и сразу SIGTERM; ждать зависшую шару
+#: дольше нескольких секунд значит держать процесс сколько угодно.
+DELIVER_SHUTDOWN_GRACE_SEC = 5.0
+#: Сколько ещё ждать, попросив поток бросить копию: флаг он проверяет между
+#: кусками по 1 МиБ и удаляет свою недописанную копию.
+DELIVER_ABORT_GRACE_SEC = 2.0
+
+
+def _in_daemon_thread(fn: Any, *args: Any) -> "asyncio.Future[Any]":
+    """`fn(*args)` в отдельном фоновом (daemon) потоке; итог — future цикла.
+
+    Не `asyncio.to_thread`: поток пула исполнителей процесс при выходе
+    ДОЖИДАЕТСЯ (`shutdown_default_executor`, затем atexit в
+    `concurrent.futures`), и копия на зависшую шару держала бы выход ядра
+    бесконечно. Daemon-поток выход не держит; ограничивает его
+    `_finish_delivery_on_shutdown`.
+    """
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future[Any] = loop.create_future()
+
+    def settle(value: Any, error: BaseException | None) -> None:
+        if fut.done():
+            return
+        if error is not None:
+            fut.set_exception(error)
+        else:
+            fut.set_result(value)
+
+    def work() -> None:
+        value: Any = None
+        error: BaseException | None = None
+        try:
+            value = fn(*args)
+        except Exception as exc:
+            error = exc
+        with contextlib.suppress(RuntimeError):  # цикл закрыт — процесс выходит
+            loop.call_soon_threadsafe(settle, value, error)
+
+    threading.Thread(target=work, name="deliver", daemon=True).start()
+    return fut
+
+
+def _delivery_facts(cfg: Any, info: dict[str, Any]) -> dict[str, Any]:
+    """Дополнить объект `delivery` фактами конфигурации.
+
+    `package_on_end` — собирается ли пакет вообще (`--no-package`: копировать
+    нечего, и предполётный экран обязан сказать это, а не «пакет уйдёт»).
+    `same_dir` — папка проктора совпадает с каталогом сессий или лежит над
+    ним: пакет и так собирается в ней, отдельной копии (и сверки копии) нет.
+    """
+    out = dict(info)
+    out["package_on_end"] = bool(getattr(cfg, "package_on_end", True))
+    same = False
+    if out.get("configured") and handover_mod is not None:
+        with contextlib.suppress(Exception):
+            same = bool(handover_mod.deliver_covers(
+                out.get("dir") or getattr(cfg, "deliver_path", None),
+                getattr(cfg, "sessions_path", None)))
+    out["same_dir"] = same
+    return out
+
+
 def _delivery_unprobed(cfg: Any, reason: str = "") -> dict[str, Any]:
     """Объект `delivery` без стартовой пробы: папка не задана или проверить нечем.
 
@@ -6229,7 +6490,7 @@ def _delivery_unprobed(cfg: Any, reason: str = "") -> dict[str, Any]:
     """
     path = getattr(cfg, "deliver_path", None)
     configured = bool(path)
-    return {
+    return _delivery_facts(cfg, {
         "configured": configured,
         "dir": str(path or ""),
         "source": (str(getattr(cfg, "deliver_dir_source", "") or "default")
@@ -6238,7 +6499,7 @@ def _delivery_unprobed(cfg: Any, reason: str = "") -> dict[str, Any]:
         "reason": (reason or "папка проктора при старте не проверялась") if configured else "",
         "created": False,
         "probe_removed": None,
-    }
+    })
 
 
 def prepare_delivery(cfg: ProctorConfig) -> dict[str, Any]:
@@ -6260,17 +6521,25 @@ def prepare_delivery(cfg: ProctorConfig) -> dict[str, Any]:
         log.warning("папка проктора %s задана, но модуль storage/handover.py "
                     "недоступен: пакет скопирован не будет", path)
     else:
-        info = handover_mod.probe_deliver_dir(path, cfg.deliver_dir_source)
+        info = _delivery_facts(cfg, handover_mod.probe_deliver_dir(
+            path, cfg.deliver_dir_source))
         label = handover_mod.deliver_source_label(str(info.get("source") or ""))
         if info.get("created"):
             log.warning("папки проктора %s не было — она создана. Если это точка "
                         "монтирования флешки или сетевого диска, проверьте, что "
                         "носитель подключён: иначе пакет ляжет на локальный диск "
                         "этой же машины", info.get("dir"))
+        if info.get("same_dir"):
+            log.warning("папка проктора %s — это каталог сессий %s или папка над "
+                        "ним: пакет и так собирается в ней, отдельной копии не будет "
+                        "и «sha256 сверен» тоже — сверять нечего. Нужна копия на "
+                        "другой носитель — укажите --deliver-to на него",
+                        info.get("dir"), cfg.sessions_path)
         if info.get("writable"):
-            log.info("папка проктора: %s (%s). Запись проверена: после экзамена "
-                     "пакет будет скопирован туда со сверкой sha256",
-                     info.get("dir"), label)
+            log.info("папка проктора: %s (%s). Запись проверена%s",
+                     info.get("dir"), label,
+                     ": после экзамена пакет будет скопирован туда со сверкой sha256"
+                     if cfg.package_on_end and not info.get("same_dir") else "")
             if info.get("probe_removed") is False:
                 log.info("пробный файл в папке проктора удалить не удалось — папка "
                          "похожа на append-only (так и задумано для шары)")
@@ -6281,8 +6550,13 @@ def prepare_delivery(cfg: ProctorConfig) -> dict[str, Any]:
                         info.get("dir"), label, info.get("reason") or "причина не определена")
     if info.get("configured") and not cfg.package_on_end:
         log.warning("задана папка проктора, но пакет не собирается (--no-package): "
-                    "доставлять будет нечего")
+                    "доставлять будет нечего, копирования не будет")
     cfg.delivery_resolved = info
+    # Признак same_dir — и в сведения о передаче: по ним отчёт и манифест
+    # говорят «копируется» или «уже лежит в папке», не обращаясь к самой папке
+    # (зависшая шара не должна держать сборку отчёта).
+    if isinstance(getattr(cfg, "handover_resolved", None), dict):
+        cfg.handover_resolved["deliver_same_dir"] = bool(info.get("same_dir"))
     return info
 
 

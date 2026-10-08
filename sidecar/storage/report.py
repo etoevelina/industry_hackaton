@@ -5878,6 +5878,47 @@ def build_fusion_html(events: list[dict[str, Any]], t0: float, embed: _Embedder,
     return intro + "".join(cards)
 
 
+def _delivery_plan(handover: dict[str, Any]) -> tuple[str, bool]:
+    """Папка проктора из сведений о передаче и признак «это и есть каталог сессий».
+
+    -> (папка или "", same_dir). same_dir — папка проктора совпадает с каталогом
+    записи или лежит над ним: пакет собирается прямо в ней, отдельной копии нет.
+    Признак ядро вычисляет при старте (`deliver_same_dir`); без него — сравнение
+    путей как строк. К самой папке отчёт не обращается: зависшая шара не должна
+    держать сборку отчёта.
+    """
+    deliver_dir = str(handover.get("deliver_dir") or "").strip()
+    if not deliver_dir:
+        return "", False
+    if "deliver_same_dir" in handover:
+        return deliver_dir, bool(handover.get("deliver_same_dir"))
+    written = str(handover.get("effective_dir") or handover.get("sessions_dir") or "")
+    if not written:
+        return deliver_dir, False
+    outer = Path(os.path.normcase(os.path.normpath(deliver_dir)))
+    inner = Path(os.path.normcase(os.path.normpath(written)))
+    return deliver_dir, outer == inner or outer in inner.parents
+
+
+def _delivery_sentence(deliver_dir: str, same_dir: bool) -> str:
+    """Что сказать в отчёте о доставке пакета в папку проктора (HTML).
+
+    Отчёт собран ДО копирования — он сам лежит в пакете, — поэтому говорит
+    «копируется», а не итог: итог знают `handover.json` и финальный экран.
+    Оговорка та же, что у каталога: это слова процесса на машине экзамена.
+    """
+    where = f'<span class="mono">{_esc(deliver_dir)}</span>'
+    if same_dir:
+        head = (f'Папка проктора {where} — это каталог записи или папка над ним: '
+                f'пакет собирается прямо в ней, отдельной копии и её сверки нет. ')
+    else:
+        head = (f'После экзамена эта машина копирует пакет в папку проктора {where} '
+                f'со сверкой sha256. Отчёт собран до копирования и её итога не знает. ')
+    return (head + 'Папку и копирование сообщает о себе тот же процесс, '
+                   'который запустили на машине экзамена. Надёжная проверка одна — '
+                   'число пакетов в папке проктора против списка группы.')
+
+
 def build_handover_html(handover: dict[str, Any], code: str,
                         package: dict[str, Any] | None = None) -> str:
     """Как доказательства попадают к экзаменатору. Это ответ на вопрос заказчика.
@@ -5886,11 +5927,15 @@ def build_handover_html(handover: dict[str, Any], code: str,
     куда ушла копия и собрался ли пакет. Деградированная передача (копия
     осталась на машине студента) помечается как проблема, а не прячется в
     служебную строку: именно в этом случае доказательства можно потерять.
+    Задана папка проктора (`deliver_dir`) — «забрать вручную» не пишется:
+    пакет после экзамена копирует туда сама машина экзамена.
     """
     handover = dict(handover or {})
     package = dict(package or {})
     degraded = bool(handover.get("degraded_handover"))
     code_text = _esc(_format_code(code))
+    deliver_dir, same_dir = _delivery_plan(handover)
+    delivery = _delivery_sentence(deliver_dir, same_dir) if deliver_dir else ""
 
     if degraded:
         status = (
@@ -5900,9 +5945,11 @@ def build_handover_html(handover: dict[str, Any], code: str,
             f'{_esc(handover.get("reason") or "каталог проктора был недоступен на запись")}. '
             f'Доказательства записаны в локальный каталог на машине, где проходил '
             f'экзамен, то есть копия НЕ ушла туда, куда указывал экзаменатор. '
-            f'Комплект нужно забрать с этой машины вручную, и до этого момента '
-            f'его сохранность не гарантирована.'
-            f'</div></div></div>')
+            + (f'{delivery} До копирования сохранность комплекта не гарантирована.'
+               if delivery else
+               f'Комплект нужно забрать с этой машины вручную, и до этого момента '
+               f'его сохранность не гарантирована.')
+            + f'</div></div></div>')
     elif handover.get("requested_dir"):
         # Каталог был задан. Говорим именно это, а не «передано экзаменатору»:
         # кто задал каталог, система не знает — и флаг, и переменная окружения
@@ -5915,7 +5962,17 @@ def build_handover_html(handover: dict[str, Any], code: str,
             f'себе тот же процесс, который запустили на машине экзамена — отличить '
             f'сетевую папку вуза от локального каталога по отчёту нельзя. Надёжный '
             f'признак один: пакет лежит на шаре вуза, и число пакетов сходится со '
-            f'списком группы.</div></div></div>')
+            f'списком группы.' + (f' {delivery}' if delivery else '')
+            + f'</div></div></div>')
+    elif delivery:
+        status = (
+            f'<div class="chain-status is-partial">{_ICON_ALERT}'
+            f'<div><div class="mono caps chain-head">'
+            f'{"пакет собирается в папке проктора" if same_dir else "пакет копируется в папку проктора"}'
+            f'</div>'
+            f'<div class="chain-text">Каталог доказательств при запуске указан не был: '
+            f'во время экзамена комплект писался на машине экзамена, то есть был под '
+            f'контролем того, кто за ней работает. {delivery}</div></div></div>')
     else:
         status = (
             f'<div class="chain-status is-partial">{_ICON_ALERT}'
@@ -5934,6 +5991,8 @@ def build_handover_html(handover: dict[str, Any], code: str,
         rows.append(("Каталог, заданный при запуске", handover.get("requested_dir")))
     if handover.get("source"):
         rows.append(("Источник настройки (со слов процесса)", handover.get("source")))
+    if deliver_dir:
+        rows.append(("Папка проктора (доставка пакета)", deliver_dir))
     if handover.get("append_only") is not None:
         rows.append(("Каталог append-only (проба при старте)",
                      "да" if handover.get("append_only") else

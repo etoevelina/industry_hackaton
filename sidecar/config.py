@@ -56,6 +56,8 @@ USB-носитель, и студент не может удалить то, ч�
 Это НЕ каталог сессий: сессия по-прежнему пишется в каталог сессий (обычно
 локальный), а в папку проктора после экзамена КОПИРУЕТСЯ готовый пакет
 (`storage/handover.deliver_package`). Не задана — пакет остаётся на машине.
+Копирование идёт фоном, завершение сессии его не ждёт; мягкий срок —
+`deliver_timeout_sec` в config.json (по умолчанию 30 с), см. docs/CONTRACT.md.
 
 Ключ подписи — тем же способом: `--signing-key PATH` (или `PROCTOR_SIGNING_KEY`).
 Ключ задан проктором -> подпись получает метку `institution` и доказывает
@@ -155,6 +157,8 @@ SESSIONS_DIR_ENV_VAR = "PROCTOR_SESSIONS_DIR"
 SIGNING_KEY_ENV_VAR = "PROCTOR_SIGNING_KEY"
 #: Папка проктора, куда после экзамена копируется пакет (`--deliver-to`).
 DELIVER_DIR_ENV_VAR = "PROCTOR_DELIVER_DIR"
+#: Мягкий срок доставки пакета в папку проктора по умолчанию, секунды.
+DEFAULT_DELIVER_TIMEOUT_SEC = 30.0
 
 #: Значение `sessions_dir` по умолчанию. Оно же — запасной локальный каталог,
 #: если указанный проктором недоступен на запись.
@@ -1826,6 +1830,11 @@ class ProctorConfig:
     deliver_dir: str = ""
     #: Откуда взято значение `deliver_dir`: cli | env | config | default.
     deliver_dir_source: str = "default"
+    #: Мягкий срок доставки, секунды. Копирование идёт фоном после сборки
+    #: пакета; не уложилось — оболочке уходит `timed_out` («папка проктора не
+    #: отвечает N с — пакет лежит здесь: …»), а копирование продолжается, и
+    #: поздний итог заменяет этот. Сам экзамен и завершение сессии его не ждут.
+    deliver_timeout_sec: float = DEFAULT_DELIVER_TIMEOUT_SEC
     #: Ключ подписи, переданный проктором. Задан -> метка подписи `institution`
     #: (доказывает авторство). Пусто -> ключ генерируется на машине студента,
     #: метка `self_signed` (доказывает только целостность при передаче).
@@ -2063,6 +2072,18 @@ class ProctorConfig:
         """Папка проктора абсолютным путём. None — доставка не настроена."""
         value = str(self.deliver_dir or "").strip()
         return self._abs(value) if value else None
+
+    @property
+    def deliver_timeout(self) -> float:
+        """Мягкий срок доставки в секундах: `deliver_timeout_sec`, приведённый
+        к разумному (не число или <= 0 — по умолчанию, не больше часа)."""
+        try:
+            value = float(self.deliver_timeout_sec)
+        except (TypeError, ValueError):
+            return DEFAULT_DELIVER_TIMEOUT_SEC
+        if not value > 0:  # и NaN
+            return DEFAULT_DELIVER_TIMEOUT_SEC
+        return min(value, 3600.0)
 
     @property
     def signing_key_abs(self) -> Path | None:
@@ -2331,6 +2352,7 @@ class ProctorConfig:
                 "package_on_end": bool(self.package_on_end),
                 "deliver_path": str(self.deliver_path or ""),
                 "deliver_dir_source": self.deliver_dir_source,
+                "deliver_timeout_sec": self.deliver_timeout,
                 "signing_key": str(self.signing_key_abs or ""),
                 "signature_authority": self.signature_authority,
                 "evidence_subdir": self.evidence_subdir,
@@ -2596,6 +2618,7 @@ __all__ = [
     "SESSIONS_DIR_ENV_VAR",
     "SIGNING_KEY_ENV_VAR",
     "DELIVER_DIR_ENV_VAR",
+    "DEFAULT_DELIVER_TIMEOUT_SEC",
     "DEFAULT_SESSIONS_DIR",
     "AUDIO_ANALYSIS_KINDS",
     "CLASSROOM_AUDIO_OFF_REASON",

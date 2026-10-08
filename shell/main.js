@@ -21,6 +21,7 @@
 
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 const {
@@ -154,9 +155,10 @@ const CLI = {
    * ПЕРЕДАЁТ сайдкару, когда запускает его сама: проверку на запись,
    * копирование и сверку sha256 делает ядро, а оболочка показывает то, что
    * оно сообщило (`delivery` в hello/status). Переменная PROCTOR_DELIVER_DIR
-   * доходит до сайдкара и без этого — окружение наследуется.
+   * доходит до сайдкара и без этого — окружение наследуется. `--deliver-dir` —
+   * синоним, как у ядра.
    */
-  deliverTo: argValue('deliver-to', ''),
+  deliverTo: argValue('deliver-to', '') || argValue('deliver-dir', ''),
 
   /*
    * Флаги, которые раньше задавали правила на стороне оболочки. Оставлены
@@ -565,10 +567,20 @@ const state = {
   sessionReport: freshSessionReport(),
   /**
    * Папка проктора со слов ядра (`delivery` в hello и в каждом status):
-   * {configured, dir, source, writable, reason}. null — ядро о ней ещё не
-   * сообщало (или его версия о доставке не знает). См. deliveryConfigFrom().
+   * {configured, dir, source, writable, reason, ...}. До hello — предварительная
+   * запись по флагу / переменной самой оболочки (provisionalDelivery), чтобы
+   * текст согласия был верен с первого кадра; null — оболочке о папке ничего
+   * не известно, а ядро ещё не сообщало. См. deliveryConfigFrom().
    */
-  delivery: null,
+  delivery: provisionalDelivery(),
+  /**
+   * Каталог сессий со слов ядра (`handover` в hello и в каждом status):
+   * {effective_dir, requested_dir, source, degraded_handover}. Нужен тексту
+   * согласия: каталог, заданный проктором, бывает сетевой папкой, и тогда
+   * журнал сессии уходит с компьютера уже во время экзамена. До hello —
+   * предварительная запись по PROCTOR_SESSIONS_DIR (provisionalSessionsTarget).
+   */
+  sessionsTarget: provisionalSessionsTarget(),
 
   // --- профиль экзамена и страница LMS ------------------------------------
   examProfile: null,        // результат normalizeExamProfile(); null до старта
@@ -734,6 +746,9 @@ function shellStatus() {
     // Дублирует `delivery` из hello/status: renderer, загрузившийся позже
     // рукопожатия, получает её отсюда не позже чем через секунду.
     delivery: state.delivery,
+    // Каталог сессий со слов ядра (`handover` из hello/status) — для текста
+    // согласия по той же причине.
+    sessionsTarget: state.sessionsTarget,
   };
 }
 
@@ -2651,9 +2666,11 @@ function spawnSidecar() {
    * Папка проктора — тем же способом: как есть, без проверок (их делает ядро
    * пробной записью при старте). Относительный путь разрешаем от каталога, где
    * запустили оболочку: сайдкар стартует с cwd = корень репозитория и понял бы
-   * его иначе, чем человек, набравший флаг.
+   * его иначе, чем человек, набравший флаг. Ведущую `~` раскрываем до
+   * разрешения (shellPath): `--deliver-to=~/x` оболочка не раскрывает, и
+   * path.resolve сделал бы из неё каталог `./~/x`.
    */
-  if (CLI.deliverTo) args.push('--deliver-to', path.resolve(CLI.deliverTo));
+  if (CLI.deliverTo) args.push('--deliver-to', shellPath(CLI.deliverTo));
 
   log('запускаем сайдкар:', python, args.join(' '));
   let child;
@@ -3004,8 +3021,17 @@ function noteSessionReportFromStatus(msg) {
   // Итоги приходят в каждом status; более ранний (повтор запроса ушёл, а
   // старый статус ещё в пути) не перетирает более поздний.
   if (delivery && (!r.delivery || delivery.at >= r.delivery.at)) {
-    if (!r.delivery || r.delivery.at !== delivery.at || r.delivery.ok !== delivery.ok) {
-      if (delivery.ok && delivery.verified) {
+    if (!r.delivery || r.delivery.at !== delivery.at || r.delivery.ok !== delivery.ok
+      || r.delivery.skipped !== delivery.skipped || r.delivery.timed_out !== delivery.timed_out) {
+      if (delivery.same_dir) {
+        log(`пакет уже в папке проктора: каталог сессий задан туда же, копия не делалась (${r.packagePath || '—'})`);
+      } else if (delivery.skipped === 'already_delivered') {
+        log(`пересобранный пакет остался на этом компьютере (${r.packagePath || '—'}): в папке проктора `
+          + `уже лежит прежний — ${delivery.dest || '—'}, вторая копия не делается`);
+      } else if (delivery.timed_out) {
+        log(`папка проктора не ответила вовремя: ${delivery.error || 'причина не сообщена'}; `
+          + 'копирование продолжается, итог придёт позже');
+      } else if (delivery.ok && delivery.verified) {
         log(`пакет доставлен в папку проктора: ${delivery.dest} (sha256 сверен)`);
       } else if (delivery.ok) {
         log(`пакет записан в папку проктора: ${delivery.dest}, но sha256 копии НЕ сверен: `
@@ -3031,9 +3057,91 @@ function deliveryConfigFrom(raw) {
     source: ['default', 'config', 'env', 'cli'].indexOf(source) !== -1 ? source : '',
     writable: raw.writable === true,
     reason: textField(raw.reason, 400),
+    // папки не было, ядро создало её при старте: точка монтирования без
+    // носителя — это локальный диск, предполётная строка об этом предупреждает
+    created: raw.created === true,
+    // --no-package: пакет не собирается, копировать нечего (нет поля — ядро
+    // старше этого флага в delivery, пакет собирается как прежде)
+    package_on_end: raw.package_on_end !== false,
+    // папка проктора совпадает с каталогом сессий или содержит его: пакет и
+    // так ложится туда, копия не делается
+    same_dir: raw.same_dir === true,
     // ядро копирует пакет прямо сейчас: кнопка повтора на это время выключена
     in_progress: raw.in_progress === true,
   };
+}
+
+/** Путь из флага или переменной оболочки: `~` -> домашний каталог, затем абсолютный. */
+function shellPath(p, base) {
+  let raw = String(p || '').trim();
+  if (raw === '~' || raw.startsWith('~/') || raw.startsWith('~\\')) {
+    raw = path.join(os.homedir(), raw.slice(1));
+  }
+  return base ? path.resolve(base, raw) : path.resolve(raw);
+}
+
+/**
+ * Папка проктора до hello ядра — по флагу (`--deliver-to` / `--deliver-dir`)
+ * или переменной PROCTOR_DELIVER_DIR самой оболочки. Renderer показывает
+ * согласие раньше, чем ядро успевает поздороваться, и без этой записи первые
+ * кадры обещали бы «данные наблюдения в сеть не уходят» при заданной папке.
+ * Запись помечена `provisional`: на запись папку проверяет только ядро, и
+ * первый же его `delivery` (hello) её заменяет.
+ */
+function provisionalDelivery() {
+  const env = textField(process.env.PROCTOR_DELIVER_DIR, 1024);
+  const fromCli = Boolean(CLI.deliverTo);
+  if (!fromCli && !env) return null;
+  return {
+    configured: true,
+    // флаг разрешается от каталога запуска (так его получит ядро от оболочки),
+    // переменная — от корня репозитория (так её разрешает ядро)
+    dir: fromCli ? shellPath(CLI.deliverTo) : shellPath(env, ROOT_DIR),
+    source: fromCli ? 'cli' : 'env',
+    writable: false,
+    reason: 'ещё не проверена ядром',
+    created: false,
+    package_on_end: true,
+    same_dir: false,
+    in_progress: false,
+    provisional: true,
+  };
+}
+
+/**
+ * Каталог сессий из `handover` hello/status ядра — только поля, нужные тексту
+ * согласия: куда фактически пишется сессия и задан ли каталог явно.
+ */
+function sessionsTargetFrom(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const source = textField(raw.source, 16);
+  return {
+    effective_dir: textField(raw.effective_dir, 1024),
+    requested_dir: textField(raw.requested_dir, 1024),
+    source: ['default', 'config', 'env', 'cli'].indexOf(source) !== -1 ? source : '',
+    degraded_handover: raw.degraded_handover === true,
+  };
+}
+
+/** До hello: каталог сессий по PROCTOR_SESSIONS_DIR оболочки (ядро наследует окружение). */
+function provisionalSessionsTarget() {
+  const env = textField(process.env.PROCTOR_SESSIONS_DIR, 1024);
+  if (!env) return null;
+  const dir = shellPath(env, ROOT_DIR);
+  return {
+    effective_dir: dir,
+    requested_dir: dir,
+    source: 'env',
+    degraded_handover: false,
+    provisional: true,
+  };
+}
+
+/** hello / status: запомнить, куда ядро пишет сессию. */
+function noteSessionsTarget(msg) {
+  if (!msg || typeof msg !== 'object' || !('handover' in msg)) return;
+  const next = sessionsTargetFrom(msg.handover);
+  if (next) state.sessionsTarget = next;
 }
 
 /** Итог deliver_package (handover.deliver_package) из status.package.delivery. */
@@ -3041,6 +3149,7 @@ function deliveryResultFrom(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const at = Number(raw.at);
   const bytes = Number(raw.bytes);
+  const skipped = textField(raw.skipped, 40);
   return {
     ok: raw.ok === true,
     dest: textField(raw.dest, 1024),
@@ -3049,6 +3158,15 @@ function deliveryResultFrom(raw) {
     verified: raw.verified === true,
     at: Number.isFinite(at) ? at : 0,
     error: textField(raw.error, 400),
+    note: textField(raw.note, 400),
+    // пакет уже лежит в папке проктора: каталог сессий задан туда же
+    same_dir: raw.same_dir === true,
+    // export_report после удачной доставки: пересобранный пакет остался
+    // локально, `ok`/`dest` — прежней доставки
+    skipped,
+    // папка не ответила к мягкому сроку; копирование идёт дальше в потоке ядра,
+    // поздний итог заменит этот
+    timed_out: raw.timed_out === true,
   };
 }
 
@@ -3063,8 +3181,12 @@ function noteDeliveryConfig(msg) {
     === JSON.stringify(Object.assign({}, b, { in_progress: null }));
   if (!next || (prev && same(prev, next))) return;
   if (!next.configured) log('папка проктора не задана: пакет останется на этом компьютере');
-  else if (next.writable) log(`папка проктора: ${next.dir} (источник ${next.source || '—'}), запись проверена`);
-  else log(`ВНИМАНИЕ: папка проктора ${next.dir} недоступна: ${next.reason || 'причина не сообщена'}`);
+  else if (!next.package_on_end) log(`папка проктора ${next.dir} задана, но пакет не собирается (--no-package): копировать нечего`);
+  else if (next.same_dir) log(`папка проктора ${next.dir} совпадает с каталогом сессий: пакет и так там, копия не делается`);
+  else if (next.writable) {
+    log(`папка проктора: ${next.dir} (источник ${next.source || '—'}), запись проверена`
+      + (next.created ? '; папки не было — ядро создало её сейчас (флешка или шара подключены?)' : ''));
+  } else log(`ВНИМАНИЕ: папка проктора ${next.dir} недоступна: ${next.reason || 'причина не сообщена'}`);
 }
 
 /**
@@ -3378,7 +3500,10 @@ function wireSidecar() {
       state.lastVerdict = { action: msg.action, reason: msg.reason, score: msg.score };
     }
     if (msg.type === MsgType.STATUS) noteSessionReportFromStatus(msg);
-    if (msg.type === MsgType.HELLO || msg.type === MsgType.STATUS) noteDeliveryConfig(msg);
+    if (msg.type === MsgType.HELLO || msg.type === MsgType.STATUS) {
+      noteDeliveryConfig(msg);
+      noteSessionsTarget(msg);
+    }
     if (msg.type === MsgType.EVENT) {
       const ev = msg.event && typeof msg.event === 'object' ? msg.event : null;
       noteSessionReportFromEvent(ev);

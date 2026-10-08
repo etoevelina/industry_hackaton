@@ -115,6 +115,9 @@
      появится на ЛОКАЛЬНОМ диске и «доставка» туда ничего не доставит. Поэтому
      факт создания говорится в логе вслух, а сама доставка папку уже не
      создаёт: пропала папка — это ошибка доставки, а не повод завести новую.
+   * Папка проктора совпадает с каталогом сессий или лежит над ним
+     (`deliver_covers`) — пакет и так собран в ней, копия не делается и
+     «sha256 сверен» не ставится: сверять копию не с чем (`same_dir`).
 
 Своей криптографии здесь нет: sha256 из `hashlib`, подпись — `sign_report()`
 из `storage/report.py` (Ed25519 через `cryptography`).
@@ -197,6 +200,11 @@ _DELIVER_MAX_SUFFIX = 999
 
 #: Кусок потокового копирования: пакет с клипами в память целиком не лезет.
 _DELIVER_CHUNK = 1 << 20
+
+#: Пояснение к итогу доставки, когда папка проктора совпадает с каталогом
+#: сессий (или лежит над ним): пакет уже там, копия не делалась.
+DELIVER_SAME_DIR_NOTE = ("пакет уже лежит в папке проктора: каталог сессий задан "
+                         "туда же, копия не делалась")
 
 # --- семантика подписи -----------------------------------------------------
 AUTHORITY_SELF = "self_signed"
@@ -1085,7 +1093,44 @@ def _short(exc: BaseException) -> str:
     return str(exc)[:200] or exc.__class__.__name__
 
 
-def deliver_package(zip_path: str | Path, deliver_dir: str | Path) -> dict[str, Any]:
+def deliver_covers(deliver_dir: str | Path | None, path: str | Path | None) -> bool:
+    """Папка проктора — это `path` или папка над ним? Никогда не бросает.
+
+    Так бывает, когда каталог сессий задан на ту же флешку или шару, что и
+    папка проктора: пакет собирается рядом с каталогом сессии, то есть уже
+    лежит в папке проктора. Копировать его туда же второй раз незачем, а
+    «sha256 сверен» про копию, которой нет, было бы неправдой. Сравнение — по
+    разрешённому пути и, где оба каталога есть, по stat (bind-mount, регистр
+    букв на macOS и Windows).
+    """
+    wanted = str(deliver_dir or "").strip()
+    inner_raw = str(path or "").strip()
+    if not wanted or not inner_raw:
+        return False
+    try:
+        outer = Path(wanted).expanduser().resolve()
+        inner = Path(inner_raw).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    chain = (inner, *inner.parents)
+    key = os.path.normcase(str(outer))
+    if any(os.path.normcase(str(p)) == key for p in chain):
+        return True
+    try:
+        outer_stat = outer.stat()
+    except OSError:
+        return False
+    for p in chain:
+        try:
+            if os.path.samestat(outer_stat, p.stat()):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def deliver_package(zip_path: str | Path, deliver_dir: str | Path,
+                    cancel: Any = None) -> dict[str, Any]:
     """Скопировать готовый пакет в папку проктора и сверить копию по sha256.
 
     Правила, ради которых функция и существует:
@@ -1104,9 +1149,18 @@ def deliver_package(zip_path: str | Path, deliver_dir: str | Path) -> dict[str, 
     концу экзамена — значит отключён носитель или шара, и новая папка на
     локальном диске под тем же путём была бы «доставкой» в никуда.
 
-    Возвращает {"ok", "dest", "bytes", "sha256", "verified", "at", "error"}:
-    `sha256` — локального пакета (то, с чем сверяли), `bytes` — сколько
-    скопировано, `at` — время окончания попытки (epoch). Никогда не бросает.
+    Пакет уже лежит в папке проктора (`deliver_covers`: каталог сессий задан
+    туда же или ниже) — копии нет: `ok: True`, `verified: False`,
+    `same_dir: True` и `note` с объяснением; `dest` — сам пакет.
+
+    `cancel` — объект с `is_set()` (`threading.Event`): выставлен — копия
+    бросается между кусками, своя недописанная копия удаляется. Так ядро на
+    останове не оставляет в папке проктора обрезанный файл под именем пакета.
+
+    Возвращает {"ok", "dest", "bytes", "sha256", "verified", "at", "error"}
+    (+ `same_dir`, `note` в случае выше): `sha256` — локального пакета (то,
+    с чем сверяли), `bytes` — сколько скопировано, `at` — время окончания
+    попытки (epoch). Никогда не бросает.
     """
     out: dict[str, Any] = {"ok": False, "dest": "", "bytes": 0, "sha256": "",
                            "verified": False, "at": 0.0, "error": ""}
@@ -1128,18 +1182,19 @@ def deliver_package(zip_path: str | Path, deliver_dir: str | Path) -> dict[str, 
         return done(f"папка проктора недоступна: нет папки {dest_dir} "
                     f"(отключён носитель или сетевой диск?)")
 
-    # Пакет уже лежит в папке проктора (каталог сессий задан туда же): вторая
-    # копия рядом с первой никому не нужна. Сверять — с самим собой.
-    same = False
-    with _suppress():
-        same = os.path.samefile(str(src.parent), str(dest_dir))
-    if same:
+    # Пакет уже лежит в папке проктора (каталог сессий задан туда же или
+    # ниже): вторая копия рядом с первой ломала бы сверку числа пакетов со
+    # списком группы. Копии нет — значит и сверять нечего: `verified` не
+    # ставим, иначе оболочка написала бы «sha256 копии сверен» про копию,
+    # которой не было. sha256 — самого пакета, для записки проктору.
+    if deliver_covers(dest_dir, src.parent):
         try:
             out["sha256"] = sha256_file(src)
             out["bytes"] = src.stat().st_size
         except OSError as exc:
             return done(f"пакет не читается: {_oserror(exc)}")
-        out.update(ok=True, dest=str(src), verified=True)
+        out.update(ok=True, dest=str(src), verified=False, same_dir=True,
+                   note=DELIVER_SAME_DIR_NOTE)
         return done()
 
     handle = None
@@ -1164,6 +1219,8 @@ def deliver_package(zip_path: str | Path, deliver_dir: str | Path) -> dict[str, 
         with handle:
             with open(src, "rb") as reader:
                 for block in iter(lambda: reader.read(_DELIVER_CHUNK), b""):
+                    if cancel is not None and cancel.is_set():
+                        raise InterruptedError("ядро останавливается, копия брошена")
                     handle.write(block)
                     digest.update(block)
                     copied += len(block)
@@ -1202,21 +1259,35 @@ def read_handover_note(session_dir: str | Path) -> dict[str, Any]:
 
 
 def record_delivery(session_dir: str | Path, result: dict[str, Any],
-                    package: str = "") -> str:
+                    package: str = "", replace_timed_out: bool = False,
+                    attempt: bool = True) -> str:
     """Дописать итог доставки в `handover.json`. Возвращает путь ('' при отказе).
 
     `delivery` — последняя попытка, `delivery_attempts` — все попытки по
     порядку (повтор из оболочки не стирает прежний отказ: проктору важно, что
     первая копия НЕ ушла и почему). Цепочка к этому моменту закрыта, поэтому
     место этой записи — рядом с ней, как и у записки о пакете.
+
+    `replace_timed_out` — это поздний итог той же попытки, что уже записана
+    как `timed_out` (мягкий срок вышел, копирование шло дальше): он ЗАМЕНЯЕТ
+    ту запись, а не добавляет вторую попытку, которой не было.
+    `attempt=False` — копии не было (`skipped`): меняется только `delivery`.
     """
     note = read_handover_note(session_dir)
     entry = dict(result or {})
     attempts = note.get("delivery_attempts")
     attempts = list(attempts) if isinstance(attempts, list) else []
-    attempts.append({**entry, "package": str(package or "")})
+    if attempt:
+        row = {**entry, "package": str(package or "")}
+        last = attempts[-1] if attempts and isinstance(attempts[-1], dict) else {}
+        if (replace_timed_out and last.get("timed_out")
+                and str(last.get("package") or "") == row["package"]):
+            attempts[-1] = row
+        else:
+            attempts.append(row)
     note["delivery"] = entry
-    note["delivery_attempts"] = attempts
+    if attempts:
+        note["delivery_attempts"] = attempts
     note["delivery_updated_at"] = now_iso()
     return write_handover_note(session_dir, note)
 
@@ -1606,7 +1677,7 @@ __all__ = [
     "sessions_dir_from_env", "signing_key_from_env", "source_label",
     "DELIVER_DIR_ENV_VAR", "deliver_dir_from_env", "deliver_source_label",
     "probe_deliver_dir", "deliver_package", "read_handover_note",
-    "record_delivery",
+    "record_delivery", "deliver_covers", "DELIVER_SAME_DIR_NOTE",
     "PackageResult", "build_manifest", "build_package", "write_handover_note",
     "sha256_file", "read_manifest", "extract_package", "verify_manifest",
     "expected_code", "cross_check_manifest", "package_authority", "is_package",
