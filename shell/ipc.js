@@ -175,9 +175,14 @@ const CALIBRATION_STAGES = Object.freeze(['gaze_center', 'gaze_grid', 'identity'
  * `--auto-lock=false` (по умолчанию) приостановка по порогу 90 не снималась
  * никем — ни студентом штатно, ни проктором, потому что команда отсекалась
  * здесь же, в `sendCommand`. Единственным выходом оставался `session_end`.
+ *
+ * `deliver_package` — повтор копирования последнего пакета в папку проктора
+ * (`--deliver-to`), только после завершения сессии; итог приходит в
+ * `status.package.delivery`, отказ — ошибкой с кодом (docs/CONTRACT.md).
  */
 const COMMAND_NAMES = Object.freeze([
   'snapshot', 'reset_risk', 'export_report', 'proctor_lock', 'proctor_release',
+  'deliver_package',
 ]);
 
 /** Команды, которые обязаны назвать, кто именно принял решение. */
@@ -697,7 +702,8 @@ class SidecarLink extends EventEmitter {
   }
 
   /**
-   * command: snapshot | reset_risk | export_report | proctor_lock | proctor_release.
+   * command: snapshot | reset_risk | export_report | proctor_lock | proctor_release |
+   * deliver_package.
    *
    * `opts.actor` — кто принял решение, `opts.reason` — почему. Для решений
    * проктора `actor` обязателен: сайдкар отвечает ошибкой `actor_required`,

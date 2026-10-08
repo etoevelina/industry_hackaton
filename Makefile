@@ -22,6 +22,13 @@
 # доказательства целостности в доказательство авторства: приватный ключ вуза на
 # машине студента не хранится. Без него подпись доказывает только, что файл не
 # менялся по дороге, и verify это прямо печатает.
+#
+# ПАПКА ПРОКТОРА. Сессия пишется в каталог сессий на этой машине, а ПОСЛЕ
+# экзамена готовый пакет копируется в папку проктора (флешка или сетевая папка
+# вуза) со сверкой sha256:
+#   make run DELIVER_DIR=/Volumes/PROCTOR
+#   PROCTOR_DELIVER_DIR=/Volumes/PROCTOR make run      # ядро читает и переменную
+# Не задана — пакет остаётся рядом с каталогом сессии, как раньше.
 
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
@@ -33,6 +40,11 @@ ARGS ?=
 # переменная, что читает сайдкар, — иначе make report собирал бы отчёт по
 # пустому локальному каталогу, пока доказательства лежат на сетевом диске.
 SESSIONS := $(if $(PROCTOR_SESSIONS_DIR),$(PROCTOR_SESSIONS_DIR),$(ROOT)/sessions)
+
+# Папка проктора для целей run и run-mock: задана — ядро получает --deliver-to.
+# Пусто — флага нет, и ядро смотрит PROCTOR_DELIVER_DIR и config.json само.
+DELIVER_DIR ?=
+DELIVER_ARGS := $(if $(strip $(DELIVER_DIR)),--deliver-to "$(strip $(DELIVER_DIR))")
 
 # Интерпретатор: .venv, затем системный. Переопределяется через PROCTOR_PYTHON.
 PY := $(shell if [ -n "$$PROCTOR_PYTHON" ]; then echo "$$PROCTOR_PYTHON"; \
@@ -47,7 +59,8 @@ JS_FILES := shell/main.js shell/state.js shell/lockdown.js shell/ipc.js \
 	tools/discover/check.js tools/discover/strip-preload.js
 
 SH_FILES := scripts/setup.sh scripts/run-dev.sh scripts/fetch_models.sh \
-	scripts/run-safe.command scripts/discover-origins.command
+	scripts/run-safe.command scripts/discover-origins.command \
+	scripts/demo-test.command scripts/demo-lms.command
 
 .PHONY: help setup run run-mock discover models report package verify test clean clean-sessions
 
@@ -59,6 +72,8 @@ help:
 	@echo "                  ARGS=\"--vision --audio --identity --all --skip-npm\""
 	@echo "  make run        запустить сайдкар и оболочку, Ctrl+C гасит оба"
 	@echo "                  ARGS=\"--no-kiosk --headless --port 8800\""
+	@echo "                  DELIVER_DIR=/Volumes/PROCTOR — после экзамена скопировать"
+	@echo "                  пакет в папку проктора (со сверкой sha256)"
 	@echo "  make run-mock   демо без камеры: события по scripts/demo_scenario.json"
 	@echo "  make discover   разведка источников LMS: открыть систему вуза и собрать"
 	@echo "                  ЧЕРНОВИК белого списка по фактическим запросам."
@@ -79,16 +94,20 @@ help:
 	@echo "  каталог сессий: $(SESSIONS)"
 	@echo "                  задаётся PROCTOR_SESSIONS_DIR или --sessions-dir"
 	@echo "  ключ подписи:   $(if $(PROCTOR_SIGNING_KEY),$(PROCTOR_SIGNING_KEY),не задан — подпись докажет только целостность)"
+	@echo "  папка проктора: $(if $(strip $(DELIVER_DIR)),$(DELIVER_DIR),$(if $(PROCTOR_DELIVER_DIR),$(PROCTOR_DELIVER_DIR),не задана — пакет останется на этой машине))"
+	@echo "                  задаётся DELIVER_DIR=, PROCTOR_DELIVER_DIR или --deliver-to"
 
 # ---------------------------------------------------------------------------
 setup:
 	@bash scripts/setup.sh $(ARGS)
 
+# DELIVER_ARGS идут ДО ARGS: в ARGS может стоять «--», после которого всё
+# уходит сайдкару как есть, и флаг оказался бы не у run-dev.sh.
 run:
-	@bash scripts/run-dev.sh $(ARGS)
+	@bash scripts/run-dev.sh $(DELIVER_ARGS) $(ARGS)
 
 run-mock:
-	@bash scripts/run-dev.sh --mock $(ARGS)
+	@bash scripts/run-dev.sh --mock $(DELIVER_ARGS) $(ARGS)
 
 # РАЗВЕДКА ИСТОЧНИКОВ LMS. Отдельная точка входа и отдельный процесс: оболочка
 # прокторинга про неё не знает и знать не должна. Правила разбора записей при

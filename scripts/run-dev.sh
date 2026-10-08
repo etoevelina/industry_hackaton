@@ -31,11 +31,21 @@
 #   владельца одних правил давали два противоречащих документа об одной
 #   сессии (подробно — в shell/main.js у CLI.examProfilePath).
 #
+# Папка проктора (флешка или сетевая папка вуза), куда ПОСЛЕ экзамена ядро
+# копирует готовый пакет <сессия>.proctor.zip со сверкой sha256:
+#   bash scripts/run-dev.sh --deliver-to /Volumes/PROCTOR
+#   make run DELIVER_DIR=/Volumes/PROCTOR             # то же через make
+#   Сессия по-прежнему пишется в каталог сессий на этой машине. Относительный
+#   путь считается от текущего каталога. Мок-сайдкар пакетов не собирает —
+#   с --mock флаг уходит только во встроенный режим ядра.
+#
 # Переменные окружения:
 #   PROCTOR_PYTHON  — интерпретатор сайдкара (по умолчанию .venv/bin/python3, затем python3)
 #   PROCTOR_LOG     — уровень логов сайдкара (DEBUG/INFO/WARNING)
+#   PROCTOR_DELIVER_DIR — папка проктора, если не задана флагом (её читает само ядро)
 #
-# Наружу в сеть ничего не идёт: оба процесса общаются только по loopback.
+# Во время экзамена наружу ничего не идёт: оба процесса общаются только по
+# loopback. После экзамена — только копия пакета в папку проктора, если задана.
 #
 set -euo pipefail
 
@@ -52,6 +62,7 @@ SIDECAR_ONLY=0
 SHELL_ONLY=0
 PASSTHROUGH=0
 EXTRA_SIDECAR=()
+DELIVER_TO=""
 
 SIDECAR_PID=""
 SHELL_PID=""
@@ -61,7 +72,7 @@ say()  { printf '[run] %s\n' "$*"; }
 warn() { printf '[run] ВНИМАНИЕ: %s\n' "$*" >&2; }
 fail() { printf '[run] ОШИБКА: %s\n' "$*" >&2; exit 1; }
 
-usage() { sed -n "3,39p" "${BASH_SOURCE[0]}" | sed "s|^# \{0,1\}||"; }
+usage() { sed -n "3,48p" "${BASH_SOURCE[0]}" | sed "s|^# \{0,1\}||"; }
 
 # --------------------------------------------------------------------------- аргументы
 while [ $# -gt 0 ]; do
@@ -100,6 +111,11 @@ while [ $# -gt 0 ]; do
         # Поиск запрещён по умолчанию. Флаг — для экзаменов, где он разрешён
         # правилами; факт идёт в цепочку и в шапку отчёта.
         --allow-search)  EXTRA_SIDECAR+=(--allow-search) ;;
+        # Папка проктора: уходит ЯДРУ (оно проверяет её пробной записью и
+        # копирует пакет). Существование здесь не проверяем — недоступная
+        # папка экзамен не останавливает, причину скажет ядро.
+        --deliver-to)    shift; [ $# -gt 0 ] || fail "--deliver-to без значения"; DELIVER_TO="$1" ;;
+        --deliver-to=*)  DELIVER_TO="${1#--deliver-to=}" ;;
         # Флаги, которых больше нет. Отказ с объяснением, а не «неизвестный
         # аргумент»: человек под часы должен узнать, куда идти, а не что он
         # опечатался.
@@ -217,6 +233,20 @@ fi
 
 [ -f "${SIDECAR_ENTRY}" ] || fail "не найдена точка входа сайдкара: ${SIDECAR_ENTRY}"
 
+# Папка проктора. Относительный путь — от каталога, где набрали команду: ядро
+# стартует из корня репозитория и поняло бы его иначе, чем человек.
+if [ -n "${DELIVER_TO}" ]; then
+    case "${DELIVER_TO}" in
+        /*|"~"|"~/"*) ;;
+        *) DELIVER_TO="${PWD}/${DELIVER_TO}" ;;
+    esac
+    if [ "${SIDECAR_ENTRY}" = "${MOCK_ENTRY}" ]; then
+        warn "мок-сайдкар пакетов не собирает — папка проктора ${DELIVER_TO} не используется"
+    else
+        SIDECAR_ARGS+=(--deliver-to "${DELIVER_TO}")
+    fi
+fi
+
 SIDECAR_ARGS+=(--host "${WS_HOST}" --port "${WS_PORT}")
 [ -n "${PROCTOR_LOG:-}" ] && SIDECAR_ARGS+=(--log-level "${PROCTOR_LOG}")
 if [ "${#EXTRA_SIDECAR[@]}" -gt 0 ]; then
@@ -274,6 +304,9 @@ fi
 say "корень: ${ROOT_DIR}"
 say "python: ${PYTHON_BIN}"
 say "канал:  ws://${WS_HOST}:${WS_PORT}"
+if [ -n "${DELIVER_TO}" ] && [ "${SIDECAR_ENTRY}" != "${MOCK_ENTRY}" ]; then
+    say "папка проктора: ${DELIVER_TO} — примет ли она запись, ядро скажет ниже"
+fi
 
 if [ "${SHELL_ONLY}" != "1" ]; then
     say "старт: ${SIDECAR_LABEL}"

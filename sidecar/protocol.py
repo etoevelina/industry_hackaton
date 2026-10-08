@@ -51,9 +51,12 @@ class MsgType(str, Enum):
 
 #: Полный словарь команд оболочки. `proctor_lock` / `proctor_release` — решение
 #: человека над приостановленным экзаменом, оба требуют `actor` (кто решил) и
-#: оба оставляют неизгладимую запись в хеш-цепочке.
+#: оба оставляют неизгладимую запись в хеш-цепочке. `deliver_package` —
+#: повторить копирование последнего пакета в папку проктора (`--deliver-to`);
+#: допустима только после завершения сессии, итог приходит в `status.package.delivery`.
 COMMAND_NAMES: tuple[str, ...] = (
     "snapshot", "reset_risk", "export_report", "proctor_lock", "proctor_release",
+    "deliver_package",
 )
 
 

@@ -28,7 +28,10 @@ const {
   session, Menu, nativeImage, shell: electronShell,
 } = require('electron');
 
-const { SidecarLink, EventKind, MsgType, DEFAULT_WS_HOST, DEFAULT_WS_PORT } = require('./ipc');
+const {
+  SidecarLink, EventKind, MsgType, DEFAULT_WS_HOST, DEFAULT_WS_PORT,
+  COMMAND_NAMES: IPC_COMMAND_NAMES,
+} = require('./ipc');
 const { Lockdown, LOCK_SPECS, comboThrottle } = require('./lockdown');
 const {
   isLockedState, canTransition, allowedFrom, lockPermissions,
@@ -146,6 +149,16 @@ const CLI = {
   examProfilePubkey: argValue('exam-profile-pubkey', ''),
 
   /*
+   * Папка проктора (USB-носитель или сетевая папка вуза), куда ядро копирует
+   * готовый пакет после экзамена. Как и профиль, оболочка флаг только
+   * ПЕРЕДАЁТ сайдкару, когда запускает его сама: проверку на запись,
+   * копирование и сверку sha256 делает ядро, а оболочка показывает то, что
+   * оно сообщило (`delivery` в hello/status). Переменная PROCTOR_DELIVER_DIR
+   * доходит до сайдкара и без этого — окружение наследуется.
+   */
+  deliverTo: argValue('deliver-to', ''),
+
+  /*
    * Флаги, которые раньше задавали правила на стороне оболочки. Оставлены
    * РАСПОЗНАВАЕМЫМИ намеренно: молча проигнорированный флаг хуже отвергнутого,
    * потому что проктор решит, что правила действуют. Запуск с ними не
@@ -191,7 +204,8 @@ function log(...args) {
  * ядра, переподписать отчёт и перенаправить сбор доказательств. Ни одна из
  * трёх здесь НЕ запрещается: на машине студента запрет бесполезен — запускает
  * он, и ядро у него в руках. Все три оставляют улику: уходят в SHELL_CONFIG, а
- * оттуда ядро пишет их в хеш-цепочку.
+ * оттуда ядро пишет их в хеш-цепочку. Четвёртая, PROCTOR_DELIVER_DIR, решает,
+ * куда после экзамена уйдёт копия пакета, — по той же причине она в том же списке.
  */
 
 /**
@@ -211,6 +225,10 @@ const EVIDENCE_ENV_VARS = Object.freeze([
   Object.freeze({
     name: 'PROCTOR_SESSIONS_DIR',
     affects: 'каталог, куда уедут доказательства',
+  }),
+  Object.freeze({
+    name: 'PROCTOR_DELIVER_DIR',
+    affects: 'папка проктора, куда после экзамена копируется пакет',
   }),
 ]);
 
@@ -545,6 +563,12 @@ const state = {
    * выдумывает. См. freshSessionReport().
    */
   sessionReport: freshSessionReport(),
+  /**
+   * Папка проктора со слов ядра (`delivery` в hello и в каждом status):
+   * {configured, dir, source, writable, reason}. null — ядро о ней ещё не
+   * сообщало (или его версия о доставке не знает). См. deliveryConfigFrom().
+   */
+  delivery: null,
 
   // --- профиль экзамена и страница LMS ------------------------------------
   examProfile: null,        // результат normalizeExamProfile(); null до старта
@@ -706,6 +730,10 @@ function shellStatus() {
     examProfile: examProfileInfo(),
     // Финальный экран: где отчёт и пакет, код сессии, деградация передачи.
     sessionReport: sessionReportInfo(),
+    // Папка проктора со слов ядра — предполётная строка и текст согласия.
+    // Дублирует `delivery` из hello/status: renderer, загрузившийся позже
+    // рукопожатия, получает её отсюда не позже чем через секунду.
+    delivery: state.delivery,
   };
 }
 
@@ -2619,6 +2647,13 @@ function spawnSidecar() {
   if (CLI.examProfilePubkey) {
     args.push('--exam-profile-pubkey', CLI.examProfilePubkey);
   }
+  /*
+   * Папка проктора — тем же способом: как есть, без проверок (их делает ядро
+   * пробной записью при старте). Относительный путь разрешаем от каталога, где
+   * запустили оболочку: сайдкар стартует с cwd = корень репозитория и понял бы
+   * его иначе, чем человек, набравший флаг.
+   */
+  if (CLI.deliverTo) args.push('--deliver-to', path.resolve(CLI.deliverTo));
 
   log('запускаем сайдкар:', python, args.join(' '));
   let child;
@@ -2886,6 +2921,10 @@ function freshSessionReport() {
     handoverReason: '',
     ended: false,
     endReason: '',
+    // Итог копирования пакета в папку проктора (status.package.delivery):
+    // {ok, dest, bytes, sha256, verified, at, error}. null — не копировали
+    // или итог ещё не пришёл.
+    delivery: null,
   };
 }
 
@@ -2961,6 +3000,106 @@ function noteSessionReportFromStatus(msg) {
   if (pkgPath) r.packagePath = pkgPath;
   r.packageOk = Boolean(pkg.ok);
   r.packageMessage = r.packageOk ? '' : textField(pkg.reason || pkg.message, 400);
+  const delivery = deliveryResultFrom(pkg.delivery);
+  // Итоги приходят в каждом status; более ранний (повтор запроса ушёл, а
+  // старый статус ещё в пути) не перетирает более поздний.
+  if (delivery && (!r.delivery || delivery.at >= r.delivery.at)) {
+    if (!r.delivery || r.delivery.at !== delivery.at || r.delivery.ok !== delivery.ok) {
+      if (delivery.ok && delivery.verified) {
+        log(`пакет доставлен в папку проктора: ${delivery.dest} (sha256 сверен)`);
+      } else if (delivery.ok) {
+        log(`пакет записан в папку проктора: ${delivery.dest}, но sha256 копии НЕ сверен: `
+          + `${delivery.error || 'причина не сообщена'}`);
+      } else {
+        log(`пакет НЕ доставлен в папку проктора: ${delivery.error || 'причина не сообщена'}`);
+      }
+    }
+    r.delivery = delivery;
+  }
+}
+
+/**
+ * Папка проктора из hello/status ядра. Читаем оборонительно и только
+ * перечисленные поля: значение уходит в renderer и в текст согласия.
+ */
+function deliveryConfigFrom(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const source = textField(raw.source, 16);
+  return {
+    configured: raw.configured === true,
+    dir: textField(raw.dir, 1024),
+    source: ['default', 'config', 'env', 'cli'].indexOf(source) !== -1 ? source : '',
+    writable: raw.writable === true,
+    reason: textField(raw.reason, 400),
+    // ядро копирует пакет прямо сейчас: кнопка повтора на это время выключена
+    in_progress: raw.in_progress === true,
+  };
+}
+
+/** Итог deliver_package (handover.deliver_package) из status.package.delivery. */
+function deliveryResultFrom(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const at = Number(raw.at);
+  const bytes = Number(raw.bytes);
+  return {
+    ok: raw.ok === true,
+    dest: textField(raw.dest, 1024),
+    bytes: Number.isFinite(bytes) && bytes >= 0 ? Math.round(bytes) : 0,
+    sha256: /^[0-9a-f]{64}$/i.test(String(raw.sha256 || '')) ? String(raw.sha256).toLowerCase() : '',
+    verified: raw.verified === true,
+    at: Number.isFinite(at) ? at : 0,
+    error: textField(raw.error, 400),
+  };
+}
+
+/** hello / status: запомнить, что ядро знает о папке проктора. */
+function noteDeliveryConfig(msg) {
+  if (!msg || typeof msg !== 'object' || !('delivery' in msg)) return;
+  const next = deliveryConfigFrom(msg.delivery);
+  const prev = state.delivery;
+  state.delivery = next;
+  // в лог — только смена самой папки, не каждое «копирование идёт/закончено»
+  const same = (a, b) => JSON.stringify(Object.assign({}, a, { in_progress: null }))
+    === JSON.stringify(Object.assign({}, b, { in_progress: null }));
+  if (!next || (prev && same(prev, next))) return;
+  if (!next.configured) log('папка проктора не задана: пакет останется на этом компьютере');
+  else if (next.writable) log(`папка проктора: ${next.dir} (источник ${next.source || '—'}), запись проверена`);
+  else log(`ВНИМАНИЕ: папка проктора ${next.dir} недоступна: ${next.reason || 'причина не сообщена'}`);
+}
+
+/**
+ * Повтор доставки пакета (`deliver_package`) — по кнопке финального экрана.
+ *
+ * Условия проверяются здесь, а не только в renderer: кнопку можно нажать и
+ * из подменённой страницы. Повтор осмыслен ровно после конца сессии и когда
+ * пакет на диске; ядро проверит то же самое у себя и ответит ошибкой.
+ *
+ * ipc.js старой версии команды не знает и отбросит её в sendCommand(), поэтому
+ * при необходимости конверт собирается здесь же — тот же приём, что у
+ * screen_evidence. Ответ — {ok, reason?, message?}.
+ */
+function requestPackageDelivery() {
+  const r = state.sessionReport || freshSessionReport();
+  if (isLockedState(state.examState) || !r.ended) {
+    return { ok: false, reason: 'session_not_ended',
+      message: 'Доставка повторяется только после завершения сессии.' };
+  }
+  if (!fileReady(r.packagePath)) {
+    return { ok: false, reason: 'no_package',
+      message: 'Пакета на диске нет — доставлять нечего.' };
+  }
+  if (!link.connected) {
+    return { ok: false, reason: 'no_link',
+      message: 'Нет связи с ядром — повторить доставку сейчас нельзя.' };
+  }
+  const known = Array.isArray(IPC_COMMAND_NAMES) && IPC_COMMAND_NAMES.indexOf('deliver_package') !== -1;
+  const sent = known
+    ? link.sendCommand('deliver_package', {})
+    : link.send(SidecarLink.envelope(MsgType.COMMAND, { name: 'deliver_package' }));
+  log(`повтор доставки пакета ${r.packagePath} в папку проктора: ${sent ? 'запрошен' : 'не отправлен'}`);
+  return sent
+    ? { ok: true }
+    : { ok: false, reason: 'not_sent', message: 'Команда не ушла в ядро — попробуйте ещё раз.' };
 }
 
 /** То, что видит финальный экран. Готовность файлов — по диску, не на слово. */
@@ -2982,6 +3121,9 @@ function sessionReportInfo() {
     handoverReason: r.handoverReason,
     ended: Boolean(r.ended),
     canOpen: Boolean(r.ended && reportReady && examOver),
+    // Итог копирования в папку проктора; что папка вообще задана — в
+    // shellStatus().delivery.
+    delivery: r.delivery,
   };
 }
 
@@ -3098,7 +3240,12 @@ function registerIpc() {
   // Второй аргумент несёт actor/reason решений проктора. Без него команды
   // proctor_lock / proctor_release отклоняются сайдкаром (actor_required):
   // запись в журнале обязана называть человека, который решил.
-  ipcMain.handle('proctor:command', (e, name, opts) => link.sendCommand(name, opts || {}));
+  // `deliver_package` — повтор доставки пакета в папку проктора — идёт своей
+  // дорогой: условия проверяет main-процесс (requestPackageDelivery), и
+  // ответ — объект с причиной отказа, а не голое true/false.
+  ipcMain.handle('proctor:command', (e, name, opts) => (name === 'deliver_package'
+    ? requestPackageDelivery()
+    : link.sendCommand(name, opts || {})));
 
   // Телеметрия — поток, ответа не ждём (ipcMain.on, не handle).
   ipcMain.on('proctor:telemetry', (e, msg) => {
@@ -3231,6 +3378,7 @@ function wireSidecar() {
       state.lastVerdict = { action: msg.action, reason: msg.reason, score: msg.score };
     }
     if (msg.type === MsgType.STATUS) noteSessionReportFromStatus(msg);
+    if (msg.type === MsgType.HELLO || msg.type === MsgType.STATUS) noteDeliveryConfig(msg);
     if (msg.type === MsgType.EVENT) {
       const ev = msg.event && typeof msg.event === 'object' ? msg.event : null;
       noteSessionReportFromEvent(ev);
@@ -3468,6 +3616,11 @@ if (!app.requestSingleInstanceLock()) {
         + 'сайдкар запускается не ею (нет --spawn-sidecar). Передать файл нечему — '
         + 'подайте этот флаг тому процессу, который запускает ядро, иначе правила '
         + 'экзамена не будут заданы НИЧЕМ.');
+    }
+    if (CLI.deliverTo && !CLI.spawnSidecar) {
+      log(`ВНИМАНИЕ: --deliver-to ${CLI.deliverTo} подан оболочке, но сайдкар `
+        + 'запускается не ею (нет --spawn-sidecar). Передать флаг нечему — подайте '
+        + 'его ядру; что ядро знает о папке проктора, покажет предполётная проверка.');
     }
 
     registerIpc();

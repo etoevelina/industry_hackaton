@@ -26,6 +26,18 @@
 # только целостность при передаче. Приватный ключ лежит в keys/ здесь же,
 # поэтому журнал можно пересобрать и переподписать. Ключ вуза на машине
 # студента не хранится — только с ним подпись доказывает авторство.
+#
+# ПАПКА ПРОКТОРА. Второй способ передачи, и он не заменяет первый: сессия
+# пишется в каталог сессий как обычно (на этой машине), а ПОСЛЕ экзамена готовый
+# пакет <сессия>.proctor.zip копируется в папку проктора со сверкой sha256:
+#
+#   PROCTOR_DELIVER_DIR=/Volumes/PROCTOR ./scripts/run-safe.command
+#   ./scripts/run-safe.command --deliver-to /Volumes/PROCTOR
+#
+# Во время экзамена туда не пишется ничего, кроме пробного файла при старте.
+# Папка недоступна — экзамен НЕ останавливается: пакет остаётся здесь, а на
+# финальном экране есть кнопка «Повторить доставку». Куда пакет дошёл, скрипт
+# печатает в конце.
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
@@ -34,16 +46,21 @@ PORT=8787
 
 # Флаги передачи доказательств: из командной строки, иначе из окружения.
 # Собственные флаги скрипта (--no-lockdown, --no-kiosk) уходят оболочке, а эти
-# два — сайдкару, поэтому разбираем их здесь и из "$@" убираем.
+# три — сайдкару, поэтому разбираем их здесь и из "$@" убираем.
 SESSIONS_DIR="${PROCTOR_SESSIONS_DIR:-}"
 SIGNING_KEY="${PROCTOR_SIGNING_KEY:-}"
+DELIVER_DIR="${PROCTOR_DELIVER_DIR:-}"
 SHELL_ARGS=()
+# Флаг последним словом без значения: `shift 2` при одном аргументе не сдвигает
+# ничего, и цикл крутился бы вечно. Поэтому второй сдвиг — только если есть что.
 while [ $# -gt 0 ]; do
     case "$1" in
-        --sessions-dir)   SESSIONS_DIR="${2:-}"; shift 2 ;;
+        --sessions-dir)   SESSIONS_DIR="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
         --sessions-dir=*) SESSIONS_DIR="${1#*=}"; shift ;;
-        --signing-key)    SIGNING_KEY="${2:-}"; shift 2 ;;
+        --signing-key)    SIGNING_KEY="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
         --signing-key=*)  SIGNING_KEY="${1#*=}"; shift ;;
+        --deliver-to)     DELIVER_DIR="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+        --deliver-to=*)   DELIVER_DIR="${1#*=}"; shift ;;
         *)                SHELL_ARGS+=("$1"); shift ;;
     esac
 done
@@ -51,6 +68,11 @@ done
 HANDOVER_ARGS=()
 [ -n "$SESSIONS_DIR" ] && HANDOVER_ARGS+=(--sessions-dir "$SESSIONS_DIR")
 [ -n "$SIGNING_KEY" ] && HANDOVER_ARGS+=(--signing-key "$SIGNING_KEY")
+[ -n "$DELIVER_DIR" ] && HANDOVER_ARGS+=(--deliver-to "$DELIVER_DIR")
+
+# Отметка старта: в конце ищем записки о передаче (handover.json), написанные
+# ПОСЛЕ неё, — это сессии этого запуска, а не прошлых.
+START_TS="$(date +%s)"
 
 # Системный bash на macOS — 3.2, и под `set -u` раскрытие "${A[@]}" ПУСТОГО
 # массива не даёт пустоты: оно даёт «unbound variable» и выход из скрипта.
@@ -151,11 +173,86 @@ pkill -f "sidecar/main.py" 2>/dev/null
 pkill -f "industry_hackaton/node_modules/electron" 2>/dev/null
 sleep 1
 
+# Куда ушёл пакет этого запуска. Источник — handover.json каталога сессии: туда
+# ядро пишет итог каждой попытки доставки, в том числе повтора с финального
+# экрана. Догадка по содержимому папки проктора не годится: на общей шаре там
+# лежат пакеты всей группы.
+delivery_summary() {
+    echo
+    echo "--- Пакет и папка проктора ---"
+    "$PY" - "$START_TS" "${DELIVER_DIR:+1}" "${SESSIONS_DIR:-}" sessions <<'PYEOF' 2>/dev/null \
+        || echo "Итог не прочитан: смотрите финальный экран и handover.json в каталоге сессии."
+import json
+import sys
+from pathlib import Path
+
+since = float(sys.argv[1])
+configured = bool(sys.argv[2])
+found, seen = [], set()
+for base in sys.argv[3:]:
+    if not base:
+        continue
+    for note_path in Path(base).expanduser().glob("*/handover.json"):
+        try:
+            key = note_path.resolve()
+            mtime = note_path.stat().st_mtime
+            if key in seen or mtime < since:
+                continue
+            seen.add(key)
+            note = json.loads(note_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(note, dict):
+            found.append((mtime, note_path.parent, note))
+
+if not found:
+    print("Пакета этого запуска нет: тест не сдавали, или сессия не завершилась.")
+    sys.exit(0)
+for _, sdir, note in sorted(found, key=lambda item: item[0]):
+    pkg = note.get("package") if isinstance(note.get("package"), dict) else {}
+    local = str(pkg.get("package") or "") or "пакет не собран"
+    res = note.get("delivery") if isinstance(note.get("delivery"), dict) else None
+    print(f"Сессия:  {sdir.name}")
+    if res is None and not configured:
+        print(f"  Папка проктора не задана — пакет остался на этом компьютере: {local}")
+    elif res is None:
+        print("  Пакет НЕ доставлен: итог копирования не записан "
+              "(программу закрыли раньше, чем оно закончилось?).")
+        print(f"  Он лежит здесь: {local}")
+    elif res.get("ok") and res.get("verified"):
+        print(f"  Пакет доставлен в папку проктора: {res.get('dest')} (sha256 сверен)")
+    elif res.get("ok"):
+        print(f"  Пакет записан в папку проктора: {res.get('dest')}, но sha256 копии "
+              f"НЕ сверен: {res.get('error') or 'причина не записана'}")
+    else:
+        print(f"  Пакет НЕ доставлен: {res.get('error') or 'причина не записана'}")
+        print(f"  Он лежит здесь: {local}")
+    attempts = note.get("delivery_attempts")
+    if isinstance(attempts, list) and len(attempts) > 1:
+        print(f"  Попыток доставки: {len(attempts)}, все — в {sdir / 'handover.json'}")
+PYEOF
+}
+
 cleanup() {
+    # Второй Ctrl+C во время ожидания ниже — выход сразу, без повторной уборки.
+    trap - INT TERM
     echo
     echo "--- Останавливаю всё ---"
-    [ -n "${SIDECAR_PID:-}" ] && kill "$SIDECAR_PID" 2>/dev/null
     pkill -f "industry_hackaton/node_modules/electron" 2>/dev/null
+    if [ -n "${SIDECAR_PID:-}" ] && kill -0 "$SIDECAR_PID" 2>/dev/null; then
+        kill "$SIDECAR_PID" 2>/dev/null
+        # Сайдкар на сигнал закрывает незавершённую сессию, собирает пакет и
+        # копирует его в папку проктора. Ждём его, а не бросаем: иначе итог
+        # ниже читался бы раньше, чем ядро успело его записать.
+        waited=0
+        while kill -0 "$SIDECAR_PID" 2>/dev/null && [ "$waited" -lt 60 ]; do
+            [ "$waited" -eq 2 ] && echo "Жду, пока сайдкар закроет сессию и соберёт пакет…"
+            sleep 0.5
+            waited=$((waited + 1))
+        done
+    fi
+    delivery_summary
+    echo
     echo "Готово."
     exit 0
 }
@@ -175,6 +272,20 @@ else
     echo "Каталог сессий:  sessions/ на этой машине (по умолчанию)."
     echo "                 В классе указывайте диск проктора:"
     echo "                 --sessions-dir /Volumes/EXAM"
+fi
+if [ -n "$DELIVER_DIR" ]; then
+    echo "Папка проктора:  $DELIVER_DIR"
+    if [ -d "$DELIVER_DIR" ] && [ -w "$DELIVER_DIR" ]; then
+        echo "                 после экзамена пакет будет скопирован туда (со сверкой sha256)"
+    else
+        echo "                 ПРОВЕРЬТЕ — папки нет или она только для чтения."
+        echo "                 Экзамен это не остановит: сайдкар скажет точную причину,"
+        echo "                 пакет останется на этой машине, а доставку можно"
+        echo "                 повторить кнопкой на финальном экране."
+    fi
+else
+    echo "Папка проктора:  не задана — пакет останется на этой машине."
+    echo "                 Флешка или сетевая папка вуза: --deliver-to /Volumes/PROCTOR"
 fi
 if [ -n "$SIGNING_KEY" ]; then
     echo "Ключ подписи:    $SIGNING_KEY (ключ учреждения)"

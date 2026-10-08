@@ -110,6 +110,7 @@ from protocol import (  # noqa: E402
 from capture import CameraCapture  # noqa: E402
 from config import (  # noqa: E402
     ALLOW_SEARCH_ENV_VAR,
+    DELIVER_DIR_ENV_VAR,
     EXAM_PROFILE_ENV_VAR,
     EXAM_PROFILE_FILENAME,
     EXAM_PROFILE_PRESETS,
@@ -411,6 +412,11 @@ def launch_env_record(cfg: Any = None, env: dict[str, str] | None = None) -> dic
         # флагом CLI, а каталог — понижен до запасного (degraded_handover).
         record["sessions_dir_effective"] = str(getattr(cfg, "sessions_path", "") or "")
         record["sessions_dir_source"] = str(getattr(cfg, "sessions_dir_source", "") or "")
+        # Куда после экзамена копируется пакет. Не меняет доказательную базу,
+        # поэтому не в EVIDENCE_ENV_VARS, но разбору нужно знать, куда пакет
+        # ДОЛЖЕН был уйти, — сверить с тем, что лежит в папке проктора.
+        record["deliver_dir_effective"] = str(getattr(cfg, "deliver_path", "") or "")
+        record["deliver_dir_source"] = str(getattr(cfg, "deliver_dir_source", "") or "")
         record["signing_key_effective"] = str(getattr(cfg, "signing_key_abs", "") or "")
         record["signature_authority"] = str(getattr(cfg, "signature_authority", "") or "")
         record["launch_flags"] = dict(getattr(cfg, "launch_flags", {}) or {})
@@ -1286,7 +1292,19 @@ class ProctorSidecar:
             handover=self.handover,
         )
         #: Результат сборки последнего пакета доказательств (для статуса и отчёта).
+        #: После доставки в папку проктора в нём же лежит `delivery`.
         self.last_package: dict[str, Any] = {}
+        #: Каталог сессии последнего пакета: туда дописывается итог доставки
+        #: (`handover.json`), в том числе при повторе из оболочки.
+        self._package_dir: str = ""
+        #: Папка проктора: результат стартовой проверки (`prepare_delivery`).
+        #: Идёт в `hello` и в каждый `status` — предполётный экран показывает,
+        #: уйдёт ли пакет с этой машины, ДО начала экзамена.
+        self.delivery: dict[str, Any] = dict(getattr(cfg, "delivery_resolved", None)
+                                             or _delivery_unprobed(cfg))
+        #: Идёт копирование в папку проктора: повторная команда не запускает
+        #: вторую копию параллельно (иначе рядом легли бы `-2` и `-3`).
+        self._delivering: bool = False
         self.capture: CameraCapture | None = None
 
         self._engine_lock = threading.Lock()
@@ -2165,6 +2183,10 @@ class ProctorSidecar:
             # финальный экран показывает код сверки, а деградированную передачу
             # нужно показать студенту и проктору, а не спрятать в лог сайдкара.
             handover=dict(self.handover),
+            # Папка проктора: задана ли и принимает ли запись (стартовая проба).
+            # Предполётный экран показывает это ДО экзамена: «пакет будет
+            # скопирован в …» или «пакет останется на этом компьютере».
+            delivery=dict(self.delivery),
             # Профиль экзамена — при рукопожатии, потому что оболочке он нужен
             # ДО первой загрузки страницы: по `exam_url` она решает, открывать
             # внешний LMS или прежний локальный мок-тест, а по
@@ -2224,6 +2246,9 @@ class ProctorSidecar:
         snap["session_code_display"] = self.session.code_display
         snap["degraded_handover"] = self.session.degraded_handover
         snap["handover"] = dict(self.handover)
+        # Папка проктора: стартовая проба + идёт ли копирование прямо сейчас.
+        # Итог копирования — в `package.delivery`, когда оно закончилось.
+        snap["delivery"] = {**self.delivery, "in_progress": bool(self._delivering)}
         # Политика и открытый запрос решения идут в КАЖДОМ статусе: экран
         # ожидания проктора не должен зависеть от того, поймала ли оболочка
         # одно конкретное сообщение verdict.
@@ -2357,6 +2382,7 @@ class ProctorSidecar:
         self._reset_engines()
         self._store_open = False
         self.last_package = {}
+        self._package_dir = ""
         if self.store is not None:
             try:
                 await asyncio.to_thread(self.store.open_session, self.session.meta())
@@ -3517,8 +3543,47 @@ class ProctorSidecar:
             summary = self.session.summary()
             await self._build_report(summary)
             await self._build_package(summary)
+        elif name == "deliver_package":
+            await self._cmd_deliver_package(msg)
         else:
             await self._error("unknown_command", f"Неизвестная команда: {name}")
+
+    async def _cmd_deliver_package(self, msg: dict[str, Any]) -> None:
+        """Повторить копирование последнего пакета в папку проктора.
+
+        Та же функция, что и после сборки (`handover.deliver_package`): новое
+        имя при занятом, сверка sha256, ничего чужого не трогаем. Допустима
+        только после завершения сессии — во время экзамена с машины не уходит
+        ничего, так сказано студенту на экране согласия.
+        """
+        if self.session.active:
+            await self._error("bad_state", "Доставить пакет в папку проктора можно "
+                                           "только после завершения сессии")
+            return
+        path = str(self.last_package.get("package") or "") if self.last_package.get("ok") else ""
+        if not path or not Path(path).is_file():
+            await self._error("no_package", "Пакета для доставки нет: сессия ещё не "
+                                            "завершалась или пакет не собран")
+            return
+        if not self.delivery.get("configured"):
+            await self._error("delivery_not_configured", (
+                "Папка проктора не задана (--deliver-to или PROCTOR_DELIVER_DIR): "
+                f"пакет остался на этом компьютере: {path}"))
+            return
+        if self._delivering:
+            await self._error("delivery_busy", "Копирование в папку проктора уже идёт")
+            return
+        done = self.last_package.get("delivery") or {}
+        if done.get("ok"):
+            # Вторая копия того же пакета рядом с первой ломает единственную
+            # надёжную проверку на стороне проктора — число пакетов на шаре
+            # против списка группы. Повтор — только после неудачи.
+            await self._error("already_delivered", (
+                f"Пакет уже скопирован в папку проктора: {done.get('dest') or '—'}. "
+                f"Повторная копия не делается"))
+            return
+        await self._deliver(path, self._package_dir)
+        await self._broadcast(self._status_message())
 
     # ------------------------------------------------------------ поток CV
     def _cv_loop(self) -> None:
@@ -5680,6 +5745,7 @@ class ProctorSidecar:
                        "message": f"Пакет не собран: {exc}"}
 
         self.last_package = dict(payload)
+        self._package_dir = sdir
         note = {
             "created_at": handover_mod.now_iso(),
             "session_id": str(summary.get("session_id") or ""),
@@ -5689,6 +5755,13 @@ class ProctorSidecar:
             "signature_authority": self.cfg.signature_authority,
             "package": payload,
         }
+        # Пересборка (export_report) переписывает записку целиком, но прежние
+        # попытки доставки терять нельзя: «первая копия не ушла» — факт.
+        with contextlib.suppress(Exception):
+            prev = await asyncio.to_thread(handover_mod.read_handover_note, sdir)
+            attempts = prev.get("delivery_attempts")
+            if isinstance(attempts, list) and attempts:
+                note["delivery_attempts"] = attempts
         with contextlib.suppress(Exception):
             await asyncio.to_thread(handover_mod.write_handover_note, sdir, note)
 
@@ -5703,7 +5776,76 @@ class ProctorSidecar:
                 f"Пакет доказательств не собран: "
                 f"{payload.get('reason') or 'причина не определена'}. "
                 f"Отчёт и журнал на месте — забирайте каталог сессии целиком: {sdir}"))
-        return payload
+
+        # Доставка в папку проктора — ПОСЛЕ записки о пакете: итог дописывается
+        # в тот же handover.json. Только по завершённой сессии: export_report
+        # посреди экзамена пересобирает пакет локально, но с машины во время
+        # экзамена не уходит ничего — так сказано на экране согласия.
+        # SESSION_ENDED к этому моменту уже разослан, поэтому итог доставки
+        # уходит оболочке отдельным status.
+        if self.delivery.get("configured"):
+            if self.session.active:
+                log.info("сессия идёт: пакет в папку проктора не копируется до её "
+                         "завершения")
+            elif payload.get("ok"):
+                await self._deliver(str(payload.get("package") or ""), sdir)
+                await self._broadcast(self._status_message())
+            else:
+                failed = {"ok": False, "dest": "", "bytes": 0, "sha256": "",
+                          "verified": False, "at": time.time(),
+                          "error": ("пакет не собран — копировать в папку проктора "
+                                    "нечего: " + str(payload.get("reason")
+                                                     or "причина не определена"))}
+                self.last_package["delivery"] = failed
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(handover_mod.record_delivery, sdir, failed, "")
+                await self._broadcast(self._status_message())
+        return dict(self.last_package)
+
+    async def _deliver(self, package: str, session_dir: str) -> dict[str, Any]:
+        """Скопировать пакет в папку проктора, записать итог и сказать о нём.
+
+        Копирует `handover.deliver_package`: исключительное создание, соседнее
+        имя при занятом, fsync, сверка sha256 перечитыванием. Итог — в
+        `last_package["delivery"]` (оттуда в `status.package.delivery`) и в
+        `handover.json` каталога сессии (`delivery` + `delivery_attempts`).
+        Ошибкой (`error`) неудачу не рассылаем: оболочка показывает её строкой
+        на финальном экране по `status`, а всплывающее «Сбой наблюдения» здесь
+        было бы неправдой — наблюдение ни при чём.
+        """
+        target = str(self.cfg.deliver_path or self.delivery.get("dir") or "")
+        # Две копии одновременно не делаем: пересборка (export_report) во время
+        # повтора из оболочки ждёт его окончания. Между проверкой и флагом нет
+        # await, поэтому в одном цикле событий гонки здесь нет.
+        while self._delivering:
+            await asyncio.sleep(0.2)
+        self._delivering = True
+        try:
+            result = await asyncio.to_thread(handover_mod.deliver_package,
+                                             package, target)
+        except Exception as exc:  # deliver_package не бросает, но страхуемся
+            log.exception("доставка пакета в папку проктора упала")
+            result = {"ok": False, "dest": "", "bytes": 0, "sha256": "",
+                      "verified": False, "at": time.time(),
+                      "error": f"доставка не удалась: {exc}"}
+        finally:
+            self._delivering = False
+        result = dict(result)
+        self.last_package["delivery"] = result
+        if session_dir:
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(handover_mod.record_delivery,
+                                        session_dir, result, package)
+        if result.get("ok") and result.get("verified"):
+            log.info("пакет доставлен в папку проктора: %s (sha256 сверен: %s…)",
+                     result.get("dest"), str(result.get("sha256") or "")[:16])
+        elif result.get("ok"):
+            log.warning("пакет записан в папку проктора: %s, но НЕ сверен: %s",
+                        result.get("dest"), result.get("error"))
+        else:
+            log.warning("пакет НЕ доставлен в папку проктора: %s. Он лежит здесь: %s",
+                        result.get("error") or "причина не определена", package)
+        return result
 
     def _chain_state(self) -> dict[str, Any]:
         """Состояние цепочки для манифеста: genesis, голова, число записей."""
@@ -5811,6 +5953,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--sessions-dir", dest="sessions_dir", default=None, metavar="PATH",
         help="каталог, куда писать сессии: сетевая папка вуза или USB-носитель. "
              "Приоритет: этот флаг > PROCTOR_SESSIONS_DIR > config.json > sessions",
+    )
+    handover.add_argument(
+        "--deliver-to", "--deliver-dir", dest="deliver_to", default=None, metavar="PATH",
+        help="папка проктора (флешка или сетевая папка вуза), куда ПОСЛЕ экзамена "
+             "копируется готовый пакет <session_id>.proctor.zip со сверкой sha256. "
+             "Сессия при этом пишется в каталог сессий как обычно. Относительный "
+             "путь — от корня репозитория, как у --sessions-dir. Приоритет: этот "
+             "флаг > PROCTOR_DELIVER_DIR > config.json:deliver_dir > не задана",
     )
     handover.add_argument(
         "--signing-key", dest="signing_key", default=None, metavar="PATH",
@@ -5974,6 +6124,9 @@ def apply_cli(cfg: ProctorConfig, args: argparse.Namespace) -> None:
     if getattr(args, "sessions_dir", None):
         cfg.sessions_dir = str(args.sessions_dir)
         cfg.sessions_dir_source = "cli"
+    if getattr(args, "deliver_to", None):
+        cfg.deliver_dir = str(args.deliver_to)
+        cfg.deliver_dir_source = "cli"
     if getattr(args, "signing_key", None):
         cfg.signing_key_path = str(args.signing_key)
     if getattr(args, "no_package", False):
@@ -6066,6 +6219,71 @@ def apply_cli(cfg: ProctorConfig, args: argparse.Namespace) -> None:
 
     if getattr(args, "risk_lock", None) is not None:
         cfg.risk_lock = float(args.risk_lock)
+
+
+def _delivery_unprobed(cfg: Any, reason: str = "") -> dict[str, Any]:
+    """Объект `delivery` без стартовой пробы: папка не задана или проверить нечем.
+
+    Нужен и ядру, собранному не через `main()` (тесты, мок): `hello` обязан
+    нести этот объект всегда, а «не проверялась» — не то же, что «доступна».
+    """
+    path = getattr(cfg, "deliver_path", None)
+    configured = bool(path)
+    return {
+        "configured": configured,
+        "dir": str(path or ""),
+        "source": (str(getattr(cfg, "deliver_dir_source", "") or "default")
+                   if configured else "default"),
+        "writable": False,
+        "reason": (reason or "папка проктора при старте не проверялась") if configured else "",
+        "created": False,
+        "probe_removed": None,
+    }
+
+
+def prepare_delivery(cfg: ProctorConfig) -> dict[str, Any]:
+    """Стартовая проверка папки проктора (`--deliver-to`). Экзамен НЕ блокирует.
+
+    Папка проктора — не каталог сессий: сессия пишется локально, а туда после
+    экзамена копируется только готовый пакет. Поэтому недоступная папка здесь
+    не причина не начинать: пакет останется на машине, доставку можно
+    повторить после экзамена командой `deliver_package`. Но сказать об этом
+    обязаны ДО экзамена — объект уходит в `hello` и в каждый `status`.
+    """
+    path = cfg.deliver_path
+    if path is None:
+        info = _delivery_unprobed(cfg)
+        log.info("папка проктора не задана (--deliver-to или %s): пакет останется "
+                 "на этом компьютере рядом с каталогом сессии", DELIVER_DIR_ENV_VAR)
+    elif handover_mod is None:
+        info = _delivery_unprobed(cfg, "модуль передачи доказательств недоступен")
+        log.warning("папка проктора %s задана, но модуль storage/handover.py "
+                    "недоступен: пакет скопирован не будет", path)
+    else:
+        info = handover_mod.probe_deliver_dir(path, cfg.deliver_dir_source)
+        label = handover_mod.deliver_source_label(str(info.get("source") or ""))
+        if info.get("created"):
+            log.warning("папки проктора %s не было — она создана. Если это точка "
+                        "монтирования флешки или сетевого диска, проверьте, что "
+                        "носитель подключён: иначе пакет ляжет на локальный диск "
+                        "этой же машины", info.get("dir"))
+        if info.get("writable"):
+            log.info("папка проктора: %s (%s). Запись проверена: после экзамена "
+                     "пакет будет скопирован туда со сверкой sha256",
+                     info.get("dir"), label)
+            if info.get("probe_removed") is False:
+                log.info("пробный файл в папке проктора удалить не удалось — папка "
+                         "похожа на append-only (так и задумано для шары)")
+        else:
+            log.warning("папка проктора %s (%s) недоступна: %s. Экзамен НЕ "
+                        "останавливается: пакет останется на этом компьютере, "
+                        "доставку можно повторить после экзамена",
+                        info.get("dir"), label, info.get("reason") or "причина не определена")
+    if info.get("configured") and not cfg.package_on_end:
+        log.warning("задана папка проктора, но пакет не собирается (--no-package): "
+                    "доставлять будет нечего")
+    cfg.delivery_resolved = info
+    return info
 
 
 def prepare_handover(cfg: ProctorConfig) -> bool:
@@ -6190,6 +6408,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if not prepare_handover(cfg):
         return 2
+    prepare_delivery(cfg)
 
     # Профиль экзамена читается ЗДЕСЬ, после разрешения каталога проктора:
     # последний источник в приоритете — `exam-profile.json` в этом каталоге, и

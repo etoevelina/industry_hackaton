@@ -34,7 +34,7 @@ WebSocket-сервер поднимает **сайдкар** на `ws://127.0.0.
 | `calibrate` | `{stage:"gaze_center"\|"gaze_grid"\|"identity"\|"voice", point:[x,y]\|null}` |
 | `telemetry` | `{kind:"keystroke"\|"paste"\|"answer_submit"\|"question_shown", question_id:str, ...}` |
 | `shell_event` | `{kind:<EventKind>, detail:dict}` — оболочка шлёт уже готовый EventKind |
-| `command` | `{name:"snapshot"\|"reset_risk"\|"export_report"\|"proctor_lock"\|"proctor_release", actor:str, reason:str}` |
+| `command` | `{name:"snapshot"\|"reset_risk"\|"export_report"\|"proctor_lock"\|"proctor_release"\|"deliver_package", actor:str, reason:str}` |
 | `screen_evidence` | `{event_id:str, mime:"image/jpeg", data_b64:str, width:int, height:int, captured_at:float, source:"exam_view"\|"main_window"}` — или без `data_b64` и с `error:str`, если снять окно не удалось |
 
 ### Калибровка — детальнее
@@ -68,6 +68,49 @@ WebSocket-сервер поднимает **сайдкар** на `ws://127.0.0.
 - `paste`: `{question_id, ts, length:int, source:"clipboard"}`
 - `answer_submit`: `{question_id, ts, length:int, time_to_answer_ms:int, typing_stats:{mean_ms,std_ms,chars}}`
 - `question_shown`: `{question_id, ts, difficulty:int}`
+
+## Доставка пакета в папку проктора
+
+Пакет `<session_id>.proctor.zip` собирается рядом с каталогом сессии (`storage/handover.py`,
+`build_package`). Чтобы он дошёл до экзаменатора, проктор задаёт **папку проктора** — флешку
+или сетевую папку вуза. Это НЕ каталог сессий: сессия по-прежнему пишется в каталог сессий
+(`--sessions-dir`, обычно локально), а в папку проктора после экзамена копируется только
+готовый пакет. Во время экзамена туда не пишется ничего, кроме пробного файла при старте.
+Сетевых вызовов ядро не делает: это копирование файла по пути, который смонтировала ОС.
+
+**Настройка.** `deliver_dir` в `config.json` < `PROCTOR_DELIVER_DIR` < `--deliver-to PATH`
+(по умолчанию `""` — доставки нет, поведение прежнее). Источник пишется в `source`. Относительный
+путь ядро разрешает от корня репозитория (как `--sessions-dir`); оболочка с `--spawn-sidecar`
+передаёт свой `--deliver-to` уже абсолютным.
+
+**Стартовая проба** — объект `delivery` в `hello` и в КАЖДОМ `status`:
+`{configured:bool, dir:str, source:"default"|"config"|"env"|"cli", writable:bool, reason:str,
+created:bool, probe_removed:bool|null}` (+ в `status` — `in_progress:bool`, идёт ли копирование).
+Пробный файл создаётся с исключительным созданием и удаляется. Папки нет, а её родитель есть —
+папка создаётся (`created:true`, ядро говорит об этом в логе: точка монтирования без носителя —
+это локальный диск). Недоступная папка экзамен НЕ блокирует: пакет останется на машине.
+
+**Доставка** — `handover.deliver_package(zip, dir)` после сборки пакета, только по завершённой
+сессии. Результат: `{ok:bool, dest:str, bytes:int, sha256:str, verified:bool, at:float, error:str}`.
+Имя — имя пакета, открывается с `xb`; занято — `<id>-2.proctor.zip`, `-3` … В папке проктора
+ничего не перезаписывается, не переименовывается и не удаляется, кроме недописанного (или не
+сошедшегося по sha256) файла этой же попытки. После `fsync` копия перечитывается, sha256
+сравнивается с локальным пакетом: `verified:true` только при совпадении. Перечитать не дали
+(шара «только запись») — `ok:true, verified:false` и причина в `error`: оболочка пишет «sha256
+сверен» ТОЛЬКО при `verified:true`. Пакет не собран — `ok:false` с причиной, копировать нечего.
+
+- оболочке: `status.package.delivery` (после `SESSION_ENDED` приходит отдельный `status`, когда
+  копирование закончилось); `delivery.configured:false` — папка не задана, `package.delivery`
+  тогда нет;
+- в каталоге сессии: `handover.json` — `delivery` (последняя попытка) и `delivery_attempts`
+  (все попытки по порядку, каждая с `package` — локальным путём пакета).
+
+**Повтор** — `command {name:"deliver_package"}`: та же функция над последним пакетом, итог —
+новым `status`. Только после завершения сессии, при собранном пакете и после НЕУДАЧНОЙ попытки
+(вторая копия того же пакета на шаре ломает сверку числа пакетов со списком группы); иначе
+`error` с `code:"bad_state"|"no_package"|"delivery_not_configured"|"delivery_busy"|"already_delivered"`.
+`export_report` после завершения сессии пересобирает пакет и копирует его ещё раз (соседнее имя);
+во время сессии пакет пересобирается только локально.
 
 ## Доказательства к инциденту: кадр камеры и снимок окна экзамена
 

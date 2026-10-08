@@ -5,7 +5,7 @@
 все?». До него ответ был «никак»: отчёт, журнал, кадры и подпись оставались в
 `sessions/` на машине студента, а `export_report` лишь пересобирал HTML там же.
 
-Здесь четыре независимые вещи.
+Здесь пять независимых вещей.
 
 1. КАТАЛОГ СЕССИЙ ЗАДАЁТ ПРОКТОР (`resolve_sessions_dir`).
    В компьютерном классе каталог указывают на сетевую папку вуза или на
@@ -88,6 +88,34 @@
    он приносит ключ вуза на атакуемую машину. Меняется класс ущерба — вместо
    подделки одного отчёта утечка одного ключа обесценивает все отчёты потока.
 
+5. ДОСТАВКА В ПАПКУ ПРОКТОРА (`probe_deliver_dir`, `deliver_package`).
+   Отдельно от каталога сессий: сессия пишется ЛОКАЛЬНО (обычный каталог
+   сессий), а в папку проктора — флешку или сетевую папку вуза, `--deliver-to`
+   / `PROCTOR_DELIVER_DIR` / `config.json:deliver_dir` — после экзамена
+   КОПИРУЕТСЯ один готовый пакет. Во время экзамена туда не пишется ничего,
+   кроме пробного файла при старте.
+
+   Копия делается так, чтобы ничего чужого не тронуть: имя открывается с
+   исключительным созданием (`xb`), занятое имя -> соседнее `-2`, `-3` …,
+   ничего в папке не переименовывается, не удаляется и не перезаписывается,
+   кроме недописанной (или не сошедшейся по sha256) копии этой же попытки.
+   После `fsync` копия перечитывается и сверяется по sha256 с локальным пакетом.
+
+   ЧЕГО ЭТО НЕ ДАЁТ — те же оговорки, что в п. 1, плюс свои.
+   * Копию делает процесс на машине студента. Удалить её из папки потом может
+     любой, у кого есть право удаления на шаре, — append-only по-прежнему
+     требование к развёртыванию, а не свойство кода.
+   * «sha256 сверен» значит: файл, который ОС отдаёт по этому пути после
+     `fsync`, совпал с пакетом. Перечитывание может прийти из кеша ОС, а не с
+     носителя; извлечённая без «безопасного извлечения» флешка всё ещё может
+     потерять хвост. Окончательная проверка — `verify_report.py` на машине
+     экзаменатора.
+   * Папку, которой нет, стартовая проверка создаёт, если существует её
+     родитель. Если это точка монтирования неподключённой флешки, папка
+     появится на ЛОКАЛЬНОМ диске и «доставка» туда ничего не доставит. Поэтому
+     факт создания говорится в логе вслух, а сама доставка папку уже не
+     создаёт: пропала папка — это ошибка доставки, а не повод завести новую.
+
 Своей криптографии здесь нет: sha256 из `hashlib`, подпись — `sign_report()`
 из `storage/report.py` (Ed25519 через `cryptography`).
 """
@@ -97,6 +125,7 @@ import base64
 import hashlib
 import json
 import os
+import time
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -112,6 +141,10 @@ SESSIONS_DIR_ENV_VAR = "PROCTOR_SESSIONS_DIR"
 
 #: Переменная окружения с ключом вуза — парная к `--signing-key`.
 SIGNING_KEY_ENV_VAR = "PROCTOR_SIGNING_KEY"
+
+#: Переменная окружения с папкой проктора — парная к `--deliver-to`. Туда
+#: после экзамена КОПИРУЕТСЯ готовый пакет; сама сессия пишется локально.
+DELIVER_DIR_ENV_VAR = "PROCTOR_DELIVER_DIR"
 
 #: Версия формата пакета. Меняется при любом изменении состава manifest.json.
 PACKAGE_FORMAT = "qih-proctor-package/v1"
@@ -154,6 +187,16 @@ HANDOVER_NAME = "handover.json"
 
 #: Файл-проба для проверки каталога на запись.
 _PROBE_NAME = ".proctor-write-probe"
+
+#: Файл-проба для папки проктора. Имя своё: в папке проктора могут лежать
+#: пробы других машин класса, и путать их с пробой каталога сессий незачем.
+_DELIVER_PROBE_NAME = ".proctor-deliver-probe"
+
+#: Сколько соседних имён (`-2`, `-3` …) пробовать, прежде чем сдаться.
+_DELIVER_MAX_SUFFIX = 999
+
+#: Кусок потокового копирования: пакет с клипами в память целиком не лезет.
+_DELIVER_CHUNK = 1 << 20
 
 # --- семантика подписи -----------------------------------------------------
 AUTHORITY_SELF = "self_signed"
@@ -524,6 +567,12 @@ def signing_key_from_env(env: dict[str, str] | None = None) -> str:
     """Ключ подписи из `PROCTOR_SIGNING_KEY`. Пусто — переменной нет."""
     source = os.environ if env is None else env
     return str(source.get(SIGNING_KEY_ENV_VAR, "") or "").strip()
+
+
+def deliver_dir_from_env(env: dict[str, str] | None = None) -> str:
+    """Папка проктора из `PROCTOR_DELIVER_DIR`. Пусто — переменной нет."""
+    source = os.environ if env is None else env
+    return str(source.get(DELIVER_DIR_ENV_VAR, "") or "").strip()
 
 
 # ===========================================================================
@@ -902,6 +951,274 @@ def _sign_manifest(manifest_path: Path, key_path: str | Path | None,
     except Exception:
         return None
     return Path(str(produced)) if produced else None
+
+
+# ===========================================================================
+# Доставка пакета в папку проктора (п. 5 описания модуля)
+# ===========================================================================
+_DELIVER_SOURCE_LABELS = {
+    "cli": "флаг --deliver-to",
+    "env": f"переменная {DELIVER_DIR_ENV_VAR}",
+    "config": "config.json",
+    "default": "не задана",
+}
+
+
+def deliver_source_label(source: str) -> str:
+    return _DELIVER_SOURCE_LABELS.get(str(source or "default"), str(source))
+
+
+def probe_deliver_dir(path: str | Path | None,
+                      source: str = "default") -> dict[str, Any]:
+    """Стартовая проверка папки проктора: есть ли она и принимает ли запись.
+
+    Проверка — пробной записью, как у каталога сессий: смонтированная шара
+    может отвечать на stat и быть read-only. Отличие от `probe_dir` в одном:
+    папку здесь создаём, только если её нет, а РОДИТЕЛЬ есть, и не создаём
+    цепочку каталогов. Иначе `/media/usb/exam`, набранный при вынутой флешке,
+    молча превращался бы в каталог на локальном диске. Даже одноуровневое
+    создание этот риск не убирает (точка монтирования без носителя — обычный
+    локальный каталог), поэтому факт создания возвращается как `created` и
+    вызывающий обязан сказать о нём вслух.
+
+    Пробный файл открывается с исключительным созданием: ни один чужой файл
+    проба затереть не может. Не удалился (append-only шара) — это не ошибка,
+    а факт `probe_removed: False`.
+
+    Возвращает {"configured", "dir", "source", "writable", "reason",
+    "created", "probe_removed"}. Никогда не бросает.
+    """
+    wanted = str(path or "").strip()
+    out: dict[str, Any] = {
+        "configured": bool(wanted), "dir": "",
+        "source": str(source or "default") if wanted else "default",
+        "writable": False, "reason": "", "created": False, "probe_removed": None,
+    }
+    if not wanted:
+        return out
+    try:
+        target = Path(wanted).expanduser().absolute()
+    except (OSError, RuntimeError, ValueError) as exc:
+        out["dir"] = wanted
+        out["reason"] = f"путь не разбирается: {_oserror(exc)}"
+        return out
+    out["dir"] = str(target)
+    try:
+        if not target.exists():
+            if not target.parent.is_dir():
+                out["reason"] = (f"папки нет, и нет её родителя {target.parent} — "
+                                 f"не подключён носитель или сетевой диск?")
+                return out
+            target.mkdir()
+            out["created"] = True
+    except OSError as exc:
+        out["reason"] = f"папки нет, создать её не удалось: {_oserror(exc)}"
+        return out
+    if not target.is_dir():
+        out["reason"] = "путь существует, но это не папка"
+        return out
+    probe = target / f"{_DELIVER_PROBE_NAME}-{os.getpid()}-{time.time_ns()}"
+    try:
+        handle = open(probe, "xb")
+    except OSError as exc:
+        out["reason"] = f"папка не принимает запись: {_oserror(exc)}"
+        return out
+    try:
+        with handle:
+            handle.write(b"proctor")
+    except OSError as exc:
+        # Файл создан, но не записан (место кончилось): он наш — убираем.
+        _drop_own_file(probe)
+        out["reason"] = f"папка не принимает запись: {_oserror(exc)}"
+        return out
+    out["writable"] = True
+    try:
+        probe.unlink()
+        out["probe_removed"] = True
+    except OSError:
+        out["probe_removed"] = False
+    return out
+
+
+def _numbered_name(name: str, n: int) -> str:
+    """`X.proctor.zip` -> `X-2.proctor.zip`: двойное расширение сохраняется."""
+    if n <= 1:
+        return name
+    if name.endswith(PACKAGE_SUFFIX):
+        return f"{name[:-len(PACKAGE_SUFFIX)]}-{n}{PACKAGE_SUFFIX}"
+    stem = Path(name)
+    return f"{stem.stem}-{n}{stem.suffix}"
+
+
+def _drop_own_file(path: Path, what: str = "недописанный файл") -> str:
+    """Удалить файл, созданный ЭТОЙ попыткой. -> '' или оговорка для ошибки.
+
+    Единственное, что доставка вправе удалить в папке проктора. Файла уже нет
+    (папка отвалилась вместе с ним) — значит и оставлять нечего.
+    """
+    try:
+        path.unlink()
+        return ""
+    except FileNotFoundError:
+        return ""
+    except OSError as exc:
+        return (f"; {what} {path.name} остался в папке проктора "
+                f"(удалить не удалось: {_oserror(exc)})")
+
+
+def _fsync_dir(path: Path) -> None:
+    """Сбросить запись каталога на носитель. Где так нельзя (Windows) — молча."""
+    if not hasattr(os, "O_DIRECTORY"):
+        return
+    with _suppress():
+        fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def _short(exc: BaseException) -> str:
+    """Причина отказа коротко и по-русски, где перевод известен."""
+    if isinstance(exc, OSError):
+        return _oserror(exc)
+    return str(exc)[:200] or exc.__class__.__name__
+
+
+def deliver_package(zip_path: str | Path, deliver_dir: str | Path) -> dict[str, Any]:
+    """Скопировать готовый пакет в папку проктора и сверить копию по sha256.
+
+    Правила, ради которых функция и существует:
+      * имя назначения — имя пакета; открывается с исключительным созданием
+        (`xb`), занятое имя -> `-2`, `-3` … перед `.proctor.zip`. В папке
+        проктора НИЧЕГО не перезаписывается, не переименовывается и не
+        удаляется — кроме недописанного или не сошедшегося файла, созданного
+        этой же попыткой;
+      * копирование потоком, затем `flush` + `os.fsync`, закрытие;
+      * копия открывается заново и её sha256 сравнивается с sha256 локального
+        пакета (`verified`). Не сошлось — копия удаляется, `ok: False`.
+        Перечитать не дали (шара «только запись») — `ok: True`,
+        `verified: False` и причина в `error`: файл записан, но сверен НЕ был.
+
+    Пакет и папка — те, что переданы. Папку здесь НЕ создаём: пропала папка к
+    концу экзамена — значит отключён носитель или шара, и новая папка на
+    локальном диске под тем же путём была бы «доставкой» в никуда.
+
+    Возвращает {"ok", "dest", "bytes", "sha256", "verified", "at", "error"}:
+    `sha256` — локального пакета (то, с чем сверяли), `bytes` — сколько
+    скопировано, `at` — время окончания попытки (epoch). Никогда не бросает.
+    """
+    out: dict[str, Any] = {"ok": False, "dest": "", "bytes": 0, "sha256": "",
+                           "verified": False, "at": 0.0, "error": ""}
+
+    def done(error: str = "") -> dict[str, Any]:
+        out["error"] = error
+        out["at"] = time.time()
+        return out
+
+    wanted = str(deliver_dir or "").strip()
+    if not wanted:
+        return done("папка проктора не задана")
+    raw_src = str(zip_path or "").strip()
+    src = Path(raw_src).expanduser() if raw_src else Path()
+    if not raw_src or not src.is_file():
+        return done(f"локального пакета нет: {raw_src or '—'}")
+    dest_dir = Path(wanted).expanduser()
+    if not dest_dir.is_dir():
+        return done(f"папка проктора недоступна: нет папки {dest_dir} "
+                    f"(отключён носитель или сетевой диск?)")
+
+    # Пакет уже лежит в папке проктора (каталог сессий задан туда же): вторая
+    # копия рядом с первой никому не нужна. Сверять — с самим собой.
+    same = False
+    with _suppress():
+        same = os.path.samefile(str(src.parent), str(dest_dir))
+    if same:
+        try:
+            out["sha256"] = sha256_file(src)
+            out["bytes"] = src.stat().st_size
+        except OSError as exc:
+            return done(f"пакет не читается: {_oserror(exc)}")
+        out.update(ok=True, dest=str(src), verified=True)
+        return done()
+
+    handle = None
+    dest: Path | None = None
+    for n in range(1, _DELIVER_MAX_SUFFIX + 1):
+        candidate = dest_dir / _numbered_name(src.name, n)
+        try:
+            handle = open(candidate, "xb")
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            return done(f"папка проктора не принимает запись: {_oserror(exc)}")
+        dest = candidate
+        break
+    if handle is None or dest is None:
+        return done(f"в папке проктора заняты все имена от {src.name} до "
+                    f"{_numbered_name(src.name, _DELIVER_MAX_SUFFIX)}")
+
+    digest = hashlib.sha256()
+    copied = 0
+    try:
+        with handle:
+            with open(src, "rb") as reader:
+                for block in iter(lambda: reader.read(_DELIVER_CHUNK), b""):
+                    handle.write(block)
+                    digest.update(block)
+                    copied += len(block)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception as exc:  # любая ошибка посреди копии — убрать СВОЙ хвост
+        left = _drop_own_file(dest)
+        return done(f"копирование прервано: {_short(exc)}{left}")
+    _fsync_dir(dest_dir)
+
+    out["bytes"] = copied
+    out["sha256"] = digest.hexdigest()
+    try:
+        dest_size = dest.stat().st_size
+        dest_sha = sha256_file(dest)
+    except OSError as exc:
+        out.update(ok=True, dest=str(dest))
+        return done(f"копия записана, но перечитать её для сверки sha256 не "
+                    f"удалось: {_oserror(exc)}")
+    if dest_size != copied or dest_sha != out["sha256"]:
+        left = _drop_own_file(dest, "несовпавшая копия")
+        return done(f"копия в папке проктора не совпала с пакетом по sha256 "
+                    f"({dest_size} из {copied} байт){left or ' и удалена'}")
+    out.update(ok=True, dest=str(dest), verified=True)
+    return done()
+
+
+def read_handover_note(session_dir: str | Path) -> dict[str, Any]:
+    """Прочитать `handover.json` каталога сессии. Нет или битый — пустой dict."""
+    try:
+        raw = json.loads((Path(str(session_dir)) / HANDOVER_NAME)
+                         .read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def record_delivery(session_dir: str | Path, result: dict[str, Any],
+                    package: str = "") -> str:
+    """Дописать итог доставки в `handover.json`. Возвращает путь ('' при отказе).
+
+    `delivery` — последняя попытка, `delivery_attempts` — все попытки по
+    порядку (повтор из оболочки не стирает прежний отказ: проктору важно, что
+    первая копия НЕ ушла и почему). Цепочка к этому моменту закрыта, поэтому
+    место этой записи — рядом с ней, как и у записки о пакете.
+    """
+    note = read_handover_note(session_dir)
+    entry = dict(result or {})
+    attempts = note.get("delivery_attempts")
+    attempts = list(attempts) if isinstance(attempts, list) else []
+    attempts.append({**entry, "package": str(package or "")})
+    note["delivery"] = entry
+    note["delivery_attempts"] = attempts
+    note["delivery_updated_at"] = now_iso()
+    return write_handover_note(session_dir, note)
 
 
 # ===========================================================================
@@ -1287,6 +1604,9 @@ __all__ = [
     "HandoverTarget", "resolve_sessions_dir", "check_writable", "probe_dir",
     "append_only_note", "free_space_mb",
     "sessions_dir_from_env", "signing_key_from_env", "source_label",
+    "DELIVER_DIR_ENV_VAR", "deliver_dir_from_env", "deliver_source_label",
+    "probe_deliver_dir", "deliver_package", "read_handover_note",
+    "record_delivery",
     "PackageResult", "build_manifest", "build_package", "write_handover_note",
     "sha256_file", "read_manifest", "extract_package", "verify_manifest",
     "expected_code", "cross_check_manifest", "package_authority", "is_package",

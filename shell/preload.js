@@ -40,10 +40,13 @@ const CALIBRATION_STAGES = Object.freeze(['gaze_center', 'gaze_grid', 'identity'
  * Полный словарь команд (sidecar/protocol.py). `proctor_lock` /
  * `proctor_release` — решение человека над приостановленным экзаменом; без
  * них приостановка по порогу блокировки была неснимаема никем, потому что
- * команда отсекалась здесь.
+ * команда отсекалась здесь. `deliver_package` — повтор копирования пакета в
+ * папку проктора с финального экрана; условия (сессия закрыта, пакет на
+ * диске) проверяет main-процесс, ответ — {ok, reason?, message?}.
  */
 const COMMAND_NAMES = Object.freeze([
   'snapshot', 'reset_risk', 'export_report', 'proctor_lock', 'proctor_release',
+  'deliver_package',
 ]);
 const ACTOR_REQUIRED = Object.freeze(['proctor_lock', 'proctor_release']);
 
@@ -244,7 +247,7 @@ const api = {
     return ipcRenderer.invoke('proctor:calibrate', stage, pt);
   },
 
-  /** name: snapshot | reset_risk | export_report. */
+  /** name: snapshot | reset_risk | export_report | proctor_lock | proctor_release | deliver_package. */
   command: (name, opts) => {
     if (!COMMAND_NAMES.includes(name)) return Promise.resolve(false);
     const o = opts || {};
@@ -261,6 +264,8 @@ const api = {
   snapshot: () => ipcRenderer.invoke('proctor:command', 'snapshot'),
   resetRisk: () => ipcRenderer.invoke('proctor:command', 'reset_risk'),
   exportReport: () => ipcRenderer.invoke('proctor:command', 'export_report'),
+  /** Повторить копирование последнего пакета в папку проктора. */
+  deliverPackage: () => ipcRenderer.invoke('proctor:command', 'deliver_package'),
   /**
    * Решение проктора над приостановленным экзаменом.
    * `actor` обязателен: сайдкар отвечает ошибкой actor_required без него.

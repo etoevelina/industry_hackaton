@@ -1709,6 +1709,30 @@ code {
 .alert--warn { --tone: var(--warning); }
 .sheet .alert--warn { border-color: var(--warning); }
 
+/* Доставка пакета в папку проктора. Исход назван словами в самом сообщении;
+   полоса и рамка его только дублируют. Кислотный на светлом — лишь полосой,
+   рамка «доставлен» — затемнённым акцентом (tokens.css, запрет гайда). */
+/* отступы задаёт gap экрана; .alert + .alert добавил бы свои 12px за скрытым
+   предупреждением о деградации */
+.alert.delivery { margin-top: 0; }
+.alert.delivery[data-state="ok"] { --tone: var(--risk-ok); }
+.sheet .alert.delivery[data-state="ok"] { border-color: var(--signal-text-on-light); }
+.alert.delivery[data-state="fail"] { --tone: var(--danger); }
+.sheet .alert.delivery[data-state="fail"] { border-color: var(--danger); }
+.alert.delivery[data-state="unverified"] { --tone: var(--warning); }
+.sheet .alert.delivery[data-state="unverified"] { border-color: var(--warning); }
+.alert.delivery[data-state="pending"] { --tone: var(--info); }
+.alert.delivery[data-state="none"] { --tone: var(--gray-500); }
+/* в заголовке — путь к файлу: переносим в любом месте, иначе он уедет вбок */
+.alert.delivery strong { overflow-wrap: anywhere; }
+.delivery__retry { align-self: center; white-space: nowrap; }
+@media (max-width: 767.98px) {
+  .delivery__retry { grid-column: 2; justify-self: start; }
+}
+
+/* Строка «Папка проктора» предполётной проверки: в пояснении путь к папке. */
+.chk--delivery .chk__note { max-width: 46ch; overflow-wrap: anywhere; }
+
 /* ------------------------- вклад в оценку (.bars) ------------------------- */
 /* Цвет полосы приходит из app.js (T.colorFor) — он дублирует число справа. */
 

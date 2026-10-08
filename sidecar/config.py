@@ -49,6 +49,14 @@ USB-носитель, и студент не может удалить то, ч�
 сохранения первого кадра; недоступен — пишем в запасной локальный и помечаем
 сессию как `degraded_handover`.
 
+Папка проктора для доставки пакета — тот же порядок источников:
+
+    "" (не задана) -> config.json:deliver_dir -> PROCTOR_DELIVER_DIR -> --deliver-to
+
+Это НЕ каталог сессий: сессия по-прежнему пишется в каталог сессий (обычно
+локальный), а в папку проктора после экзамена КОПИРУЕТСЯ готовый пакет
+(`storage/handover.deliver_package`). Не задана — пакет остаётся на машине.
+
 Ключ подписи — тем же способом: `--signing-key PATH` (или `PROCTOR_SIGNING_KEY`).
 Ключ задан проктором -> подпись получает метку `institution` и доказывает
 авторство. Ключ не задан -> ключ генерируется на машине студента, метка
@@ -145,6 +153,8 @@ EXAM_MODE_ENV_VAR = "PROCTOR_EXAM_MODE"
 #: разъехались: модуль передачи доказательств — владелец этих понятий.
 SESSIONS_DIR_ENV_VAR = "PROCTOR_SESSIONS_DIR"
 SIGNING_KEY_ENV_VAR = "PROCTOR_SIGNING_KEY"
+#: Папка проктора, куда после экзамена копируется пакет (`--deliver-to`).
+DELIVER_DIR_ENV_VAR = "PROCTOR_DELIVER_DIR"
 
 #: Значение `sessions_dir` по умолчанию. Оно же — запасной локальный каталог,
 #: если указанный проктором недоступен на запись.
@@ -249,6 +259,18 @@ def sessions_dir_from_env(env: dict[str, str] | None = None) -> str | None:
     """Каталог сессий из `PROCTOR_SESSIONS_DIR`."""
     source = os.environ if env is None else env
     raw = str(source.get(SESSIONS_DIR_ENV_VAR, "") or "").strip()
+    return raw or None
+
+
+def deliver_dir_from_argv(argv: Sequence[str] | None = None) -> str | None:
+    """Папка проктора из `--deliver-to PATH`. None — в argv про неё ничего."""
+    return _value_from_argv(("--deliver-to", "--deliver-dir"), argv)
+
+
+def deliver_dir_from_env(env: dict[str, str] | None = None) -> str | None:
+    """Папка проктора из `PROCTOR_DELIVER_DIR`."""
+    source = os.environ if env is None else env
+    raw = str(source.get(DELIVER_DIR_ENV_VAR, "") or "").strip()
     return raw or None
 
 
@@ -1797,6 +1819,13 @@ class ProctorConfig:
     #: Нужно для сообщения человеку: «каталог задан флагом» и «каталог взят по
     #: умолчанию» требуют разной реакции, если запись не удалась.
     sessions_dir_source: str = "default"
+    #: Папка проктора: флешка или сетевая папка вуза, куда после экзамена
+    #: КОПИРУЕТСЯ готовый пакет. Пусто — доставки нет, пакет остаётся рядом с
+    #: каталогом сессии (прежнее поведение). Сессия сюда НЕ пишется.
+    #: Приоритет: --deliver-to > PROCTOR_DELIVER_DIR > config.json > "".
+    deliver_dir: str = ""
+    #: Откуда взято значение `deliver_dir`: cli | env | config | default.
+    deliver_dir_source: str = "default"
     #: Ключ подписи, переданный проктором. Задан -> метка подписи `institution`
     #: (доказывает авторство). Пусто -> ключ генерируется на машине студента,
     #: метка `self_signed` (доказывает только целостность при передаче).
@@ -2030,6 +2059,12 @@ class ProctorConfig:
         return self._abs(self.sessions_fallback_dir or DEFAULT_SESSIONS_DIR)
 
     @property
+    def deliver_path(self) -> Path | None:
+        """Папка проктора абсолютным путём. None — доставка не настроена."""
+        value = str(self.deliver_dir or "").strip()
+        return self._abs(value) if value else None
+
+    @property
     def signing_key_abs(self) -> Path | None:
         """Абсолютный путь к ключу проктора. None — ключ не задан."""
         value = str(self.signing_key_path or "").strip()
@@ -2070,6 +2105,8 @@ class ProctorConfig:
             "signature_authority": self.signature_authority,
             "signing_key": str(self.signing_key_abs or ""),
             "package_on_end": bool(self.package_on_end),
+            "deliver_dir": str(self.deliver_path or ""),
+            "deliver_dir_source": self.deliver_dir_source,
         }
 
     # --------------------------------------------------------- профиль экзамена
@@ -2142,6 +2179,7 @@ class ProctorConfig:
         d["root"] = str(ROOT)
         d["sessions_path"] = str(self.sessions_path)
         d["sessions_fallback_path"] = str(self.sessions_fallback_path)
+        d["deliver_path"] = str(self.deliver_path or "")
         d["signature_authority"] = self.signature_authority
         d["report_signing_key"] = self.report_signing_key
         d["models_path"] = str(self.models_path)
@@ -2291,6 +2329,8 @@ class ProctorConfig:
                 "sessions_fallback_path": str(self.sessions_fallback_path),
                 "sessions_dir_source": self.sessions_dir_source,
                 "package_on_end": bool(self.package_on_end),
+                "deliver_path": str(self.deliver_path or ""),
+                "deliver_dir_source": self.deliver_dir_source,
                 "signing_key": str(self.signing_key_abs or ""),
                 "signature_authority": self.signature_authority,
                 "evidence_subdir": self.evidence_subdir,
@@ -2379,6 +2419,8 @@ class ProctorConfig:
             warnings.append(f"конфиг загружен из {candidate}")
             if cfg.sessions_dir != DEFAULT_SESSIONS_DIR:
                 cfg.sessions_dir_source = "config"
+            if str(cfg.deliver_dir or "").strip():
+                cfg.deliver_dir_source = "config"
             break
         else:
             if path:
@@ -2398,6 +2440,18 @@ class ProctorConfig:
             cfg.sessions_dir = dir_cli
             cfg.sessions_dir_source = "cli"
             warnings.append(f"каталог сессий задан флагом CLI: {dir_cli}")
+
+        # --- папка проктора для доставки пакета: тот же порядок ---
+        deliver_env = deliver_dir_from_env(env)
+        if deliver_env:
+            cfg.deliver_dir = deliver_env
+            cfg.deliver_dir_source = "env"
+            warnings.append(f"{DELIVER_DIR_ENV_VAR}={deliver_env}")
+        deliver_cli = deliver_dir_from_argv(argv)
+        if deliver_cli:
+            cfg.deliver_dir = deliver_cli
+            cfg.deliver_dir_source = "cli"
+            warnings.append(f"папка проктора задана флагом CLI: {deliver_cli}")
 
         # --- профиль экзамена: путь, доверенный ключ, разрешение поиска ---
         # Тот же порядок и тот же стиль разбора, что у каталога сессий: флаг
@@ -2541,6 +2595,7 @@ __all__ = [
     "EXAM_MODE_ENV_VAR",
     "SESSIONS_DIR_ENV_VAR",
     "SIGNING_KEY_ENV_VAR",
+    "DELIVER_DIR_ENV_VAR",
     "DEFAULT_SESSIONS_DIR",
     "AUDIO_ANALYSIS_KINDS",
     "CLASSROOM_AUDIO_OFF_REASON",
@@ -2551,6 +2606,8 @@ __all__ = [
     "sessions_dir_from_env",
     "signing_key_from_argv",
     "signing_key_from_env",
+    "deliver_dir_from_argv",
+    "deliver_dir_from_env",
     # --- профиль экзамена ---
     "EXAM_PROFILE_FILENAME",
     "EXAM_PROFILE_ENV_VAR",

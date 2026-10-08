@@ -232,6 +232,9 @@
               'сессии. Сама страница не открывается и не сохраняется.'
     },
     {
+      // Текст строки зависит от того, задана ли папка проктора: при заданной
+      // пакет после экзамена копируется туда (networkDetail ниже).
+      id: 'network',
       signal: 'Сетевые обращения',
       mode: 'no',
       detail: 'Сама система ничего не отправляет: доказательства и отчёт остаются на этом ' +
@@ -239,6 +242,97 @@
               'страницу LMS, с ней работает только окно теста.'
     }
   ];
+
+  /* =========================================================================
+   * ПАПКА ПРОКТОРА (доставка пакета).
+   *
+   * Проктор может задать папку — USB-носитель или сетевую папку вуза, — куда
+   * ядро ПОСЛЕ экзамена копирует подписанный пакет и сверяет копию по sha256.
+   * Что папка задана и доступна на запись, ядро сообщает в hello и в каждом
+   * status (`delivery`), итог копирования — в status.package.delivery.
+   *
+   * Отсюда три обязанности интерфейса: сказать на согласии, что пакет уйдёт с
+   * компьютера (иначе «в сеть не уходят» стало бы неправдой), показать в
+   * предполётной проверке, куда он уйдёт (на старт это НЕ влияет), и на
+   * финальном экране — дошёл ли он, а если нет, где лежит и как повторить.
+   * ========================================================================= */
+
+  /** Сколько ждём итога повторной доставки, прежде чем снова включить кнопку. */
+  var DELIVERY_RETRY_TIMEOUT_MS = 90000;
+
+  /**
+   * Ответы ядра на deliver_package (sidecar/main.py, _cmd_deliver_package).
+   * `delivery_busy` повтор не завершает: копирование уже идёт, итог придёт.
+   */
+  var DELIVERY_ERROR_CODES = ['bad_state', 'no_package', 'delivery_not_configured',
+    'delivery_busy', 'already_delivered'];
+
+  var DELIVERY_STAYS = 'пакет останется на этом компьютере';
+
+  /** {configured, dir, source, writable, reason} из hello/status; иначе null. */
+  function normDelivery(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    return {
+      configured: raw.configured === true,
+      dir: typeof raw.dir === 'string' ? raw.dir.trim() : '',
+      source: typeof raw.source === 'string' ? raw.source : '',
+      writable: raw.writable === true,
+      reason: typeof raw.reason === 'string' ? raw.reason.trim() : ''
+    };
+  }
+
+  /** Итог deliver_package: {ok, dest, bytes, sha256, verified, at, error}; иначе null. */
+  function normDeliveryResult(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    var at = Number(raw.at);
+    var bytes = Number(raw.bytes);
+    return {
+      ok: raw.ok === true,
+      dest: typeof raw.dest === 'string' ? raw.dest : '',
+      bytes: isFinite(bytes) && bytes > 0 ? Math.round(bytes) : 0,
+      sha256: typeof raw.sha256 === 'string' ? raw.sha256 : '',
+      verified: raw.verified === true,
+      at: isFinite(at) ? at : 0,
+      error: typeof raw.error === 'string' ? raw.error.trim() : ''
+    };
+  }
+
+  /** Задана ли папка: от этого зависят тексты согласия. */
+  function deliveryOn(d) { return Boolean(d && d.configured); }
+
+  /**
+   * Фраза о сети в шапке согласия. Длина варианта с папкой подобрана под
+   * экран без прокрутки от 1024×728: путь к папке сюда не входит, он — в
+   * полном перечне и в предполётной проверке.
+   */
+  function consentNetText(d) {
+    if (!deliveryOn(d)) return 'Всё считается на этом компьютере, данные наблюдения в сеть не уходят.';
+    return 'Во время экзамена данные не покидают компьютер, после — подписанный пакет ' +
+           'копируется в папку проктора.';
+  }
+
+  function disclosureLede(d) {
+    var head = 'Перечень полный: других данных система не собирает. ';
+    if (!deliveryOn(d)) return head + 'Всё вычисление идёт на этом компьютере, сеть не используется.';
+    return head + 'Всё вычисление идёт на этом компьютере. Во время экзамена данные его не ' +
+           'покидают; после экзамена подписанный пакет копируется в папку проктора.';
+  }
+
+  /** Строка «Сетевые обращения» полного перечня. */
+  function networkDetail(d, fallback) {
+    if (!deliveryOn(d)) return fallback;
+    var where = d.dir ? ' (' + d.dir + ')' : '';
+    var text = 'Во время экзамена система ничего не отправляет: наблюдение и доказательства ' +
+               'остаются на этом компьютере, облака и внешней аналитики нет. После экзамена ' +
+               'подписанный пакет — отчёт, журнал, кадры и снимки окна теста — копируется в ' +
+               'папку проктора' + where + ': на USB-носитель или в сетевую папку вуза, тогда по ' +
+               'сети. Если правила экзамена открывают страницу LMS, с ней работает только окно теста.';
+    if (!d.writable) {
+      text += ' Сейчас папка недоступна' + (d.reason ? ' (' + d.reason + ')' : '') +
+              ' — если так и останется, ' + DELIVERY_STAYS + '.';
+    }
+    return text;
+  }
 
   var MODE_TEXT = {
     yes: 'пишется, локально',
@@ -545,6 +639,20 @@
   };
 
   /**
+   * Та же команда, но с ответом оболочки: true/false либо {ok, reason?,
+   * message?} (так отвечает deliver_package). Без моста — null.
+   */
+  Bridge.prototype.command = function (name) {
+    var method = this._pick(['command', 'sendCommand']);
+    if (!method && name === 'deliver_package') method = this._pick(['deliverPackage']);
+    if (!method) return Promise.resolve(null);
+    try {
+      var res = method === 'deliverPackage' ? this.api.deliverPackage() : this.api[method](name);
+      return Promise.resolve(res).catch(function () { return null; });
+    } catch (e) { return Promise.resolve(null); }
+  };
+
+  /**
    * Отправка calibrate. В перечисленном API preload отдельного метода для
    * калибровки нет, поэтому пробуем известные варианты имён и общий send.
    * Если ничего нет — калибровка идёт локально по таймерам, интерфейс не рвётся.
@@ -670,6 +778,16 @@
     // каталог сессии, код, деградация передачи, готовность файлов по диску.
     this.sessionFiles = null;
     this._sessionFilesSig = '';
+    // Папка проктора со слов ядра (normDelivery) и итог копирования пакета
+    // туда (normDeliveryResult). deliveryRetry — повтор в пути: кнопка
+    // выключена, пока не придёт итог новее того, что был при нажатии.
+    this.delivery = null;
+    this._deliverySig = '';
+    this.deliveryResult = null;
+    this.deliveryRetry = null;
+    this.deliveryNote = '';
+    // Ядро сейчас копирует пакет (status.delivery.in_progress).
+    this.deliveryInProgress = false;
   }
 
   /** Экранирование: своё, если hud.js не отдал общий помощник. */
@@ -1016,10 +1134,21 @@
       var caps = pickSidecarCaps(h);
       if (caps) self._applyCaps(caps);
       self._feedProfile(h);
+      // Папка проктора — с первого сообщения: экран согласия уже открыт, и
+      // его текст о сети зависит от неё.
+      if (h && typeof h === 'object') self._applyDelivery(h.delivery);
     });
     this.bridge.subscribe('onError', null, function (err) {
       if (!err || typeof err !== 'object') return;
       var msg = err.message || err.code || 'Ошибка ядра прокторинга';
+      var code = String(err.code || '');
+      // Ответ на «Повторить доставку» — не сбой наблюдения: его показывает
+      // блок доставки на финальном экране, а не тост.
+      if (self.deliveryRetry && (DELIVERY_ERROR_CODES.indexOf(code) !== -1 || /deliver/i.test(code))) {
+        // копирование уже идёт — итог придёт сам, ждём его
+        if (code !== 'delivery_busy') self._endDeliveryRetry('Ядро не выполнило повтор: ' + String(msg));
+        return;
+      }
       self.hud.toast('Сбой наблюдения', String(msg));
       if (err.fatal) self._setLink('degraded', 'ядро сообщило об ошибке');
     });
@@ -1127,7 +1256,11 @@
     // изменению — иначе таблица на экране отчёта мигала бы каждую секунду.
     if (st.sessionReport && typeof st.sessionReport === 'object') {
       this._applySessionFiles(st.sessionReport);
+      this._applyDeliveryResult(st.sessionReport.delivery);
     }
+    // Папка проктора: тот же `delivery`, что в hello/status, но из памяти
+    // оболочки — для renderer, загрузившегося позже рукопожатия.
+    if (st.delivery) this._applyDelivery(st.delivery);
     // Состояние защищённого режима приходит и отдельным событием, и здесь:
     // статус оболочки — страховка на случай, если renderer загрузился позже
     // первого push и пропустил его.
@@ -1157,6 +1290,8 @@
     if (!st || typeof st !== 'object') return;
     this._setLink('up', 'ядро прокторинга на связи');
     this.hud.applyStatus(st);
+    this._applyDelivery(st.delivery);
+    if (st.package && typeof st.package === 'object') this._applyDeliveryResult(st.package.delivery);
 
     if (!this.envGraceStartedAt) this.envGraceStartedAt = Date.now();
 
@@ -1427,19 +1562,19 @@
     var rows = '';
     for (var i = 0; i < DISCLOSURE.length; i++) {
       var r = DISCLOSURE[i];
-      rows += '<tr data-mode="' + r.mode + '">' +
+      var detail = r.id === 'network' ? networkDetail(this.delivery, r.detail) : r.detail;
+      rows += '<tr data-mode="' + r.mode + '"' + (r.id ? ' data-row="' + r.id + '"' : '') + '>' +
                 '<th scope="row">' + this._esc(r.signal) + '</th>' +
                 '<td><span class="disclose__mode" data-mode="' + r.mode + '">' +
                   modeSvg(r.mode) + '<span>' + this._esc(MODE_TEXT[r.mode]) + '</span>' +
                 '</span></td>' +
-                '<td class="disclose__detail">' + this._esc(r.detail) + '</td>' +
+                '<td class="disclose__detail">' + this._esc(detail) + '</td>' +
               '</tr>';
     }
     host.innerHTML =
       '<div class="disclose__head">' +
         '<h2 class="card__title" id="disclose-title">Что пишется и что не пишется</h2>' +
-        '<p class="disclose__lede muted">Перечень полный: других данных система не собирает. ' +
-          'Всё вычисление идёт на этом компьютере, сеть не используется.</p>' +
+        '<p class="disclose__lede muted">' + this._esc(disclosureLede(this.delivery)) + '</p>' +
       '</div>' +
       '<div class="table-wrap">' +
         // .data-table из гайда описана для тёмной поверхности; экран согласия
@@ -1455,6 +1590,103 @@
           '<tbody>' + rows + '</tbody>' +
         '</table>' +
       '</div>';
+  };
+
+  // --- папка проктора: согласие, предполётная проверка, финальный экран ---
+
+  /** Фраза о сети в шапке согласия — по тому, что ядро сообщило о папке. */
+  App.prototype._renderConsentNetwork = function () {
+    setText('consent-net', consentNetText(this.delivery));
+  };
+
+  /**
+   * `delivery` из hello / status / состояния оболочки. Приходит раз в секунду,
+   * поэтому перерисовка — только по изменению: перечень согласия собирается
+   * через innerHTML, и мигать ему незачем.
+   */
+  App.prototype._applyDelivery = function (raw) {
+    var d = normDelivery(raw);
+    if (!d) return;
+    // «Копируется прямо сейчас» — отдельно от настроек: тексты согласия от
+    // него не зависят, перерисовывать их на каждом копировании незачем.
+    var busy = raw.in_progress === true;
+    if (busy !== this.deliveryInProgress) {
+      this.deliveryInProgress = busy;
+      if (this.screen === 'report') this._renderReportFiles();
+    }
+    var sig;
+    try { sig = JSON.stringify(d); } catch (e) { return; }
+    if (sig === this._deliverySig) return;
+    var onChanged = deliveryOn(d) !== deliveryOn(this.delivery);
+    this._deliverySig = sig;
+    this.delivery = d;
+    this._renderConsentNetwork();
+    this._renderDisclosure();
+    // шапка согласия могла вырасти на строку — пересчитать потолок колонки правил
+    if (onChanged && this.screen === 'consent' && this._scheduleConsentFit) this._scheduleConsentFit();
+    this._renderChecks();
+    if (this.screen === 'report') this._renderReportFiles();
+  };
+
+  /**
+   * Итог копирования пакета: из status.package.delivery и из состояния
+   * оболочки. Старый итог новый не перетирает (сравнение по `at`); итог новее
+   * того, что был при нажатии «Повторить доставку», завершает повтор.
+   */
+  App.prototype._applyDeliveryResult = function (raw) {
+    var res = normDeliveryResult(raw);
+    if (!res) return;
+    var cur = this.deliveryResult;
+    if (cur && res.at < cur.at) return;
+    var sig = JSON.stringify(res);
+    if (cur && sig === JSON.stringify(cur)) return;
+    this.deliveryResult = res;
+    if (this.deliveryRetry && res.at > this.deliveryRetry.prevAt) this._endDeliveryRetry('');
+    else if (this.screen === 'report') this._renderReportFiles();
+  };
+
+  App.prototype._endDeliveryRetry = function (note) {
+    if (this.deliveryRetry && this.deliveryRetry.timer) clearTimeout(this.deliveryRetry.timer);
+    this.deliveryRetry = null;
+    this.deliveryNote = note || '';
+    if (this.screen === 'report') this._renderReportFiles();
+  };
+
+  /**
+   * Строка «Папка проктора» в предполётной проверке. В шлюз старта не входит:
+   * _updateStartGate считает только CHECKS. Без папки экзамен идёт как прежде,
+   * пакет остаётся на этом компьютере — об этом и говорит строка.
+   */
+  App.prototype._deliveryCheck = function () {
+    var d = this.delivery;
+    if (!d) {
+      var waited = this.demoMode || (this.bridge.sawAny && this.envGraceStartedAt &&
+        Date.now() - this.envGraceStartedAt >= ENV_GRACE_MS);
+      return waited
+        ? { state: 'warn', word: 'внимание', note: 'ядро не сообщило о папке проктора — ' + DELIVERY_STAYS }
+        : { state: 'pending', word: STATE_TEXT.pending, note: '' };
+    }
+    if (!d.configured) return { state: 'warn', word: 'внимание', note: 'не задана — ' + DELIVERY_STAYS };
+    if (!d.writable) {
+      return { state: 'warn', word: 'внимание',
+        note: 'недоступна: ' + (d.reason || 'причина не сообщена') + ' — ' + DELIVERY_STAYS };
+    }
+    return { state: 'ok', word: STATE_TEXT.ok, note: 'пакет будет скопирован в ' + d.dir };
+  };
+
+  App.prototype._deliveryCheckHtml = function () {
+    var c = this._deliveryCheck();
+    return '<li class="chk chk--delivery is-' + c.state + '" data-state="' + c.state + '" data-check="delivery">' +
+             '<span class="chk__mark">' + markSvg(c.state) + '</span>' +
+             '<span class="chk__text">' +
+               '<span class="chk__title">Папка проктора</span>' +
+               '<span class="chk__hint">Куда после экзамена копируется подписанный пакет. На старт не влияет</span>' +
+             '</span>' +
+             '<span class="chk__state">' +
+               '<span class="chk__word">' + this._esc(c.word) + '</span>' +
+               (c.note ? '<span class="chk__note muted">' + this._esc(c.note) + '</span>' : '') +
+             '</span>' +
+           '</li>';
   };
 
   // --- правила экзамена: согласие, предполётная проверка, шапка отчёта ---
@@ -1889,6 +2121,8 @@
                 '</span>' +
               '</li>';
     }
+    // Папка проктора — последней строкой и вне шлюза старта.
+    html += this._deliveryCheckHtml();
     list.innerHTML = html;
     list.setAttribute('role', 'list');
 
@@ -2454,6 +2688,20 @@
         else pkgState = 'соберётся после отчёта';
         rows.push(['Пакет для проктора', f.packagePath || '—', pkgState]);
 
+        // Копия в папке проктора — только когда папка задана: иначе строка
+        // повторяла бы «не задана» из блока доставки выше.
+        var dres = this.deliveryResult;
+        if (deliveryOn(this.delivery) || dres) {
+          var dState;
+          if (dres && dres.ok && dres.verified) dState = 'доставлен, sha256 копии сверен с пакетом';
+          else if (dres && dres.ok) dState = 'записан, sha256 копии не сверен' + (dres.error ? ': ' + dres.error : '');
+          else if (dres) dState = 'не доставлен' + (dres.error ? ': ' + dres.error : '');
+          else if (f.packageOk === false) dState = 'не копировался: пакет не собран';
+          else dState = f.packageReady ? 'копируется…' : 'скопируется после сборки пакета';
+          rows.push(['Копия в папке проктора',
+            (dres && dres.dest) || (this.delivery && this.delivery.dir) || '—', dState]);
+        }
+
         rows.push(['Каталог сессии', f.sessionDir || '—',
           'журнал evidence.sqlite с хеш-цепочкой; кадры, клипы и снимки окна теста — в evidence/']);
       }
@@ -2463,6 +2711,9 @@
                '<td>' + self._esc(r[2]) + '</td></tr>';
       }).join('');
     }
+
+    // --- доставка в папку проктора ---
+    this._renderReportDelivery();
 
     // --- кнопка «Открыть отчёт» и подсказка ---
     var btn = el('btn-report');
@@ -2483,6 +2734,124 @@
       }
       hint.textContent = text;
     }
+  };
+
+  /**
+   * Финальный экран: дошёл ли пакет до папки проктора.
+   *
+   * Четыре исхода, и каждый назван словами, а не только цветом полосы:
+   * доставлен и сверен по sha256; НЕ доставлен — причина, где лежит пакет
+   * здесь и кнопка повтора; папка не задана — пакет остался на этом
+   * компьютере; итога ещё нет — копируется. Пока о сессии ничего не известно,
+   * блок скрыт: обещать доставку пакета, которого нет, нельзя.
+   */
+  App.prototype._renderReportDelivery = function () {
+    var box = el('report-delivery');
+    if (!box) return;
+    var f = this.sessionFiles;
+    var d = this.delivery;
+    var res = this.deliveryResult;
+    var known = Boolean(f && (f.sessionDir || f.packagePath || f.ended));
+    var retryBtn = el('btn-deliver-retry');
+    if (!known && !res) {
+      box.hidden = true;
+      if (retryBtn) retryBtn.hidden = true;
+      return;
+    }
+    var local = (f && f.packagePath) || '';
+    var built = Boolean(f && f.ended && (f.packageReady || f.packageOk === true));
+    var state;
+    var title;
+    var text = '';
+    if (res && res.ok && res.verified) {
+      state = 'ok';
+      title = 'Пакет доставлен в папку проктора: ' + (res.dest || (d && d.dir) || '—') + ' (sha256 сверен)';
+      text = (res.sha256 ? 'sha256 ' + res.sha256.slice(0, 12) + '…' + res.sha256.slice(-6) + '. ' : '') +
+             'Копия проверена повторным чтением.' + (local ? ' Пакет остаётся и здесь: ' + local + '.' : '');
+    } else if (res && res.ok) {
+      // Записан, но перечитать копию не дали (папка «только запись»): файл у
+      // проктора есть, сверен он НЕ был. Повтора нет — ядро вторую копию того
+      // же пакета не делает (already_delivered), и это правильно: лишний файл
+      // на шаре ломает сверку числа пакетов со списком группы.
+      state = 'unverified';
+      title = 'Пакет записан в папку проктора: ' + (res.dest || (d && d.dir) || '—') +
+              ', но sha256 копии НЕ сверен';
+      text = (res.error ? res.error.charAt(0).toUpperCase() + res.error.slice(1).replace(/[.\s]+$/, '') + '. ' : '') +
+             'Проктору стоит проверить копию (scripts/verify_report.py).' +
+             (local ? ' Пакет остаётся и здесь: ' + local + '.' : '');
+    } else if (res) {
+      state = 'fail';
+      var why = res.error || 'причина не сообщена';
+      title = 'Пакет НЕ доставлен: ' + why.replace(/[.\s]+$/, '') + '. Он лежит здесь: ' + (local || '—');
+      text = 'Повторите доставку или передайте этот файл проктору вручную.';
+    } else if (!d) {
+      state = 'none';
+      title = 'Ядро не сообщило о папке проктора — пакет ' +
+              (built && local ? 'остался на этом компьютере: ' + local : 'останется на этом компьютере');
+    } else if (!d.configured) {
+      state = 'none';
+      title = 'Не задана папка проктора — пакет ' +
+              (built && local ? 'остался на этом компьютере: ' + local : 'останется на этом компьютере');
+      text = 'Передайте пакет проктору вручную.';
+    } else if (f && f.packageOk === false) {
+      state = 'none';
+      title = 'Пакет не собран — в папку проктора копировать нечего';
+      text = 'Забирайте каталог сессии целиком' + (f.sessionDir ? ': ' + f.sessionDir : '') + '.';
+    } else if (built) {
+      state = 'pending';
+      title = 'Пакет копируется в папку проктора: ' + (d.dir || '—') + '…';
+    } else {
+      state = 'pending';
+      title = 'После сборки пакет будет скопирован в папку проктора: ' + (d.dir || '—');
+    }
+
+    var busy = Boolean(this.deliveryRetry) || (this.deliveryInProgress && state === 'fail');
+    if (this.deliveryRetry) text = 'Повторная доставка запрошена — ждём итога от ядра…';
+    else if (busy) text = 'Ядро копирует пакет в папку проктора — ждём итога…';
+    else if (this.deliveryNote) text = this.deliveryNote;
+
+    box.hidden = false;
+    box.setAttribute('data-state', state);
+    setText('report-delivery-title', title);
+    var p = el('report-delivery-text');
+    if (p) {
+      p.textContent = text;
+      p.hidden = !text;
+    }
+    if (retryBtn) {
+      // Повтор осмыслен только после неудачи; пока он в пути — кнопка выключена.
+      retryBtn.hidden = state !== 'fail';
+      retryBtn.disabled = busy;
+      if (busy) retryBtn.setAttribute('aria-busy', 'true');
+      else retryBtn.removeAttribute('aria-busy');
+    }
+  };
+
+  /** «Повторить доставку»: команда deliver_package тем же путём, что и остальные. */
+  App.prototype._retryDelivery = function () {
+    var self = this;
+    if (this.deliveryRetry) return;
+    var retry = {
+      prevAt: this.deliveryResult ? this.deliveryResult.at : 0,
+      timer: null
+    };
+    this.deliveryRetry = retry;
+    this.deliveryNote = '';
+    retry.timer = setTimeout(function () {
+      if (self.deliveryRetry !== retry) return;
+      self._endDeliveryRetry('Ядро не сообщило итог повтора за ' +
+        Math.round(DELIVERY_RETRY_TIMEOUT_MS / 1000) + ' с. Попробуйте ещё раз или передайте пакет вручную.');
+    }, DELIVERY_RETRY_TIMEOUT_MS);
+    this._renderReportDelivery();
+    this.bridge.command('deliver_package').then(function (res) {
+      if (self.deliveryRetry !== retry) return;
+      if (res === true || (res && typeof res === 'object' && res.ok)) return;  // ждём итога в status
+      var msg;
+      if (res === null) msg = 'Оболочка недоступна — повторить доставку отсюда нельзя.';
+      else if (res && typeof res === 'object' && res.message) msg = String(res.message);
+      else msg = 'Команда не ушла в ядро — попробуйте ещё раз.';
+      self._endDeliveryRetry(msg);
+    });
   };
 
   App.prototype._wireReport = function () {
@@ -2513,6 +2882,14 @@
             hint(String(res.message || 'Отчёт открыть не удалось.'));
           }
         });
+      });
+    }
+
+    var retryDelivery = el('btn-deliver-retry');
+    if (retryDelivery) {
+      retryDelivery.addEventListener('click', function () {
+        if (retryDelivery.disabled) return;
+        self._retryDelivery();
       });
     }
 

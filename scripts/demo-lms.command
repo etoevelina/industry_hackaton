@@ -13,6 +13,10 @@ cd "$(dirname "$0")/.." || exit 1
 LMS_URL="${PROCTOR_DEMO_LMS:-https://lms.astanait.edu.kz/login/index.php}"
 LMS_HOST="$(printf '%s' "$LMS_URL" | sed -E 's#^[a-z]+://##; s#/.*##')"
 EXAMDIR="${PROCTOR_DEMO_DIR:-$HOME/Documents/proctor-demo}"
+# Папка проктора, куда после экзамена копируется пакет. В этом показе не нужна
+# (он про браузер, а не про передачу), поэтому по умолчанию не задана:
+#   DELIVER_DIR=~/Documents/proctor-deliver scripts/demo-lms.command
+DELIVER_DIR="${DELIVER_DIR-${PROCTOR_DELIVER_DIR:-}}"
 
 mkdir -p "$EXAMDIR" || { echo "Не удалось создать $EXAMDIR"; read -r _; exit 1; }
 
@@ -73,6 +77,7 @@ echo "Адрес:          $LMS_URL"
 echo "Разрешены:      $LMS_HOST и домены входа Microsoft"
 echo "Профиль:        $EXAMDIR/exam-profile.json"
 echo "Пакет сессии:   $EXAMDIR"
+echo "Папка проктора: ${DELIVER_DIR:-не задана — пакет останется рядом с сессией}"
 echo
 printf 'Проверяю доступность сайта... '
 if curl -s -o /dev/null --max-time 8 "$LMS_URL"; then
@@ -89,4 +94,4 @@ read -r _
 # Камера: на этой машине встроенная FaceTime — индекс 1, индекс 0 занимает
 # iPhone как Continuity Camera. Задаётся явно, подбор вслепую уже подводил.
 exec env PROCTOR_SESSIONS_DIR="$EXAMDIR" PROCTOR_CAMERA="${PROCTOR_CAMERA:-1}" \
-    "$(dirname "$0")/run-safe.command"
+    PROCTOR_DELIVER_DIR="$DELIVER_DIR" "$(dirname "$0")/run-safe.command"
