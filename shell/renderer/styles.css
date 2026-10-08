@@ -940,6 +940,95 @@ code {
 }
 .checkbox__text { font-size: var(--fs-small); line-height: var(--lh-body); }
 
+/* --------------------------- экран согласия -------------------------------- */
+/* Помещается без прокрутки от 1280×720: плотнее отступы, заголовок на ступень
+   меньше, суть — двумя короткими колонками. Подробности свёрнуты в <details>,
+   прокрутка появляется только если их раскрыть. */
+
+.consent {
+  min-height: 100%;
+  box-sizing: border-box;
+  justify-content: center;
+  padding-top: var(--space-8);
+  padding-bottom: var(--space-8);
+  gap: var(--space-6);
+}
+.consent .screen__head { max-width: 120ch; }
+.consent__title { font-size: var(--fs-h2); }
+
+.consent-sum {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-4);
+}
+.consent-sum__col {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-6);
+  border: 1px solid var(--text-primary);
+  border-radius: var(--radius-md);
+}
+.consent-sum__title {
+  font-size: var(--fs-small);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+}
+/* «сохраняется» — акцент, на светлом допустим только как тёмный текст */
+.consent-sum__col[data-mode="yes"] .consent-sum__title { color: var(--signal-text-on-light); }
+.consent-sum__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  font-size: var(--fs-small);
+  line-height: var(--lh-body);
+}
+/* Режим несут заголовок колонки и форма маркера: галочка / крестик */
+.consent-sum__list li {
+  position: relative;
+  padding-left: var(--space-6);
+}
+.consent-sum__list li::before {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: var(--space-4);
+  font-family: var(--font-mono);
+  font-weight: 700;
+  text-align: center;
+}
+.consent-sum__col[data-mode="yes"] li::before { content: "✓"; color: var(--signal-text-on-light); }
+.consent-sum__col[data-mode="no"] li::before { content: "×"; color: var(--text-muted); }
+
+.consent-more > summary {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--tap-min);
+  font-size: var(--fs-small);
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
+  cursor: pointer;
+}
+.consent-more > summary:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-offset);
+}
+.consent-more[open] > summary { margin-bottom: var(--space-3); }
+
+.consent__form { grid-template-columns: 2fr 1fr 2fr; }
+
+/* Невысокие экраны (проектор 1280×720, 1024×768) — плотнее по вертикали */
+@media (max-height: 800px) {
+  .consent { gap: var(--space-4); padding-top: var(--space-6); padding-bottom: var(--space-6); }
+  .consent-sum__col { padding: var(--space-3) var(--space-4); gap: var(--space-2); }
+  .consent-more > summary { min-height: var(--space-6); }
+}
+
 /* ===========================================================================
    4. ЭКРАН 2 — ПРЕДПОЛЁТНАЯ ПРОВЕРКА (тёмная диагностика)
    Каждая строка: статус-точка + ПОДПИСЬ СТАТУСА СЛОВОМ + название проверки.
@@ -2140,6 +2229,7 @@ code {
   .report__tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .calib__viewport { height: calc(var(--space-22) * 4); }
   .form-grid { grid-template-columns: 1fr; }
+  .consent-sum { grid-template-columns: 1fr; }
   .consent-bar { padding: var(--space-4); }
   .alert { grid-template-columns: var(--space-1) minmax(0, 1fr); }
   .alert__code { grid-column: 2; }
