@@ -31,7 +31,7 @@ psutil>=5.9,<8.0
 # молча уходит в available()==False. Проверено: 0.10.21 — последняя рабочая.
 # Переход на Tasks API (FaceLandmarker) — отдельная задача, см. memory/backlog.md.
 mediapipe>=0.10.9,<0.10.22 ; platform_system != "Linux" or platform_machine == "x86_64"
-ultralytics>=8.1,<8.4
+ultralytics>=8.1.44,<8.4   # 8.1.44 — первая версия, где работает YOLO_OFFLINE
 onnxruntime>=1.17,<2.0
 
 # ---------------------------------------------------------------------------

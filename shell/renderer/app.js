@@ -105,7 +105,18 @@
       signal: 'Кадры с камеры',
       mode: 'ram',
       detail: 'Разбираются покадрово в оперативной памяти: есть ли лицо, сколько лиц, ' +
-              'поворот головы, направление взгляда, посторонние предметы. Непрерывной записи нет.'
+              'поворот головы, направление взгляда, посторонние предметы. Сами кадры не ' +
+              'сохраняются — на диск попадают только числа посекундной сводки.'
+    },
+    {
+      // RawObservationLog в сайдкаре включён по умолчанию (log_raw) и пишет
+      // посекундные окна наблюдений в журнал сессии независимо от инцидентов.
+      signal: 'Посекундная сводка наблюдений',
+      mode: 'yes',
+      detail: 'Раз в секунду в журнал сессии пишутся числа: есть ли лицо и сколько лиц, ' +
+              'сходство с эталоном лица, поворот головы и направление взгляда, моргание, ' +
+              'найденные предметы; при удалённой сдаче — была ли речь, громкость и сходство ' +
+              'с голосом владельца. Без кадров и звука.'
     },
     {
       signal: 'Кадр и клип инцидента',
@@ -151,10 +162,10 @@
     {
       signal: 'Звук, речь, расшифровка',
       mode: 'no',
-      detail: 'Аудио не записывается и не хранится. В режиме аудитории аудиоканал ' +
+      detail: 'Аудиозаписи нет: звук не сохраняется. В режиме аудитории аудиоканал ' +
               'выключен целиком: в классе он давал бы ложные срабатывания на соседей. ' +
-              'При удалённой сдаче речь с микрофона анализируется в памяти, профиль ' +
-              'голоса держится в памяти до конца сессии.'
+              'При удалённой сдаче речь с микрофона разбирается в памяти, профиль голоса ' +
+              'там же до конца сессии; в посекундную сводку попадают только числа.'
     },
     {
       signal: 'Содержимое буфера обмена',
@@ -172,10 +183,10 @@
       signal: 'Проверки окружения',
       mode: 'yes',
       detail: 'Число мониторов, виртуальная камера, ПО удалённого доступа, признаки ' +
-              'виртуальной машины, запись экрана, подключённые аудиоустройства. Список ' +
-              'запущенных программ просматривается в памяти; у найденной запрещённой ' +
-              '(мессенджер, ИИ-клиент, средство автоматизации) фиксируются имя, путь, ' +
-              'пользователь ОС и время запуска.'
+              'виртуальной машины, запись экрана, подключённые аудиоустройства, мессенджеры, ' +
+              'ИИ-клиенты, средства автоматизации. Список запущенных программ просматривается ' +
+              'в памяти; у программы, найденной любой из этих проверок, фиксируются имя, путь, ' +
+              'номер процесса, пользователь ОС и время запуска.'
     },
     {
       signal: 'События окна теста',
@@ -240,6 +251,15 @@
   };
 
   function el(id) { return document.getElementById(id); }
+
+  /** Высота коробки по её содержимому, даже если сетка растянула её выше. */
+  function contentHeight(box) {
+    var last = box.lastElementChild;
+    if (!last) return box.offsetHeight;
+    var cs = window.getComputedStyle(box);
+    return Math.ceil(last.getBoundingClientRect().bottom - box.getBoundingClientRect().top +
+      (parseFloat(cs.paddingBottom) || 0) + (parseFloat(cs.borderBottomWidth) || 0));
+  }
   function pad2(n) { return n < 10 ? '0' + n : String(n); }
 
   function fmtDuration(ms) {
@@ -1069,6 +1089,7 @@
     var self = this;
     var cb = el('consent-check');
     var btn = el('btn-consent');
+    this._watchConsentFit();
     if (cb && btn) {
       cb.addEventListener('change', function () { btn.disabled = !cb.checked; });
       btn.addEventListener('click', function () {
@@ -1078,6 +1099,56 @@
         if (!self.envGraceStartedAt) self.envGraceStartedAt = Date.now();
       });
     }
+  };
+
+  /**
+   * Экран согласия должен помещаться без прокрутки. Сколь угодно высокой может
+   * быть только колонка правил (профиль с десятком источников и отклонённых
+   * записей) — ей и ставится потолок: ровно столько, сколько остаётся после
+   * всего остального. «Сохраняется» и «Не записывается» не сжимаются никогда:
+   * прятать под прокрутку то, что о человеке записывают, нельзя, поэтому
+   * потолок не ниже их собственной высоты (не хватит и так — пусть лучше
+   * прокрутится страница). Пока раскрыт полный перечень, потолок не трогаем:
+   * иначе колонка выросла бы и строка «Полный перечень данных» уехала бы
+   * из-под курсора. Точный замер вместо вычетов из 100vh — те ломались от
+   * каждой новой строки текста.
+   */
+  App.prototype._fitConsent = function () {
+    var screen = el('screen-consent');
+    var rules = screen && screen.querySelector('.consent-sum > .rules');
+    var more = screen && screen.querySelector('.consent-more');
+    if (!screen || !rules || screen.hidden || (more && more.open)) return;
+    rules.style.maxHeight = '';
+    // узкий экран: колонки стопкой, страница прокручивается штатно — правила не режем
+    var sum = rules.parentNode;
+    if (window.getComputedStyle(sum).gridTemplateColumns.split(' ').length < 2) return;
+    var floor = 0;
+    var cols = screen.querySelectorAll('.consent-sum__col');
+    for (var i = 0; i < cols.length; i++) floor = Math.max(floor, contentHeight(cols[i]));
+    // второй проход добирает пиксель, потерянный на округлении дробных высот
+    for (var pass = 0; pass < 2; pass++) {
+      var over = screen.scrollHeight - screen.clientHeight;
+      if (over <= 0) return;
+      var cap = Math.max(Math.floor(rules.getBoundingClientRect().height) - over, floor);
+      if (rules.style.maxHeight === cap + 'px') return;
+      rules.style.maxHeight = cap + 'px';
+    }
+  };
+
+  App.prototype._watchConsentFit = function () {
+    var self = this;
+    var pending = false;
+    function schedule() {
+      if (pending) return;
+      pending = true;
+      window.requestAnimationFrame(function () { pending = false; self._fitConsent(); });
+    }
+    this._scheduleConsentFit = schedule;
+    try { window.addEventListener('resize', schedule); } catch (e) { /* нет окна */ }
+    var more = document.querySelector('#screen-consent .consent-more');
+    if (more) more.addEventListener('toggle', schedule);
+    try { document.fonts.ready.then(schedule); } catch (e) { /* шрифты уже на месте */ }
+    schedule();
   };
 
   App.prototype._readMeta = function () {
@@ -1445,6 +1516,7 @@
     this._renderRulesBlock(
       this._rulesHost('preflight-rules', 'screen-preflight', '.checks'), p, 'preflight');
     this._renderReportRules(p);
+    if (this._scheduleConsentFit) this._scheduleConsentFit();
   };
 
   // --- экран проверок ---

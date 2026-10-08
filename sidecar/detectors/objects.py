@@ -51,6 +51,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -438,8 +439,21 @@ class ObjectDetector:
             return False
         try:
             # ultralytics считает себя офлайн ТОЛЬКО при YOLO_OFFLINE == "true"
-            # (utils.is_online). С "1" при импорте шли DNS-запросы и включалась
-            # аналитика — это нарушало обещание «в сеть ничего не уходит».
+            # (utils.is_online), и только начиная с 8.1.44: раньше этой проверки
+            # нет вовсе. С "1" или на старой версии при импорте идёт сетевой
+            # пробник, а при predict — аналитика: это нарушало бы обещание
+            # «данные наблюдения в сеть не уходят». Старую версию не импортируем.
+            try:
+                from importlib.metadata import version as _pkg_version
+                found = tuple(int(x) for x in re.findall(r"\d+", _pkg_version("ultralytics"))[:3])
+            except Exception:
+                found = ()
+            if found and found < (8, 1, 44):
+                self._yolo = None
+                self._backend_info = (f"ultralytics {'.'.join(map(str, found))} < 8.1.44 "
+                                      "не умеет офлайн-режим, бэкенд не поднят")
+                self._last_error = self._backend_info
+                return False
             os.environ["YOLO_OFFLINE"] = "True"
             from ultralytics import YOLO  # ленивый импорт тяжёлой зависимости
 
