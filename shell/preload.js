@@ -23,12 +23,29 @@ const IN = Object.freeze({
   error: 'proctor:error',
   shellStatus: 'proctor:shell-status',
   blocking: 'proctor:blocking',
+  protection: 'proctor:protection',
 });
+
+/**
+ * Состояния оболочки. Берём из общего модуля, а не держим копию: разъехавшийся
+ * список здесь означал бы, что renderer присылает состояние, которого
+ * main-процесс не знает, и переход молча отвергается.
+ */
+const EXAM_STATES = require('./state').SHELL_STATES;
 
 const TELEMETRY_KINDS = Object.freeze(['keystroke', 'paste', 'answer_submit', 'question_shown']);
 const KEY_CLASSES = Object.freeze(['char', 'nav', 'ctrl']);
 const CALIBRATION_STAGES = Object.freeze(['gaze_center', 'gaze_grid', 'identity', 'voice']);
-const COMMAND_NAMES = Object.freeze(['snapshot', 'reset_risk', 'export_report']);
+/*
+ * Полный словарь команд (sidecar/protocol.py). `proctor_lock` /
+ * `proctor_release` — решение человека над приостановленным экзаменом; без
+ * них приостановка по порогу блокировки была неснимаема никем, потому что
+ * команда отсекалась здесь.
+ */
+const COMMAND_NAMES = Object.freeze([
+  'snapshot', 'reset_risk', 'export_report', 'proctor_lock', 'proctor_release',
+]);
+const ACTOR_REQUIRED = Object.freeze(['proctor_lock', 'proctor_release']);
 
 function nowSec() {
   return Date.now() / 1000;
@@ -59,6 +76,34 @@ function subscribe(channel, cb) {
 }
 
 /**
+ * Метка вопроса: номер в билете, а не текст.
+ *
+ * Шестнадцать символов из списка ниже и ни одного пробела. Банк вопросов —
+ * внешние данные: id вида `q3/<первая строка ответа>` приходит не от злого
+ * умысла, а от небрежного экспорта, и до этой проверки такая метка уезжала в
+ * подписанный журнал и в пакет проктору. Обрезка по длине задачу не решает:
+ * обрезанный ответ это всё ещё ответ, поэтому непохожее на идентификатор
+ * заменяется устойчивым суррогатом (та же логика, что в `safe_label()`
+ * сайдкара — сайдкар проверяет повторно и нам на слово не верит).
+ */
+const LABEL_MAX_LEN = 16;
+const LABEL_OK = /^[0-9A-Za-z_.\-\u0400-\u04FF]+$/;
+
+function safeLabel(value) {
+  const rawLabel = String(value === undefined || value === null ? '' : value).trim();
+  if (!rawLabel) return '';
+  if (rawLabel.length <= LABEL_MAX_LEN && LABEL_OK.test(rawLabel)) return rawLabel;
+  // Суррогат: одинаковый вход — одинаковый выход, поэтому дедупликация по
+  // вопросу на стороне сайдкара продолжает работать, а содержание уходит.
+  let h = 0x811c9dc5;
+  for (let i = 0; i < rawLabel.length; i += 1) {
+    h ^= rawLabel.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return 'qid-' + ('0000000' + h.toString(16)).slice(-8);
+}
+
+/**
  * Приведение телеметрии к форме из docs/CONTRACT.md.
  * Всё лишнее отбрасывается: никаких символов, текстов ответов и содержимого буфера.
  */
@@ -69,7 +114,7 @@ function sanitizeTelemetry(raw) {
 
   const out = {
     kind,
-    question_id: String(msg.question_id || msg.questionId || ''),
+    question_id: safeLabel(msg.question_id || msg.questionId),
     ts: num(msg.ts, nowSec()),
   };
 
@@ -102,6 +147,27 @@ function sendTelemetry(raw) {
   return true;
 }
 
+/**
+ * Отчёт о раскладке: какой прямоугольник окна renderer оставил свободным под
+ * страницу экзамена. Четыре неотрицательных числа и ничего больше —
+ * проверяет присланное всё равно main-процесс (normalizeExamViewInset в
+ * shell/state.js), но пропускать сюда произвольный объект незачем.
+ */
+function sendExamViewInset(raw) {
+  const side = (value) => {
+    const n = Number(value);
+    return Number.isFinite(n) && n >= 0 ? Math.round(n) : 0;
+  };
+  if (!raw || typeof raw !== 'object') return false;
+  ipcRenderer.send('proctor:exam-view-inset', {
+    top: side(raw.top),
+    right: side(raw.right),
+    bottom: side(raw.bottom),
+    left: side(raw.left),
+  });
+  return true;
+}
+
 const api = {
   /** Версия протокола обмена (см. sidecar/protocol.py). */
   protocolVersion: 1,
@@ -121,9 +187,21 @@ const api = {
   onShellStatus: (cb) => subscribe(IN.shellStatus, cb),
   /** Блокирующий экран: {active, reason, title, text}. */
   onBlocking: (cb) => subscribe(IN.blocking, cb),
+  /**
+   * Защищённый режим: {active, examState, reason, accelerators, systemWide, …}.
+   * Приходит при каждом изменении — HUD обязан показывать это студенту.
+   */
+  onProtection: (cb) => subscribe(IN.protection, cb),
 
   /** Универсальная подписка по короткому имени канала. */
   on: (name, cb) => (IN[name] ? subscribe(IN[name], cb) : () => {}),
+
+  /**
+   * Сообщить оболочке, сколько места наша вёрстка оставила свободным под
+   * страницу экзамена: {top,right,bottom,left} в пикселях окна. Источник
+   * истины по раскладке — CSS, а не константа в main-процессе.
+   */
+  reportExamViewInset: sendExamViewInset,
 
   // -------------------------------------------------------------- телеметрия
   sendTelemetry,
@@ -167,19 +245,59 @@ const api = {
   },
 
   /** name: snapshot | reset_risk | export_report. */
-  command: (name) => {
+  command: (name, opts) => {
     if (!COMMAND_NAMES.includes(name)) return Promise.resolve(false);
-    return ipcRenderer.invoke('proctor:command', name);
+    const o = opts || {};
+    const actor = String(o.actor || '').trim();
+    const reason = String(o.reason || o.note || '').trim();
+    // Решение без указания, кто его принял, бессмысленно: вся политика
+    // затевалась ради того, чтобы в журнале стоял человек.
+    if (ACTOR_REQUIRED.includes(name) && !actor) return Promise.resolve(false);
+    return ipcRenderer.invoke('proctor:command', name, {
+      actor: actor.slice(0, 120),
+      reason: reason.slice(0, 400),
+    });
   },
   snapshot: () => ipcRenderer.invoke('proctor:command', 'snapshot'),
   resetRisk: () => ipcRenderer.invoke('proctor:command', 'reset_risk'),
   exportReport: () => ipcRenderer.invoke('proctor:command', 'export_report'),
+  /**
+   * Решение проктора над приостановленным экзаменом.
+   * `actor` обязателен: сайдкар отвечает ошибкой actor_required без него.
+   */
+  proctorLock: (actor, reason) => ipcRenderer.invoke('proctor:command', 'proctor_lock',
+    { actor: String(actor || '').trim().slice(0, 120),
+      reason: String(reason || '').trim().slice(0, 400) }),
+  proctorRelease: (actor, reason) => ipcRenderer.invoke('proctor:command', 'proctor_release',
+    { actor: String(actor || '').trim().slice(0, 120),
+      reason: String(reason || '').trim().slice(0, 400) }),
 
   // -------------------------------------------------------- состояние оболочки
   /** Честная карта блокировок: {lockdown, matrix, shell}. */
   capabilities: () => ipcRenderer.invoke('proctor:capabilities'),
   /** Текущее состояние оболочки без ожидания следующего пуша. */
   shellStatus: () => ipcRenderer.invoke('proctor:shell-status'),
+
+  /** Текущее состояние защищённого режима. */
+  protection: () => ipcRenderer.invoke('proctor:protection'),
+
+  /**
+   * Сообщить оболочке, где находится студент: idle | consent | preflight |
+   * calibration | exam | paused | finished. Оболочка включает блокировки
+   * только на exam и paused.
+   *
+   * Это СИГНАЛ, не команда: main-процесс проверяет и само имя, и допустимость
+   * перехода, и вправе отказать. Ответ — {ok, state, reason?}.
+   */
+  setExamState: (next) => {
+    if (!EXAM_STATES.includes(next)) {
+      return Promise.resolve({ ok: false, state: null, reason: 'unknown_state' });
+    }
+    return ipcRenderer.invoke('proctor:exam-state', next);
+  },
+
+  /** Список состояний — чтобы renderer не держал свою копию. */
+  examStates: EXAM_STATES,
 
   /**
    * Защита содержимого от скриншотов и записи экрана.

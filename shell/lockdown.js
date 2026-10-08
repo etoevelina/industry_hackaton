@@ -265,6 +265,13 @@ class Lockdown {
     this.displayIntervalMs = opts.displayIntervalMs || 2000;
     this._allow = comboThrottle(opts.throttleMs || 400);
 
+    /**
+     * Акселераторы, которые Lockdown не имеет права ни регистрировать, ни снимать.
+     * Сюда main-процесс кладёт аварийный выход: если Lockdown случайно возьмёт его
+     * себе, release() его же и снимет — и из экзамена станет не выйти.
+     */
+    this._reserved = new Set(Array.isArray(opts.reserved) ? opts.reserved : []);
+
     this.engaged = false;
     this._electronPresent = false;  // была ли реальная попытка регистрации хоткеев
     this._clipboardTimer = null;
@@ -279,7 +286,28 @@ class Lockdown {
 
   // ------------------------------------------------------------------- включение
 
-  /** Идемпотентно: можно звать повторно на browser-window-focus. */
+  /**
+   * Наблюдатели, которые НЕ отбирают у пользователя управление машиной:
+   * сейчас это только опрос мониторов. Их можно держать включёнными всю
+   * сессию — число экранов это доказательная база, а не блокировка.
+   * Отделены от engage() намеренно: с флагом --no-lockdown журнал
+   * MULTIPLE_DISPLAYS продолжает наполняться, а хоткеи не перехватываются.
+   */
+  startObservers() {
+    const api = electronApi();
+    if (!api) return null;
+    this._startDisplayTimer(api);
+    return { displays: Boolean(this._displayTimer) };
+  }
+
+  /**
+   * Включение блокировок. Идемпотентно: можно звать повторно на
+   * browser-window-focus. Зовётся ТОЛЬКО когда экзамен реально идёт —
+   * решение о моменте принимает main-процесс по состоянию сессии.
+   *
+   * Возвращает capabilities() с добавленным полем `intercepted`: список
+   * акселераторов, которые система действительно отдала нам.
+   */
   engage() {
     const api = electronApi();
     if (!api) {
@@ -292,32 +320,106 @@ class Lockdown {
     this._startClipboardTimer(api);
     this._startDisplayTimer(api);
     this.engaged = true;
+
+    // Требование журналирования: честно печатаем, что именно перехвачено,
+    // и прямо предупреждаем про системную область действия на macOS.
+    const taken = this.registeredAccelerators();
+    const refused = [...this._registered.entries()]
+      .filter(([, ok]) => ok !== true).map(([acc]) => acc);
+    this._log(`ВКЛЮЧЕНЫ блокировки, перехвачено глобальных сочетаний: ${taken.length}`);
+    if (taken.length) {
+      this._log(`перехвачены: ${taken.join(', ')}`);
+      if (this.platform === 'darwin') {
+        this._log('ВНИМАНИЕ: на macOS globalShortcut перехватывает эти сочетания '
+          + 'СИСТЕМНО — они перестают работать во ВСЕХ приложениях пользователя, '
+          + 'а не только в окне теста. Снимаются при выходе из состояния exam.');
+      } else {
+        this._log('перехват действует на уровне всей системы, пока блокировки включены');
+      }
+    }
+    if (refused.length) {
+      this._log(`система не отдала (остаются рабочими): ${refused.join(', ')}`);
+    }
+    if (this._clipboardTimer) {
+      this._log(`очистка СИСТЕМНОГО буфера обмена раз в ${this.clipboardIntervalMs} мс`);
+    }
     return this.capabilities();
   }
 
-  release() {
+  /**
+   * Снятие блокировок. Снимаем ТОЧЕЧНО только те акселераторы, которые
+   * зарегистрировали сами: globalShortcut.unregisterAll() снёс бы вместе с ними
+   * и аварийный выход прокторa, то есть единственный способ выйти отключал бы
+   * сам себя. Таймеры гасим здесь же — иначе буфер обмена продолжит чиститься
+   * уже после экзамена.
+   */
+  release(reason) {
     const api = electronApi();
-    if (api && api.globalShortcut) {
+    const gs = api && api.globalShortcut;
+    const freed = [];
+    const failed = [];
+    for (const [acc, ok] of this._registered.entries()) {
+      if (ok !== true) continue;
+      if (this._reserved.has(acc)) continue;   // не наш, не трогаем
+      if (!gs) continue;
       try {
-        api.globalShortcut.unregisterAll();
+        gs.unregister(acc);
+        freed.push(acc);
       } catch (err) {
-        this._log(`unregisterAll: ${err && err.message}`);
+        failed.push(acc);
+        this._log(`unregister(${acc}): ${err && err.message}`);
       }
     }
     this._registered.clear();
+
     if (this._clipboardTimer) {
       clearInterval(this._clipboardTimer);
       this._clipboardTimer = null;
     }
+    this.engaged = false;
+
+    this._log(`СНЯТЫ блокировки${reason ? ` (${reason})` : ''}: освобождено сочетаний `
+      + `${freed.length}${freed.length ? ` — ${freed.join(', ')}` : ''}; `
+      + 'очистка буфера обмена остановлена');
+    if (failed.length) this._log(`НЕ УДАЛОСЬ снять: ${failed.join(', ')}`);
+
+    // Подтверждение по факту, а не по нашему учёту: спрашиваем систему.
+    if (gs) {
+      const stuck = freed.filter((acc) => {
+        try { return gs.isRegistered(acc); } catch (err) { return false; }
+      });
+      if (stuck.length) this._log(`ОСТАЛИСЬ ЗАНЯТЫМИ (проверка системой): ${stuck.join(', ')}`);
+      else this._log('проверка системой: ни одно из наших сочетаний больше не занято');
+    }
+    return { freed, failed };
+  }
+
+  /** Полная остановка, включая наблюдателей. Для выхода из приложения. */
+  dispose(reason) {
+    const out = this.release(reason || 'dispose');
     if (this._displayTimer) {
       clearInterval(this._displayTimer);
       this._displayTimer = null;
     }
-    this.engaged = false;
+    return out;
   }
 
-  /** Повторная регистрация хоткеев — после возврата фокуса приложению. */
+  /** Акселераторы, которые система действительно отдала нам. */
+  registeredAccelerators() {
+    const out = [];
+    for (const [acc, ok] of this._registered.entries()) {
+      if (ok === true) out.push(acc);
+    }
+    return out;
+  }
+
+  /**
+   * Повторная регистрация хоткеев — после возврата фокуса приложению.
+   * Молчит, если блокировки не включены: иначе возврат фокуса на экране
+   * согласия снова захватил бы клавиатуру всей системы.
+   */
   reregister() {
+    if (!this.engaged) return;
     const api = electronApi();
     if (!api || !api.globalShortcut) return;
     this._registerShortcuts(api);
@@ -336,6 +438,11 @@ class Lockdown {
     for (const spec of LOCK_SPECS) {
       if (spec.kind !== 'shortcut') continue;
       for (const acc of this._acceleratorsFor(spec)) {
+        if (this._reserved.has(acc)) {
+          // аварийный выход и прочее зарезервированное — мимо Lockdown
+          this._log(`акселератор зарезервирован main-процессом, не берём: ${acc}`);
+          continue;
+        }
         if (this._registered.get(acc) === true) {
           // уже держим — проверим, что регистрация жива
           let alive = false;

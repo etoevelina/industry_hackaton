@@ -25,7 +25,12 @@ psutil>=5.9,<8.0
 # ultralytics: YOLOv8n для телефона и посторонних предметов (вес в models/).
 # onnxruntime: инференс лёгких моделей без torch.
 # ---------------------------------------------------------------------------
-mediapipe>=0.10.9,<0.11 ; platform_system != "Linux" or platform_machine == "x86_64"
+# ВЕРХНЯЯ ГРАНИЦА КРИТИЧНА. Начиная с 0.10.22 из пакета вырезан legacy-API
+# mediapipe.solutions, на котором построен FaceAnalyzer: в 0.10.35 и 1.x
+# модуль отдаёт только Image/ImageFormat/tasks, и канал взгляда (пункт 2.2 ТЗ)
+# молча уходит в available()==False. Проверено: 0.10.21 — последняя рабочая.
+# Переход на Tasks API (FaceLandmarker) — отдельная задача, см. memory/backlog.md.
+mediapipe>=0.10.9,<0.10.22 ; platform_system != "Linux" or platform_machine == "x86_64"
 ultralytics>=8.1,<8.4
 onnxruntime>=1.17,<2.0
 
@@ -55,3 +60,17 @@ librosa>=0.10.1,<0.12
 # ---------------------------------------------------------------------------
 jinja2>=3.1,<4.0
 cryptography>=42.0,<47.0
+
+# ──────────────────────────────────────────────────────────────────────────
+# ВНИМАНИЕ: onnx НЕ СТАВИТЬ В РАБОЧЕЕ ОКРУЖЕНИЕ.
+# Он нужен ТОЛЬКО для разового экспорта модели (scripts/fetch_models.sh) и
+# тянет protobuf>=6.31, тогда как mediapipe требует protobuf<5. Установка onnx
+# рядом с mediapipe ломает канал взгляда с ошибкой
+#   AttributeError: 'MessageFactory' object has no attribute 'GetPrototype'
+# Порядок действий при подготовке модели:
+#   python3 -m venv .venv-export && .venv-export/bin/pip install ultralytics onnx
+#   .venv-export/bin/python -c "from ultralytics import YOLO; YOLO('yolov8n.pt').export(format='onnx', imgsz=640, opset=12)"
+# либо, если экспортировали в основном окружении, вернуть protobuf обратно:
+#   pip install "protobuf>=4.25.3,<5"
+# В рантайме onnx не нужен: модель читает onnxruntime, который protobuf не использует.
+# ──────────────────────────────────────────────────────────────────────────

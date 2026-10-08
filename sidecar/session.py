@@ -8,6 +8,21 @@
 Переходы валидируются: оболочка не может «продолжить» заблокированную сессию
 или начать вторую поверх активной — это осознанно, чтобы доказательная база
 не смешивалась между сессиями.
+
+КОД СВЕРКИ И ПЕРЕДАЧА ДОКАЗАТЕЛЬСТВ
+-----------------------------------
+У сессии есть короткий код сверки (`session_code`): шесть символов base32,
+выведенные детерминированно из genesis-хеша цепочки и идентификатора студента.
+Проктор сверяет по нему, что пакетов столько же, сколько студентов, и что коды
+совпадают со списком, — тогда пропажа пакета сама становится фактом.
+
+Код появляется не в `start()`, а в `set_genesis()`, который вызывается сразу
+после открытия хранилища. Иначе было бы невозможно: genesis выводится из
+канонических метаданных сессии, и положить код внутрь этих метаданных значит
+замкнуть вывод на себя. Поэтому `meta()` — метаданные, ЗАЩИЩЁННЫЕ genesis, —
+кода не содержит и не меняется; код живёт в `summary()` (а сводка попадает в
+цепочку записью `session_close`, то есть защищена) и в `meta.json` на диске,
+который проверяющий всё равно обязан считать неподтверждённым.
 """
 from __future__ import annotations
 
@@ -26,6 +41,15 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 from protocol import ProctorEvent, Severity  # noqa: E402
+
+try:  # код сверки живёт в модуле передачи доказательств
+    from storage.handover import format_code, session_code  # noqa: E402
+except Exception:  # pragma: no cover — Р-05: отсутствие модуля не роняет сессию
+    def session_code(genesis: str, student_id: str = "", length: int = 6) -> str:  # type: ignore[misc]
+        return ""
+
+    def format_code(code: str) -> str:  # type: ignore[misc]
+        return str(code or "") or "—"
 
 _SAFE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
@@ -81,11 +105,20 @@ class Session:
         evidence_subdir: str = "evidence",
         db_filename: str = "evidence.sqlite",
         report_filename: str = "report.html",
+        handover: dict[str, Any] | None = None,
     ) -> None:
         self.sessions_root = Path(sessions_root)
         self.evidence_subdir = evidence_subdir
         self.db_filename = db_filename
         self.report_filename = report_filename
+        #: Куда и как уходят доказательства: каталог, его источник, признак
+        #: degraded_handover. Пишется в meta.json, в сводку и в шапку отчёта —
+        #: проктор обязан видеть, ушла копия на его диск или осталась здесь.
+        self.handover: dict[str, Any] = dict(handover or {})
+        #: Имя сессии было занято, пришлось взять соседнее. Попадает в сводку
+        #: (а значит в цепочку) и в отчёт: совпадение имён в общем каталоге —
+        #: это либо сдвинутые часы, либо попытка писать в чужой каталог.
+        self.id_collision: str = ""
 
         self._lock = threading.RLock()
         self._state = SessionState.IDLE
@@ -94,6 +127,12 @@ class Session:
         self.student_name: str = ""
         self.exam_id: str = ""
         self.session_id: str = ""
+        #: genesis-хеш цепочки доказательств. Ставится `set_genesis()` сразу
+        #: после открытия хранилища; из него выводится код сверки.
+        self.genesis: str = ""
+        #: Код сверки сессии. Пустая строка, пока genesis неизвестен: выдумывать
+        #: код там, где цепочки нет, значит выдавать непроверяемое за проверяемое.
+        self.session_code: str = ""
         self.dir: Path | None = None
         self.started_at: float = 0.0
         self.ended_at: float = 0.0
@@ -163,7 +202,30 @@ class Session:
             self.student_id = student_id or "anon"
             self.student_name = student_name or ""
             self.exam_id = exam_id or ""
+            # КАТАЛОГ СЕССИИ НИКОГДА НЕ ПЕРЕИСПОЛЬЗУЕТСЯ. `session_id` — это
+            # время старта плюс student_id, то есть имя предсказуемо, а часы на
+            # машине студента принадлежат студенту: сдвинув их, он получает
+            # ровно то же имя, что у уже сданной сессии. Прежний
+            # `mkdir(exist_ok=True)` в этом случае начинал писать В ЧУЖОЙ
+            # каталог — поверх чужого журнала, отчёта и кадров. На общей папке
+            # вуза это уничтожение чужих доказательств штатным кодом.
+            # Занято — берём соседнее имя и говорим об этом вслух.
             self.session_id = f"{stamp}_{safe_id(self.student_id)}"
+            base_id = self.session_id
+            suffix = 1
+            while (self.sessions_root / self.session_id).exists():
+                suffix += 1
+                self.session_id = f"{base_id}-{suffix}"
+            if self.session_id != base_id:
+                self.id_collision = (
+                    f"каталог {base_id} уже существует — эта сессия пишется в "
+                    f"{self.session_id}. Совпадение имён означает либо повтор "
+                    f"в ту же секунду, либо сдвинутые часы; чужой каталог не "
+                    f"затронут")
+            else:
+                self.id_collision = ""
+            self.genesis = ""
+            self.session_code = ""
             self.dir = self.sessions_root / self.session_id
             (self.dir / self.evidence_subdir).mkdir(parents=True, exist_ok=True)
 
@@ -222,6 +284,45 @@ class Session:
             self.final_risk = round(float(score), 2)
             self.final_action = str(action)
 
+    # ------------------------------------------------ передача доказательств
+    def set_genesis(self, genesis: str) -> str:
+        """Запомнить genesis-хеш цепочки и вывести из него код сверки.
+
+        Вызывается сразу после `EvidenceStore.open_session()`. Возвращает код
+        (пустую строку, если genesis неизвестен — например в деградированном
+        режиме без SQLite). Код детерминирован: тот же genesis и тот же студент
+        дают тот же код на любой машине, поэтому проверяющий пересчитывает его
+        сам и видит подмену.
+        """
+        with self._lock:
+            self.genesis = str(genesis or "").strip()
+            self.session_code = session_code(self.genesis, self.student_id)
+            self._write_meta()
+            return self.session_code
+
+    def set_handover(self, info: dict[str, Any]) -> None:
+        """Записать, куда и как уходят доказательства этой сессии."""
+        with self._lock:
+            self.handover = dict(info or {})
+            self._write_meta()
+
+    @property
+    def code_display(self) -> str:
+        """Код сверки для глаз и для диктовки: `ABC-DEF`."""
+        return format_code(self.session_code)
+
+    @property
+    def degraded_handover(self) -> bool:
+        """Копия НЕ ушла туда, куда просил проктор."""
+        return bool(self.handover.get("degraded_handover"))
+
+    @property
+    def package_path(self) -> Path | None:
+        """Куда ляжет пакет: рядом с каталогом сессии, `<session_id>.proctor.zip`."""
+        if self.dir is None or not self.session_id:
+            return None
+        return self.dir.parent / f"{self.session_id}.proctor.zip"
+
     # -------------------------------------------------------------------- пути
     @property
     def evidence_dir(self) -> Path | None:
@@ -251,7 +352,14 @@ class Session:
 
     # ------------------------------------------------------------------ сводки
     def meta(self) -> dict[str, Any]:
-        """Метаданные для EvidenceStore.open_session()."""
+        """Метаданные для EvidenceStore.open_session() — основа genesis-хеша.
+
+        ВНИМАНИЕ: состав этого словаря участвует в вычислении genesis, а из
+        genesis выводится код сверки. Поэтому ни кода, ни сведений о передаче
+        здесь быть не может (вывод замкнулся бы на себя) и добавлять сюда новые
+        поля без необходимости нельзя — это меняет genesis у всех будущих
+        сессий. Для файла `meta.json` есть `meta_file()`.
+        """
         with self._lock:
             return {
                 "session_id": self.session_id,
@@ -266,10 +374,43 @@ class Session:
                 "db_path": str(self.db_path) if self.dir else "",
             }
 
+    def meta_file(self) -> dict[str, Any]:
+        """Что пишется в `meta.json`: защищённые метаданные плюс передача.
+
+        Код сверки и сведения о передаче лежат здесь для удобства человека —
+        проктор открывает один файл и видит код. Доказательством этот файл не
+        является: он не защищён хешем. Проверяемая копия кода — в `summary`,
+        которая попадает в цепочку записью `session_close`.
+        """
+        with self._lock:
+            data = self.meta()
+            data.update({
+                "session_code": self.session_code,
+                "session_code_display": self.code_display,
+                "genesis_hash": self.genesis,
+                "handover": dict(self.handover),
+                "degraded_handover": self.degraded_handover,
+                "package_path": str(self.package_path) if self.package_path else "",
+                "id_collision": self.id_collision,
+            })
+            return data
+
     def summary(self) -> dict[str, Any]:
         with self._lock:
             duration = (self.ended_at or time.time()) - self.started_at if self.started_at else 0.0
             data = self.meta()
+            data.update({
+                # Код сверки и признак degraded_handover идут в сводку намеренно:
+                # сводка уходит в цепочку записью session_close, то есть эти два
+                # факта защищены хешем, а не лежат в правимом meta.json.
+                "session_code": self.session_code,
+                "session_code_display": self.code_display,
+                "genesis_hash": self.genesis,
+                "handover": dict(self.handover),
+                "degraded_handover": self.degraded_handover,
+                "package_path": str(self.package_path) if self.package_path else "",
+                "id_collision": self.id_collision,
+            })
             data.update({
                 "ended_at": self.ended_at,
                 "ended_at_iso": _iso(self.ended_at) if self.ended_at else "",
@@ -287,7 +428,7 @@ class Session:
 
     # --------------------------------------------------------------------- диск
     def _write_meta(self) -> None:
-        self._write_json("meta.json", self.meta())
+        self._write_json("meta.json", self.meta_file())
 
     def _write_json(self, name: str, payload: dict[str, Any]) -> None:
         if self.dir is None:

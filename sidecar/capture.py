@@ -128,12 +128,54 @@ class CameraCapture:
             return round((len(self._ts_window) - 1) / span, 2)
 
     # -------------------------------------------------------------- жизненный цикл
+    def _prime_authorization(self) -> None:
+        """
+        Разовое открытие камеры на ВЫЗЫВАЮЩЕМ потоке — только macOS.
+
+        Зачем: AVFoundation выдаёт разрешение на камеру лишь тогда, когда запрос
+        идёт с главного потока. Наш рабочий поток его сделать не может, OpenCV
+        прямо сообщает: «can not spin main run loop from other thread». Если первое
+        открытие камеры произойдёт в потоке, системный диалог не появится НИКОГДА,
+        и канал зрения останется пустым без единой внятной ошибки — ровно это
+        и случилось 07.10 при первом живом запуске.
+
+        Поэтому start() сначала открывает устройство здесь, на главном потоке:
+        запрос уходит системе, пользователь отвечает, разрешение запоминается.
+        Дальше рабочий поток открывает камеру уже беспрепятственно.
+
+        Не бросает исключений и ничего не ломает: это подготовка, а не проверка.
+        """
+        if sys.platform != "darwin":
+            return
+        cv2 = self._cv2
+        if cv2 is None:
+            return
+        try:
+            cap = cv2.VideoCapture(self.index)
+            opened = cap.isOpened()
+            cap.release()
+        except Exception as exc:
+            self._last_error = f"подготовка доступа к камере: {exc}"
+            return
+        if opened:
+            return
+        # Разрешения нет. Сообщаем так, чтобы человек понял, что делать.
+        self._last_error = (
+            f"камера {self.index} недоступна: нет разрешения у приложения, "
+            "запустившего сайдкар. Системные настройки -> Конфиденциальность "
+            "и безопасность -> Камера -> включить это приложение. "
+            "Если приложения нет в списке, запустите сайдкар из Terminal.app "
+            "(scripts/run-sidecar-terminal.command) — система спросит доступ."
+        )
+
     def start(self) -> bool:
         """Запустить поток чтения. False — opencv нет, работаем без камеры."""
         if self._thread is not None and self._thread.is_alive():
             return True
         if self._import_cv2() is None:
             return False
+        # Запрос разрешения обязан уйти с главного потока, см. _prime_authorization.
+        self._prime_authorization()
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, name="camera", daemon=True)
         self._thread.start()

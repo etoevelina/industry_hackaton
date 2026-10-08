@@ -1047,6 +1047,12 @@ class MockSidecar:
         if self.state == "idle":
             self.state = "calibrating"
             await self._broadcast(self._status())
+        if stage == "gaze_grid" and msg.get("point") is not None:
+            # точка сетки: итог этапа придёт на point=null (конец обхода)
+            await self._broadcast(envelope(MsgType.CALIBRATION, stage=stage, progress=0.0,
+                                           done=False, result={"point": msg.get("point"),
+                                                               "mock": True}))
+            return
         for progress in (0.0, 0.45, 0.8):
             await self._broadcast(envelope(MsgType.CALIBRATION, stage=stage,
                                            progress=progress, done=False, result={}))
@@ -1055,7 +1061,9 @@ class MockSidecar:
             MsgType.CALIBRATION, stage=stage, progress=1.0, done=True,
             result={"ok": True, "degraded": True, "mock": True,
                     "reason": "мок-режим: калибровка имитирована, камера не используется",
-                    "samples": 30}))
+                    "samples": 30,
+                    **({"all_points_done": True, "screen_map_applied": False}
+                       if stage == "gaze_grid" else {})}))
         await self._emit(make_event(EventKind.CALIBRATION_DONE,
                                     detail={"stage": stage, "degraded": True}))
         if self.state == "calibrating":

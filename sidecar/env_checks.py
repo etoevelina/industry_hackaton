@@ -98,6 +98,7 @@ __all__ = [
     "check_screen_recording",
     "check_blacklisted_processes",
     "check_displays",
+    "logical_display_count",
     "check_audio_devices",
     "available",
     "describe_checks",
@@ -1892,6 +1893,40 @@ def _displays_linux() -> list[dict[str, Any]]:
                 out.append({"name": node.name, "main": False,
                             "mirrored": False, "online": True})
     return out
+
+
+def logical_display_count() -> int | None:
+    """Сколько НЕЗАВИСИМЫХ экранов видит сама система. None — опросить не удалось.
+
+    `check_displays` отдаёт находку только при двух и более экранах — это
+    правильно для журнала, но не годится для СВЕРКИ: ядру нужно число всегда,
+    в том числе когда экран один. Логика счёта та же (зеркала считаются одним
+    экраном), и это намеренно: два разных способа посчитать мониторы внутри
+    одной системы разошлись бы между собой и обвиняли бы оболочку в
+    расхождении, которого нет.
+
+    Зачем число: в подписанной записи SHELL_CONFIG `display_count` приходит СО
+    СЛОВ оболочки (Electron `screen.getAllDisplays()`), и до этой функции ядру
+    нечем было его проверить. Второй независимо проверяемый факт в записи,
+    после интерпретатора (`python_mismatch`), — `main._shell_config_record`.
+    Расхождение само по себе не обвинение: монитор могли воткнуть между
+    опросами. Оно идёт в заметки записи, а не в список снятых защит.
+    """
+    try:
+        if IS_MAC:
+            screens = _displays_mac()
+        elif IS_WIN:
+            screens = _displays_win()
+        else:
+            screens = _displays_linux()
+    except Exception:
+        return None
+    active = [s for s in screens if s.get("online", True)]
+    if not active:
+        # Ни одного экрана система не назвала: это «не знаем», а не «ноль».
+        return None
+    mirrored = [s for s in active if s.get("mirrored")]
+    return len(active) - max(len(mirrored) - 1, 0)
 
 
 def check_displays(config: Any = None) -> list[EnvFinding]:

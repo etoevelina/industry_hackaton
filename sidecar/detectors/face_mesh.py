@@ -983,37 +983,46 @@ class FaceAnalyzer:
         # GAZE_SIDE/GAZE_OFF_SCREEN не родятся ни при каком повороте головы.
         # Голова за персональным порогом -> карте не верим, уходим на девиации,
         # где поворот головы учтён.
+        smap = self._calib.get("screen_map") if isinstance(self._calib, dict) else None
+        smap = smap if isinstance(smap, dict) else {}
+        head_tol = float(smap.get("head_tolerance") or 0.0)
         head_trusted = not obs.pose_ok or (
-            abs(obs.head_dev_yaw) < 1.0 and abs(obs.head_dev_pitch) < 1.0)
+            abs(obs.head_dev_yaw) < 1.0 and abs(obs.head_dev_pitch) < 1.0
+            and (head_tol <= 0.0 or (abs(obs.yaw - base["head_yaw"]) <= head_tol
+                                     and abs(obs.pitch - base["head_pitch"]) <= head_tol)))
         if obs.gaze_ok and head_trusted and self._has_screen_map():
             pt = self._eval_screen_map(obs.gaze_yaw, obs.gaze_pitch)
             if pt is not None:
                 x, y = pt
                 obs.gaze_point = (float(x), float(y))
-                margin = float(self._c("off_screen_margin"))
-                out_x = x < -margin or x > 1.0 + margin
-                out_y = y < -margin or y > 1.0 + margin
-                if out_x or out_y:
-                    # направление наибольшего выхода за границу экрана
-                    ox = (-margin - x) if x < -margin else (x - 1.0 - margin if out_x else 0.0)
-                    oy = (-margin - y) if y < -margin else (y - 1.0 - margin if out_y else 0.0)
-                    if ox >= oy:
-                        obs.gaze_off_direction = "left" if x < 0.5 else "right"
-                    else:
-                        obs.gaze_off_direction = "up" if y < 0.5 else "down"
+                # Запас границы растёт с ошибкой карты (LOO): «приемлемая»
+                # карта с ошибкой 12 % экрана при запасе 12 % отправляла бы
+                # честный взгляд в край экрана «мимо экрана».
+                margin = max(float(self._c("off_screen_margin")),
+                             2.0 * float(smap.get("loo_rmse") or 0.0))
+                # Карта решает только ГОРИЗОНТАЛЬ. По вертикали радужка ходит
+                # в 2–3 раза меньше, чем по горизонтали, при том же шуме, а
+                # сразу под экраном — клавиатура, над ним — «задумался».
+                # Выход вверх/вниз остаётся на персональных порогах ниже,
+                # как без карты: карта не делает их чувствительнее.
+                if x < -margin or x > 1.0 + margin:
+                    obs.gaze_off_direction = "left" if x < 0.5 else "right"
                     obs.gaze_zone = "off_screen"
                     obs.gaze_region = "off_screen"
                     return
-                box = float(self._c("screen_center_box"))
-                if abs(x - 0.5) <= box and abs(y - 0.5) <= box:
-                    obs.gaze_region = "center"
-                elif abs(x - 0.5) >= abs(y - 0.5):
-                    obs.gaze_region = "left" if x < 0.5 else "right"
-                else:
-                    obs.gaze_region = "up" if y < 0.5 else "down"
-                # точка внутри экрана -> нарушения нет, как бы ни косил глаз
-                obs.gaze_zone = "center"
-                return
+                if -margin <= y <= 1.0 + margin:
+                    box = float(self._c("screen_center_box"))
+                    if abs(x - 0.5) <= box and abs(y - 0.5) <= box:
+                        obs.gaze_region = "center"
+                    elif abs(x - 0.5) >= abs(y - 0.5):
+                        obs.gaze_region = "left" if x < 0.5 else "right"
+                    else:
+                        obs.gaze_region = "up" if y < 0.5 else "down"
+                    # точка внутри экрана -> зона center; персональные пороги
+                    # main._face_observations всё равно проверяет отдельно (ИЛИ),
+                    # поэтому карта, растянутая на калибровке, ничего не прячет
+                    obs.gaze_zone = "center"
+                    return
 
         # --- карты нет: пороговая логика по персональным порогам ---
         off = thr["off_screen_factor"]

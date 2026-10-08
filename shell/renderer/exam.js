@@ -328,12 +328,23 @@
     }
   };
 
-  /** Пауза по вердикту прокторинга: время не идёт, ввод недоступен (оверлей сверху). */
+  /**
+   * Пауза по вердикту прокторинга: время не идёт И ВВОД НЕДОСТУПЕН.
+   *
+   * Раньше здесь стоял только флаг, и «оверлей сверху» считался достаточной
+   * блокировкой. Он ею не был: оверлей перехватывает МЫШЬ (position:fixed с
+   * полупрозрачным фоном), но не клавиатуру. Поле ответа не получало ни
+   * `disabled`, ни `readonly`, ловушки фокуса не было, `go()` не проверял
+   * `paused`. В сумме это означало, что часы экзамена остановлены, а печатать
+   * можно — то есть пауза была для списывающего СТРОГО выгоднее, чем её
+   * отсутствие. Поэтому пауза теперь действительно приостанавливает ввод.
+   */
   Exam.prototype.pause = function () {
     if (this.paused || !this.running) return;
     this.paused = true;
     this._pauseStartedAt = Date.now();
-    this._setSaveState('тест приостановлен, время не идёт');
+    this._setSaveState('тест приостановлен, время не идёт, ввод недоступен');
+    this._applyPausedInput();
   };
 
   Exam.prototype.resume = function () {
@@ -342,8 +353,51 @@
     if (this._pauseStartedAt) this.pausedMs += Date.now() - this._pauseStartedAt;
     this._pauseStartedAt = 0;
     this._setSaveState('ответы сохраняются локально');
+    this._applyPausedInput();
     var ta = this.dom.body ? this.dom.body.querySelector('textarea') : null;
     if (ta) { try { ta.focus(); } catch (e) {} }
+  };
+
+  /**
+   * Привести доступность ввода в соответствие с `paused`.
+   *
+   * Зовётся и из pause/resume, и из `_render()`: вопрос может перерисоваться
+   * во время паузы (например, при возврате оболочки на тот же экран), и
+   * свежесозданный textarea иначе пришёл бы разблокированным.
+   *
+   * Три уровня, потому что ни одного по отдельности не хватает:
+   * * `disabled` на полях и кнопках — снимает и ввод, и табуляцию в них;
+   * * `inert` на содержимом экзамена — выключает его целиком для фокуса и
+   *   указателя там, где он поддерживается (Chromium в Electron — да);
+   * * `aria-hidden` — чтобы скринридер не читал приостановленный тест как
+   *   доступный. Доступность паузы обеспечивает оверлей, он вне этого узла.
+   */
+  Exam.prototype._applyPausedInput = function () {
+    var paused = !!this.paused;
+    var body = this.dom.body;
+    if (body) {
+      var fields = body.querySelectorAll('textarea, input, button, select');
+      for (var i = 0; i < fields.length; i += 1) {
+        fields[i].disabled = paused;
+      }
+      if (paused) {
+        body.setAttribute('inert', '');
+        body.setAttribute('aria-hidden', 'true');
+      } else {
+        body.removeAttribute('inert');
+        body.removeAttribute('aria-hidden');
+      }
+    }
+    // Навигация по билету — тоже ввод: на паузе вопрос не меняется.
+    if (this.dom.prev) this.dom.prev.disabled = paused || this.index === 0;
+    if (this.dom.next) this.dom.next.disabled = paused;
+    if (this.dom.palette) {
+      if (paused) {
+        this.dom.palette.setAttribute('inert', '');
+      } else {
+        this.dom.palette.removeAttribute('inert');
+      }
+    }
   };
 
   Exam.prototype.isPaused = function () { return this.paused; };
@@ -356,6 +410,12 @@
 
   Exam.prototype.go = function (nextIndex) {
     if (!this.running) return;
+    // На паузе вопрос не меняется. Без этой проверки навигация работала прямо
+    // поверх оверлея: `_leaveCurrent()` отправлял answer_submit, а счётчик
+    // времени стоял — то есть билет можно было пройти целиком на остановленных
+    // часах. Решение о продолжении принимает оболочка (а при review_required —
+    // проктор), и до него экзамен не двигается.
+    if (this.paused) return;
     if (nextIndex < 0) return;
     if (nextIndex >= QUESTIONS.length) { this.finish('student'); return; }
     this._leaveCurrent();
@@ -549,7 +609,8 @@
     }
     if (this.dom.prev) this.dom.prev.disabled = this.index === 0;
     if (this.dom.next) this.dom.next.textContent = this.index === QUESTIONS.length - 1 ? 'К завершению' : 'Далее';
-    this._setSaveState(this.paused ? 'тест приостановлен, время не идёт' : 'ответы сохраняются локально');
+    this._setSaveState(this.paused ? 'тест приостановлен, время не идёт, ввод недоступен'
+                                   : 'ответы сохраняются локально');
 
     // .qsheet — отступы и центровка листа (styles.css ждёт этот узел от exam.js)
     var sheet = document.createElement('div');
@@ -577,6 +638,10 @@
 
     this._protect(card);
     this._syncPalette();
+    // Разметка вопроса только что создана заново. Если идёт пауза, её поля
+    // обязаны приехать уже заблокированными: иначе любая перерисовка во время
+    // приостановки возвращала бы студенту рабочее поле ответа.
+    this._applyPausedInput();
 
     // question_shown уходит ПОСЛЕ отрисовки — время до ответа считается от показа
     if (this.telemetry) this.telemetry.questionShown(q.id, q.difficulty);

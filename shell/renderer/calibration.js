@@ -18,6 +18,19 @@
  * (progress/done/result) имеют приоритет — экран честен и с реальным сайдкаром,
  * и в деградированном режиме без CV-модулей.
  *
+ * Исключение — карта экрана. Точки обходит ОБОЛОЧКА, и ответ сайдкара по
+ * отдельной точке этап не заканчивает. Точка держится, пока сайдкар не
+ * сообщит, что набрал её кадры (point_done), но не меньше POINT_MIN_MS и не
+ * больше POINT_MAX_MS: на медленной камере точке нужно больше времени, а
+ * фиксированные 1.5 с оставляли бы карту без кадров. Если сайдкар по точке
+ * молчит (нет моста, мок, деградация) — GRID_MS. После последней точки уходит
+ * calibrate {stage:'gaze_grid', point:null} — «обход закончен, строй карту», —
+ * и этап ждёт итог (done) не дольше GRID_RESULT_WAIT_MS.
+ *
+ * Плохой итог этапа (grade 'poor', ok:false, карта не построена) не
+ * проглатывается: калибровка встаёт на паузу и предлагает «Повторить этап»
+ * или «Продолжить» с честным объяснением, чем это обернётся.
+ *
  * Текстовый статус обязателен. Анимация (сканлайн, пульс точки, волна) только
  * поддерживает процесс: при prefers-reduced-motion она гаснет, а объяснение
  * «что происходит» и «что делать» остаётся на месте.
@@ -29,6 +42,10 @@
   'use strict';
 
   var GRID_MS = 1500;
+  var POINT_MIN_MS = 900;
+  var POINT_MAX_MS = 3000;
+  /** Сколько ждать карту экрана после обхода: расчёт — один кадр CV-потока. */
+  var GRID_RESULT_WAIT_MS = 4000;
 
   /**
    * Описание стадий. cap — ключ из hello.capabilities.
@@ -62,7 +79,7 @@
     {
       key: 'gaze_grid',
       name: 'Карта экрана',
-      meta: '9 точек по 1.5 с',
+      meta: '9 точек по 1–3 с',
       ms: 9 * GRID_MS,
       cap: 'gaze',
       what: 'Девять точек задают карту экрана. По ней система отличает взгляд в край собственного экрана от взгляда мимо экрана.',
@@ -154,6 +171,12 @@
 
   function pad2(n) { return n < 10 ? '0' + n : String(n); }
 
+  /** Причина от сайдкара -> предложение для человека. */
+  function sentence(s) {
+    s = String(s);
+    return s.charAt(0).toUpperCase() + s.slice(1) + '.';
+  }
+
   // =========================================================================
 
   function Calibration() {
@@ -172,8 +195,13 @@
     this._raf = null;
     this._t0 = 0;
     this._gridIdx = -1;
-    this._gridSent = -1;
     this._lastSec = -1;
+    this._gridFinalizeAt = 0;  // когда ушёл сигнал «строй карту» (0 — ещё нет)
+    this._gridDone = false;    // итог карты экрана пришёл
+    this._pointT0 = 0;         // когда показана текущая точка сетки
+    this._pointState = '';     // '' — сайдкар молчит | 'collecting' | 'done'
+    this._paused = false;      // этап закончился плохо, ждём решения человека
+    this._startLabel = '';
 
     this.sendCalibrate = null;
     this.onDone = null;
@@ -221,7 +249,12 @@
     if (this.dom.btnRetry) this.dom.btnRetry.disabled = true;
 
     if (this.dom.btnStart) {
-      this.dom.btnStart.addEventListener('click', function () { self.start(); });
+      this._startLabel = this.dom.btnStart.textContent;
+      // На паузе после плохого этапа та же кнопка значит «Продолжить».
+      this.dom.btnStart.addEventListener('click', function () {
+        if (self._paused) self._resume();
+        else self.start();
+      });
     }
     if (this.dom.btnRetry) {
       this.dom.btnRetry.addEventListener('click', function () { self.retryStage(); });
@@ -419,11 +452,12 @@
 
   /* -------------------------------------------------------------- отправка */
 
+  /** false — сообщение заведомо не ушло (нет моста): ответа ждать не надо. */
   Calibration.prototype._send = function (stage, point) {
-    if (!this.sendCalibrate) return;
+    if (!this.sendCalibrate) return false;
     try {
-      this.sendCalibrate(stage, point || null);
-    } catch (e) { /* канал недоступен — продолжаем локально */ }
+      return this.sendCalibrate(stage, point || null) !== false;
+    } catch (e) { return false; /* канал недоступен — продолжаем локально */ }
   };
 
   /* ----------------------------------------------------------------- старт */
@@ -447,7 +481,23 @@
 
   Calibration.prototype.retryStage = function () {
     if (!this.running || this.stageIndex < 0) return;
+    this._setPaused(false);
     this.stageIndex--;
+    this._nextStage();
+  };
+
+  /** Пауза после плохого этапа: кнопка «Начать» становится «Продолжить». */
+  Calibration.prototype._setPaused = function (on) {
+    this._paused = !!on;
+    if (!this.dom.btnStart) return;
+    this.dom.btnStart.textContent = on ? 'Продолжить' : this._startLabel;
+    this.dom.btnStart.hidden = !on;
+  };
+
+  /** Человек решил идти дальше с плохим этапом: это видно в итоговой сводке. */
+  Calibration.prototype._resume = function () {
+    if (!this.running || !this._paused) return;
+    this._setPaused(false);
     this._nextStage();
   };
 
@@ -463,8 +513,15 @@
     this.stageProgress = 0;
     this._t0 = Date.now();
     this._gridIdx = -1;
-    this._gridSent = -1;
     this._lastSec = -1;
+    this._gridFinalizeAt = 0;
+    this._gridDone = false;
+    this._pointT0 = 0;
+    this._pointState = '';
+    // Повтор этапа начинается с нуля: прогресс и итог прошлой попытки
+    // иначе закончили бы новую попытку на первом же кадре.
+    delete this.remoteProgress[st.key];
+    delete this.results[st.key];
 
     if (this.dom.title) this.dom.title.textContent = st.name;
     if (this.dom.hint) this.dom.hint.textContent = st.what;
@@ -564,13 +621,24 @@
       var elapsed = Date.now() - self._t0;
       var local = Math.min(1, elapsed / st.ms);
       var remote = self.remoteProgress[st.key];
-      self.stageProgress = (typeof remote === 'number' && remote > local)
-        ? Math.min(1, remote) : local;
+      if (st.key === 'gaze_grid') {
+        // Обход ведёт оболочка: прогресс сайдкара по точкам не может
+        // закончить этап раньше, чем показаны все точки.
+        self._gridStep(st);
+        self.stageProgress = self._gridIdx >= GRID.length ? 1 : Math.min(0.99,
+          (self._gridIdx + Math.min(1, (Date.now() - self._pointT0) / GRID_MS)) / GRID.length);
+      } else {
+        self.stageProgress = (typeof remote === 'number' && remote > local)
+          ? Math.min(1, remote) : local;
+      }
 
       self._renderStage(st, elapsed);
       self._renderProgress();
 
-      if (self.stageProgress >= 1) { self._stageDone(st); return; }
+      if (self.stageProgress >= 1 && (st.key !== 'gaze_grid' || self._gridSettled())) {
+        self._stageDone(st);
+        return;
+      }
       self._raf = requestAnimationFrame(frame);
     }
     this._raf = requestAnimationFrame(frame);
@@ -601,30 +669,7 @@
       if (d.tele && secTick) d.tele.textContent = 'GAZE_CENTER · ' + pad2(leftSec) + 's';
     }
 
-    if (st.key === 'gaze_grid') {
-      var idx = Math.min(GRID.length - 1, Math.floor(elapsed / GRID_MS));
-      if (idx !== this._gridIdx) {
-        this._gridIdx = idx;
-        var p = GRID[idx];
-        if (d.dot) {
-          // Позиция точки — данные, а не оформление: координаты приходят из
-          // карты обхода, поэтому задаются атрибутом style (см. CSP в index.html).
-          d.dot.style.left = (p[0] * 100).toFixed(2) + '%';
-          d.dot.style.top = (p[1] * 100).toFixed(2) + '%';
-        }
-        if (idx !== this._gridSent) {
-          this._gridSent = idx;
-          this._send('gaze_grid', [p[0], p[1]]);
-        }
-        if (d.todo) {
-          d.todo.textContent = 'Точка ' + (idx + 1) + ' из ' + GRID.length +
-            '. ' + st.todo;
-        }
-        if (d.tele) {
-          d.tele.textContent = 'GAZE_GRID · ' + pad2(idx + 1) + '/' + pad2(GRID.length);
-        }
-      }
-    }
+    // gaze_grid рисует _gridStep(): точка меняется по событию, а не по часам
 
     if (st.key === 'voice') {
       if (d.todo && secTick) {
@@ -651,9 +696,122 @@
     }
   };
 
+  /**
+   * Шаг обхода сетки: перейти к следующей точке, когда текущая своё отстояла.
+   * После последней точки _gridIdx === GRID.length — обход закончен.
+   */
+  Calibration.prototype._gridStep = function (st) {
+    if (this._gridIdx >= GRID.length) return;
+    var now = Date.now();
+    if (this._gridIdx >= 0) {
+      var t = now - this._pointT0;
+      var ps = this._pointState;
+      var next = t >= POINT_MAX_MS ||
+        (ps === 'done' && t >= POINT_MIN_MS) ||
+        (ps === '' && t >= GRID_MS);
+      if (!next) return;
+    }
+    this._gridIdx++;
+    if (this._gridIdx >= GRID.length) return;
+    this._pointT0 = now;
+    this._pointState = '';
+
+    var d = this.dom;
+    var p = GRID[this._gridIdx];
+    if (d.dot) {
+      // Позиция точки — данные, а не оформление: координаты приходят из
+      // карты обхода, поэтому задаются атрибутом style (см. CSP в index.html).
+      d.dot.style.left = (p[0] * 100).toFixed(2) + '%';
+      d.dot.style.top = (p[1] * 100).toFixed(2) + '%';
+    }
+    this._send('gaze_grid', [p[0], p[1]]);
+    if (d.todo) {
+      d.todo.textContent = 'Точка ' + (this._gridIdx + 1) + ' из ' + GRID.length + '. ' + st.todo;
+    }
+    if (d.tele) {
+      d.tele.textContent = 'GAZE_GRID · ' + pad2(this._gridIdx + 1) + '/' + pad2(GRID.length);
+    }
+  };
+
+  /** Ответ сайдкара относится к точке, которая сейчас на экране? */
+  Calibration.prototype._isCurrentPoint = function (pt) {
+    var cur = GRID[this._gridIdx];
+    return !!(cur && Array.isArray(pt) && pt.length === 2 &&
+      Math.abs(pt[0] - cur[0]) < 1e-6 && Math.abs(pt[1] - cur[1]) < 1e-6);
+  };
+
+  /**
+   * Обход сетки закончен: попросить карту и ждать её итога.
+   * true — можно закрывать этап (итог пришёл, ждать нечего или ждать дольше
+   * нельзя; во втором случае итог честно помечается как «ответа нет»).
+   */
+  Calibration.prototype._gridSettled = function () {
+    if (!this._gridFinalizeAt) {
+      this._gridFinalizeAt = Date.now();
+      if (!this._send('gaze_grid', null)) return true;
+      this._setBadge('расчёт карты', 'var(--signal)');
+      if (this.dom.todo) {
+        this.dom.todo.textContent = 'Строим карту экрана по ' + GRID.length + ' точкам…';
+      }
+      if (this.dom.tele) this.dom.tele.textContent = 'GAZE_GRID · MAP';
+      return false;
+    }
+    if (this._gridDone) return true;
+    if (Date.now() - this._gridFinalizeAt < GRID_RESULT_WAIT_MS) return false;
+    this.results.gaze_grid = { ok: true, screen_map_applied: false, timeout: true };
+    return true;
+  };
+
+  /**
+   * Что пошло не так на этапе — словами для человека; '' — всё в порядке.
+   * Деградация (канала нет, мок) — не провал: о ней уже сказано в плане.
+   */
+  Calibration.prototype._problemOf = function (key, res) {
+    if (!res || typeof res !== 'object' || res.degraded) return '';
+    var q = (res.quality && typeof res.quality === 'object') ? res.quality : res;
+    if (key === 'gaze_grid') {
+      // Этап сетки судим по карте: короткий центр портит общую оценку, но
+      // не делает хорошую карту плохой (map_grade считает сайдкар по LOO).
+      if (res.screen_map_applied !== false) {
+        return res.ok === false ? sentence(res.reason || 'карта экрана не построена') : '';
+      }
+      if (res.timeout) return 'Модуль наблюдения не ответил вовремя — карта экрана не построена.';
+      if (q.map_grade === 'poor' && typeof q.loo_rmse === 'number' && q.loo_rmse > 0) {
+        return 'Карта экрана получилась неточной: ошибка около ' +
+          Math.round(q.loo_rmse * 100) + '% ширины экрана.';
+      }
+      if (res.ok === false && res.reason) return sentence(res.reason);
+      return 'Карта экрана не построилась: точкам не хватило кадров с вашим взглядом.';
+    }
+    if (res.ok === false) return sentence(res.reason || 'измерение не удалось');
+    if (q.grade === 'poor') {
+      return key === 'gaze_center'
+        ? 'Взгляд не удержался в центре — нулевая точка получилась неустойчивой.'
+        : 'Измерение получилось неустойчивым.';
+    }
+    return '';
+  };
+
+  Calibration.prototype._pauseOnProblem = function (st, problem) {
+    var after = st.key === 'gaze_grid'
+      ? 'взгляд будет оцениваться по персональным порогам, без карты экрана, и ложных отметок станет больше.'
+      : 'наблюдение по этому каналу будет грубее.';
+    this._setBadge('повторите этап', 'var(--risk-warn)');
+    if (this.dom.todo) {
+      this.dom.todo.textContent = problem + ' «Повторить этап» — переснять; «Продолжить» — идти дальше: ' + after;
+    }
+    if (this.dom.tele) this.dom.tele.textContent = st.key.toUpperCase() + ' · RETRY';
+    if (this.dom.count) this.dom.count.textContent = '';
+    if (this.dom.btnRetry) this.dom.btnRetry.disabled = false;
+    this._setPaused(true);
+  };
+
   Calibration.prototype._stageDone = function (st) {
     if (this._raf) { cancelAnimationFrame(this._raf); this._raf = null; }
     if (!this.results[st.key]) this.results[st.key] = { ok: true };
+
+    var problem = this._problemOf(st.key, this.results[st.key]);
+    if (problem) { this._pauseOnProblem(st, problem); return; }
 
     this._setBadge('этап пройден', 'var(--signal)');
     if (this.dom.todo) this.dom.todo.textContent = 'Этап пройден, переходим к следующему.';
@@ -707,13 +865,20 @@
   /** Перечислить словами, что именно записано, и что пропущено и почему. */
   Calibration.prototype._summaryText = function () {
     var got = [];
+    var weak = [];
     var skipped = [];
     for (var i = 0; i < this.plan.length; i++) {
       var item = this.plan[i];
-      if (item.skip) skipped.push(item.def.name.toLowerCase());
-      else got.push(item.def.name.toLowerCase());
+      var name = item.def.name.toLowerCase();
+      if (item.skip) skipped.push(name);
+      else if (this._problemOf(item.def.key, this.results[item.def.key])) weak.push(name);
+      else got.push(name);
     }
-    var s = 'Персональная норма записана: ' + got.join(', ') + '.';
+    var s = got.length ? 'Персональная норма записана: ' + got.join(', ') + '.' : '';
+    if (weak.length) {
+      s += (s ? ' ' : '') + 'Не удалось: ' + weak.join(', ') +
+        ' — по этим каналам наблюдение будет грубее.';
+    }
     if (skipped.length) {
       s += ' Пропущено: ' + skipped.join(', ') + ' — ' + this._firstSkipReason();
     }
@@ -731,28 +896,47 @@
 
   /* ------------------------------------------------- сообщения от сайдкара */
 
-  /** Входящее calibration: {stage, progress, done, result}. */
+  /**
+   * Входящее calibration: {stage, progress, done, result}.
+   *
+   * Оценку итога (плохое качество -> пауза с выбором) делает _stageDone():
+   * здесь только складываем. Качество взгляда сайдкар кладёт в result.quality
+   * (LOO-кросс-валидация карты), а не в корень result.
+   */
   Calibration.prototype.applyMessage = function (msg) {
     if (!msg || typeof msg !== 'object' || !msg.stage) return;
     if (typeof msg.progress === 'number') this.remoteProgress[msg.stage] = msg.progress;
-    if (msg.result && typeof msg.result === 'object') this.results[msg.stage] = msg.result;
+    if (msg.stage === 'gaze_grid') {
+      var r = (msg.result && typeof msg.result === 'object') ? msg.result : null;
+      // Итог карты — только ответ на сигнал конца обхода (docs/CONTRACT.md).
+      if (msg.done && this._gridFinalizeAt) {
+        this.results.gaze_grid = r || { ok: true };
+        this._gridDone = true;
+        return;
+      }
+      // Ход точки: сайдкар копит её кадры или уже набрал. Деградация и мок
+      // кадров не копят — тогда точка стоит обычные GRID_MS.
+      if (r && !msg.done && !r.degraded && !r.mock && this._isCurrentPoint(r.point) &&
+          this._pointState !== 'done') {
+        this._pointState = r.point_done ? 'done' : 'collecting';
+      }
+      return;
+    }
+    // Итог — только из done: промежуточный прогресс несёт оценку ПРОШЛОЙ
+    // попытки, и по ней этап, закрытый по таймеру, встал бы на ложную паузу.
+    // Итог стадии, с которой оболочка уже ушла (superseded), приходит позже
+    // и попадает в сводку.
     if (msg.done) {
       this.remoteProgress[msg.stage] = 1;
-      if (!this.results[msg.stage]) this.results[msg.stage] = { ok: true };
-    }
-    // Качество калибровки взгляда сайдкар считает честно (LOO-кросс-валидация);
-    // если оно плохое, говорим об этом прямо и предлагаем повторить этап.
-    var res = this.results[msg.stage];
-    if (res && (res.grade === 'poor' || res.ok === false) && this.dom.todo) {
-      this.dom.todo.textContent = 'Измерение получилось неустойчивым. ' +
-        'Нажмите «Повторить этап»: это снизит число ложных отметок на экзамене.';
-      this._setBadge('повторите этап', 'var(--risk-warn)');
+      this.results[msg.stage] = (msg.result && typeof msg.result === 'object')
+        ? msg.result : { ok: true };
     }
   };
 
   /* ----------------------------------------------------------------- сброс */
 
   Calibration.prototype.reset = function () {
+    this._setPaused(false);
     this.running = false;
     this.done = false;
     this.stageIndex = -1;

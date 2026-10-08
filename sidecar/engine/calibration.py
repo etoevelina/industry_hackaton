@@ -85,7 +85,11 @@ DEFAULTS: dict[str, Any] = {
     # стадия сетки
     "grid_target_samples": 15,       # на точку
     "min_grid_samples": 8,
-    "min_grid_points": 6,            # меньше 6 точек -> только аффинная карта
+    # poly2 — 6 параметров: LOO (переобучение без точки) осмыслен только при
+    # 8+ точках, иначе он вырождается в ошибку на обучении (~0) и «хорошей»
+    # становится любая карта. Аффинной (3 параметра) нужно 5+ точек.
+    "min_grid_points": 8,            # меньше -> только аффинная карта
+    "min_affine_points": 5,          # меньше -> карты нет
     "grid_head_tolerance": 8.0,      # градусы; голова ушла — сэмпл не берём
     "ridge": 1e-6,
     "good_rmse": 0.08,               # доля экрана
@@ -140,6 +144,22 @@ def _sample_get(sample: Any, name: str, default: Any = None) -> Any:
     if isinstance(sample, dict):
         return sample.get(name, default)
     return getattr(sample, name, default)
+
+
+def _gaze_pair(sample: Any) -> tuple[Any, Any]:
+    """(gaze_yaw, gaze_pitch) БЕЗ сглаживания детектора, если оно известно.
+
+    Детектор сглаживает взгляд медианой и EMA: после перевода глаз на новую
+    точку сглаженное значение доходит до неё за ~1 с, и при 10–12 к/с медиана
+    точки съезжает на 10–15 % экрана к предыдущей. Карта, обученная на таком
+    взгляде, сжата и смещена по ходу обхода. Сырое значение кадра (`raw`)
+    этой инерции не имеет; в установившемся взгляде оба совпадают, поэтому
+    карта, обученная на сыром, верна и для сглаженного взгляда на экзамене.
+    """
+    raw = _sample_get(sample, "raw", None)
+    if isinstance(raw, dict) and _finite(raw.get("gaze_yaw")) and _finite(raw.get("gaze_pitch")):
+        return raw["gaze_yaw"], raw["gaze_pitch"]
+    return _sample_get(sample, "gaze_yaw", None), _sample_get(sample, "gaze_pitch", None)
 
 
 def _robust_stats(values: list[float]) -> tuple[float, float]:
@@ -219,6 +239,7 @@ class GazeCalibration:
         self._quality: dict[str, Any] = {"grade": "none",
                                          "message": "Калибровка не выполнена."}
         self._rejected = {"gaze": 0, "blink": 0, "head": 0, "visibility": 0}
+        self._center_pending = False
         self._ts = 0.0
         self.reset()
 
@@ -249,9 +270,11 @@ class GazeCalibration:
         self._thresholds = {}
         self._grid = []
         self._grid_idx = -1
+        self._fit_pts: list[tuple[tuple[float, float], float, float]] = []
         self._screen_map = {"kind": None}
         self._quality = {"grade": "none", "message": "Калибровка не выполнена."}
         self._rejected = {"gaze": 0, "blink": 0, "head": 0, "visibility": 0}
+        self._center_pending = False
         self._ts = 0.0
 
     @property
@@ -261,6 +284,10 @@ class GazeCalibration:
     def begin_center(self) -> None:
         self._stage = STAGE_CENTER
         self._center = {k: [] for k in self.CENTER_KEYS}
+        self._center_pending = False
+        # фильтр морганий сравнивает с EAR базы; база прошлой попытки (а то и
+        # другого человека с другой формой глаз) отбросила бы все кадры центра
+        self._base.pop("ear", None)
 
     def begin_grid(self, points: Any = None) -> list[tuple[float, float]]:
         """Начать 9-точечную стадию. Возвращает список целей для оболочки."""
@@ -281,9 +308,16 @@ class GazeCalibration:
     def grid_points(self) -> list[tuple[float, float]]:
         return [g["point"] for g in self._grid]
 
-    def begin_point(self, point: Any = None) -> int:
+    def begin_point(self, point: Any = None, fresh: bool = False) -> int:
         """Переключиться на точку сетки. point=[x,y] из сообщения `calibrate`
-        или None — тогда берётся следующая по порядку."""
+        или None — тогда берётся следующая по порядку.
+
+        fresh=True — оболочка только что ПОКАЗАЛА эту точку (см. visit_point).
+        Без fresh (вызов на каждом кадре) точка только выбирается по ближайшей
+        координате, накопленное не трогается.
+        """
+        if fresh and point is not None:
+            return self.visit_point(point)
         if not self._grid:
             self.begin_grid()
         if point is None:
@@ -305,6 +339,33 @@ class GazeCalibration:
         self._grid_idx = best
         return best
 
+    def visit_point(self, point: Any) -> int:
+        """Оболочка показала точку: она и есть цель регрессии, ровно как есть.
+
+        Сетка оболочки (0.06/0.94) не совпадает с DEFAULT_GRID (0.1/0.9), и
+        «прищёлкивание» к ближайшей точке по умолчанию учило бы карту на
+        смещённых целях — она сжимала бы экран. Поэтому первый показ после
+        другой стадии начинает сетку с нуля и из точек оболочки, а точка
+        сопоставляется только по точной координате (иначе на плотной сетке
+        новая точка затёрла бы соседнюю). Повторный показ той же точки
+        сбрасывает её кадры: повтор этапа не смешивает старый взгляд с новым.
+        """
+        try:
+            px, py = float(point[0]), float(point[1])
+        except (TypeError, ValueError, IndexError):
+            return self.begin_point(None)
+        if self._stage != STAGE_GRID:
+            self._stage = STAGE_GRID
+            self._grid = []
+        for i, g in enumerate(self._grid):
+            if abs(g["point"][0] - px) <= 1e-3 and abs(g["point"][1] - py) <= 1e-3:
+                self._grid[i] = {"point": (px, py), "samples": []}
+                self._grid_idx = i
+                return i
+        self._grid.append({"point": (px, py), "samples": []})
+        self._grid_idx = len(self._grid) - 1
+        return self._grid_idx
+
     # ------------------------------------------------------------------
     # приём сэмплов
     # ------------------------------------------------------------------
@@ -313,8 +374,7 @@ class GazeCalibration:
         if not _sample_get(obs, "gaze_ok", False):
             self._rejected["gaze"] += 1
             return False
-        g_yaw = _sample_get(obs, "gaze_yaw", None)
-        g_pitch = _sample_get(obs, "gaze_pitch", None)
+        g_yaw, g_pitch = _gaze_pair(obs)
         if not (_finite(g_yaw) and _finite(g_pitch)):
             self._rejected["gaze"] += 1
             return False
@@ -350,9 +410,10 @@ class GazeCalibration:
             return len(self._center["gaze_yaw"])
         if not self._usable(obs, check_head=False):
             return len(self._center["gaze_yaw"])
+        g_yaw, g_pitch = _gaze_pair(obs)
         src = {
-            "gaze_yaw": _sample_get(obs, "gaze_yaw", None),
-            "gaze_pitch": _sample_get(obs, "gaze_pitch", None),
+            "gaze_yaw": g_yaw,
+            "gaze_pitch": g_pitch,
             "head_yaw": _sample_get(obs, "yaw", None),
             "head_pitch": _sample_get(obs, "pitch", None),
             "head_roll": _sample_get(obs, "roll", None),
@@ -365,6 +426,7 @@ class GazeCalibration:
                 continue
             if _finite(v):
                 self._center[k].append(float(v))
+        self._center_pending = True
         return len(self._center["gaze_yaw"])
 
     def add_grid_sample(self, obs: Any, point: Any = None) -> int:
@@ -379,9 +441,8 @@ class GazeCalibration:
             return len(self._grid[self._grid_idx]["samples"])
         if not self._usable(obs, check_head=True):
             return len(self._grid[self._grid_idx]["samples"])
-        g_yaw = float(_sample_get(obs, "gaze_yaw", 0.0))
-        g_pitch = float(_sample_get(obs, "gaze_pitch", 0.0))
-        self._grid[self._grid_idx]["samples"].append((g_yaw, g_pitch))
+        g_yaw, g_pitch = _gaze_pair(obs)
+        self._grid[self._grid_idx]["samples"].append((float(g_yaw), float(g_pitch)))
         return len(self._grid[self._grid_idx]["samples"])
 
     # ------------------------------------------------------------------
@@ -394,15 +455,23 @@ class GazeCalibration:
         self._base = {k: stats[k][0] for k in self.CENTER_KEYS}
         self._sigma = {k: stats[k][1] for k in self.CENTER_KEYS}
         self._base["samples"] = float(n)
+        self._center_pending = False
 
         k_sigma = float(self._c("k_sigma"))
         ceil_f = float(self._c("threshold_ceiling_factor"))
         enough = n >= int(self._c("min_center_samples"))
+        # Шатание головой и взглядом на центре раздувало бы пороги до потолка
+        # (голова до 45°), а «Продолжить» оставляло бы их на весь экзамен.
+        # Неустойчивый центр — не норма человека, а провал измерения.
+        stable = (max(self._sigma.get("gaze_yaw", 0.0), self._sigma.get("gaze_pitch", 0.0))
+                  <= float(self._c("center_gaze_sigma_max"))
+                  and max(self._sigma.get("head_yaw", 0.0), self._sigma.get("head_pitch", 0.0))
+                  <= float(self._c("center_head_sigma_max")))
 
         def thr(floor_key: str, sigma_key: str) -> float:
             floor = float(self._c(floor_key))
-            if not enough:
-                return floor               # мало данных — доверяем только полу
+            if not enough or not stable:
+                return floor               # мало или негодные данные — только пол
             return _clamp(k_sigma * self._sigma.get(sigma_key, 0.0),
                           floor, floor * ceil_f)
 
@@ -424,7 +493,9 @@ class GazeCalibration:
     # ------------------------------------------------------------------
     def finish_grid(self) -> dict[str, Any]:
         """Обучить карту «взгляд -> экран» по собранным точкам."""
-        if not self._base:
+        if not self._base or self._center_pending:
+            # оболочка могла уйти с центра раньше, чем набралась цель кадров:
+            # база считается по тому, что успели собрать, а не берётся старая
             self.finish_center()
         min_s = int(self._c("min_grid_samples"))
         pts: list[tuple[tuple[float, float], float, float]] = []
@@ -444,6 +515,7 @@ class GazeCalibration:
             v = statistics.median([p[1] for p in kept])
             pts.append((g["point"], u, v))
 
+        self._fit_pts = pts
         c0 = float(self._base.get("gaze_yaw", 0.0))
         c1 = float(self._base.get("gaze_pitch", 0.0))
         scale = 1.0
@@ -453,7 +525,7 @@ class GazeCalibration:
         kind = None
         if len(pts) >= int(self._c("min_grid_points")):
             kind = "poly2"
-        elif len(pts) >= 3:
+        elif len(pts) >= int(self._c("min_affine_points")):
             kind = "affine"
 
         self._screen_map = {"kind": None, "center": [c0, c1], "scale": scale,
@@ -490,6 +562,9 @@ class GazeCalibration:
             "coef_y": coef_y,
             "features": _FEATURE_NAMES[kind],
             "points": len(pts),
+            # карта обучена при этой позе головы: дальше grid_head_tolerance
+            # от базы детектор ей не верит (face_mesh._classify_zone)
+            "head_tolerance": float(self._c("grid_head_tolerance")),
         }
         self._ts = time.time()
         self._grade(grid_pts=pts)
@@ -497,7 +572,7 @@ class GazeCalibration:
 
     def finish(self) -> dict[str, Any]:
         """Завершить калибровку целиком (центр + сетка, если она собиралась)."""
-        if not self._base:
+        if not self._base or self._center_pending:
             self.finish_center()
         if any(g["samples"] for g in self._grid):
             return self.finish_grid()
@@ -582,13 +657,29 @@ class GazeCalibration:
             }
         return dict(self._thresholds)
 
+    def screen_map_usable(self) -> bool:
+        """Можно ли детектору верить карте экрана.
+
+        Плохая карта опаснее, чем её отсутствие: внутри неё действует правило
+        «точка на экране -> нарушения нет», и сжатая карта прячет взгляд мимо
+        экрана. Поэтому при map_grade == 'poor' детектор остаётся на
+        персональных порогах, а сама карта сохраняется в JSON для разбора.
+        Решает оценка КАРТЫ (LOO), а не общая: короткий центр портит общую
+        оценку, но не делает хорошую карту неточной.
+        """
+        return self._screen_map.get("kind") in ("poly2", "affine") and \
+            self._quality.get("map_grade") in ("good", "fair")
+
     def attach(self, analyzer: Any) -> bool:
         """Отдать калибровку детектору (duck typing, без импорта детектора)."""
         fn = getattr(analyzer, "apply_calibration", None)
         if not callable(fn):
             return False
+        data = self.to_dict()
+        if not self.screen_map_usable():
+            data["screen_map"] = {"kind": None}
         try:
-            return bool(fn(self.to_dict()))
+            return bool(fn(data))
         except Exception:
             return False
 
@@ -653,23 +744,35 @@ class GazeCalibration:
 
         rmse = loo = max_err = 0.0
         if grid_pts is None:
-            grid_pts = []
-            if self._screen_map.get("kind"):
-                grid_pts = [(g["point"],
-                             statistics.median([s[0] for s in g["samples"]]),
-                             statistics.median([s[1] for s in g["samples"]]))
-                            for g in self._grid if g["samples"]]
+            # ровно те точки, на которых карта обучена (finish_grid), а не
+            # все с кадрами: иначе оценка смешала бы карту с чужими точками
+            grid_pts = list(self._fit_pts) if self._screen_map.get("kind") else []
         if self._screen_map.get("kind") and grid_pts:
             rmse, loo, max_err = self._fit_errors(grid_pts)
 
         good_r = float(self._c("good_rmse"))
         fair_r = float(self._c("fair_rmse"))
+        if not self._screen_map.get("kind") or not grid_pts:
+            map_grade = "none"
+        elif loo <= good_r:
+            map_grade = "good"
+        elif loo <= fair_r:
+            map_grade = "fair"
+        else:
+            map_grade = "poor"
+        if self._screen_map.get("kind"):
+            # детектор расширяет запас границы экрана по ошибке карты
+            self._screen_map["loo_rmse"] = round(loo, 5)
+        if not self._screen_map.get("kind"):
+            if any(g["samples"] for g in self._grid):
+                notes.append("карта экрана не построена: точкам сетки не хватило кадров")
+            else:
+                notes.append("карта экрана не построена (нет 9-точечной калибровки)")
         if not center_ok:
             grade = "poor"
         elif not self._screen_map.get("kind"):
             # карты экрана нет — работаем на персональных порогах
             grade = "fair" if stable else "poor"
-            notes.append("карта экрана не построена (нет 9-точечной калибровки)")
         elif loo <= good_r and stable:
             grade = "good"
         elif loo <= fair_r:
@@ -698,6 +801,7 @@ class GazeCalibration:
             "rmse": round(rmse, 5),
             "loo_rmse": round(loo, 5),
             "max_error": round(max_err, 5),
+            "map_grade": map_grade,
             "rejected": dict(self._rejected),
         }
 
@@ -766,6 +870,9 @@ class GazeCalibration:
             "sigma": sigma,
             "thresholds": self.thresholds(),
             "screen_map": dict(self._screen_map),
+            # отдана ли карта детектору (см. screen_map_usable): в файле лежит
+            # и плохая карта — для разбора, — но работал детектор без неё
+            "screen_map_applied": self.screen_map_usable(),
             "quality": self.quality(),
         }
 

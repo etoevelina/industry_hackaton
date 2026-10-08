@@ -11,9 +11,11 @@
   },
   "scripts": {
     "start": "electron .",
-    "dev": "ELECTRON_ENABLE_LOGGING=1 electron .",
-    "dev:spawn": "ELECTRON_ENABLE_LOGGING=1 electron . --spawn-sidecar",
-    "check": "node --check shell/main.js && node --check shell/lockdown.js && node --check shell/ipc.js && node --check shell/preload.js"
+    "dev": "ELECTRON_ENABLE_LOGGING=1 electron . --no-kiosk --no-lockdown",
+    "dev:spawn": "ELECTRON_ENABLE_LOGGING=1 electron . --no-kiosk --no-lockdown --spawn-sidecar",
+    "dev:kiosk": "ELECTRON_ENABLE_LOGGING=1 electron .",
+    "check": "node --check shell/main.js && node --check shell/lockdown.js && node --check shell/ipc.js && node --check shell/preload.js && node --check shell/state.js && node scripts/check_state_model.js",
+    "check:lockdown": "electron scripts/check_lockdown_release.js"
   },
   "dependencies": {
     "ws": "^8.18.0"

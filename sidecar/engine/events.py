@@ -25,6 +25,26 @@
    Новый инцидент того же вида возможен только после honest-release и только
    если с предыдущего прошло не меньше cooldown.
 
+ЛЕСТНИЦЫ НАБЛЮДЕНИЯ. Три механизма выше убирают дубли ОДНОГО вида события. Они
+ничего не могут сделать с эскалацией: телефон, попавший в кадр и затем поднятый
+и наведённый на экран, рождает три РАЗНЫХ вида за полторы секунды, и в сумме
+они дают 105 — порог блокировки с одного наблюдаемого объекта. Таблица
+`protocol.ESCALATION_LADDERS` объявляет такие последовательности, а движок
+размечает каждое их событие полем `detail["escalation"]`: номер ступени, прогон
+лестницы (`run`), что эта ступень уточняет (`refines`) и чем уточнена она сама
+(`superseded_by`). По этой разметке `engine/risk.py` начисляет вклад ТОЛЬКО
+высшей достигнутой ступени прогона. Младшему событию движок ставит
+`detail["refined_by"]`: из журнала оно не исчезает, его код остаётся
+пригодным для апелляции, но вторым обвинением в счёте не становится.
+
+Прогон лестницы — это один наблюдаемый объект. Он заканчивается, когда снято
+показание, которым он оценён (для покадровых правил это видит `_close`,
+см. `_ladder_release`), или когда новых
+ступеней не было дольше `protocol.LADDER_GAP_SEC` (для мгновенных внешних
+событий это единственный признак). Если ступени пришли с РАЗНЫМИ признаками
+субъекта (`track_id`, `pid`), прогоны разные и вклады складываются как прежде:
+второй телефон или вторая программа захвата — это второе наблюдение.
+
 СОСТОЯНИЯ ОКРУЖЕНИЯ. Находки env-проверок из `STATEFUL_EXTERNAL` (сейчас это
 `audio_device_connected`) — состояние, а не момент: проверка присылает их
 каждый цикл, пока устройство подключено. Они идут через тот же конечный
@@ -79,11 +99,20 @@ if str(_SIDECAR) not in sys.path:
     sys.path.insert(0, str(_SIDECAR))
 
 from protocol import (  # noqa: E402  (путь настраиваем выше)
+    ESCALATION_LADDERS,
+    LADDER_LABELS,
     RISK_WEIGHTS,
     Channel,
     EventKind,
     ProctorEvent,
     Severity,
+    ladder_gap,
+    ladder_merge_subject,
+    ladder_of,
+    ladder_same_subject,
+    ladder_steps,
+    ladder_subject,
+    ladder_top_weight,
 )
 
 #: Защита от сравнения float'ов «на грани»: 1.7999999 >= 1.8 должно быть True.
@@ -163,6 +192,11 @@ EVENT_CODES: dict[EventKind, str] = {
     EventKind.SHORTCUT_BLOCKED: "SHL_603",
     EventKind.CLIPBOARD_PASTE: "SHL_604",
     EventKind.DEVTOOLS_ATTEMPT: "SHL_605",
+    # Фактический режим запуска оболочки. Вид не проходит через движок
+    # (`main.py::_cmd_shell_config` кладёт событие сам), но код обязан жить в
+    # канонической таблице: иначе отчёт печатает UNK_000. Номер согласован с
+    # `main.SHELL_CONFIG_CODE` — свободное начало блока оболочки.
+    EventKind.SHELL_CONFIG: "SHL_600",
 
     # --- ввод и связки -----------------------------------------------------
     EventKind.PASTE_BURST: "FUS_701",
@@ -349,8 +383,10 @@ RULES: dict[str, Rule] = {
         "поля зрения камеры. Попросите отключить дополнительный монитор."),
     "blacklisted_process": _rule(
         EventKind.BLACKLISTED_PROCESS, Channel.ENVIRONMENT, 0.0, 1.0, 60.0,
-        "Запущен процесс из списка запрещённых{name_colon}. "
-        "Сверьтесь с правилами экзамена и попросите закрыть программу."),
+        # Стем без глагола: summary из env_checks сам начинается с «запущен …»,
+        # иначе выходит «Запущен процесс …: запущен ИИ-клиент …».
+        "Проверка процессов{name_colon}. "
+        "Сверьтесь с правилами экзамена и попросите закрыть эти программы."),
 
     # --- оболочка ----------------------------------------------------------
     "window_blur": _rule(
@@ -574,6 +610,42 @@ class _State:
     held_total: float = 0.0             # суммарное время под условием, сек
 
 
+#: Префикс ключа прогона лестницы.
+#:
+#: Ключ уходит в `detail["escalation"]["run"]`, то есть в журнал, в цепочку и
+#: в отчёт, поэтому он обязан быть печатным: служебный \x00 (как во внутренних
+#: ключах `engine/risk.py`) в SQLite-TEXT и в HTML-отчёте — мина.
+#: Столкнуться с ключом наблюдения по вопросу он всё равно не может: метку
+#: вопроса пропускает только `protocol.safe_label`, а она не допускает ни «/»,
+#: ни «:», ни «#» и обрезает длину до LABEL_MAX_LEN.
+LADDER_RUN_PREFIX = "ladder/"
+
+
+@dataclass
+class _LadderRun:
+    """Один прогон лестницы: эскалация показаний об ОДНОМ объекте.
+
+    `level` — высшая достигнутая ступень прогона, `rows` — выпущенные ступени
+    для отчёта, `objs` — ссылки на ещё живые события младших ступеней: им
+    ставится `detail["refined_by"]`, когда приходит старшая.
+
+    `key` фиксируется при создании и больше не меняется, даже если признак
+    субъекта станет известен позже: по этому ключу `engine/risk.py` держит
+    группу вклада, и смена ключа посреди прогона вернула бы двойной счёт.
+    """
+    ladder: str
+    seq: int
+    key: str
+    subject: str = ""
+    level: int = -1
+    peak_kind: str = ""
+    first_ts: float = 0.0
+    last_ts: float = 0.0
+    ended: bool = False
+    rows: list[dict[str, Any]] = field(default_factory=list)
+    objs: list[tuple[int, ProctorEvent]] = field(default_factory=list)
+
+
 class EventEngine:
     """Единственное место, где наблюдения превращаются в ProctorEvent.
 
@@ -604,6 +676,11 @@ class EventEngine:
         self._mode_suppressed: dict[str, int] = {}
         self._states: dict[str, _State] = {}
         self._external_fire: dict[str, float] = {}
+        #: Текущий прогон каждой лестницы наблюдения и счётчик прогонов.
+        self._ladder_runs: dict[str, _LadderRun] = {}
+        self._ladder_seq: dict[str, int] = {}
+        #: Сколько ступеней пришло не выше уже достигнутой — видно в stats().
+        self._ladder_folded: dict[str, int] = {}
         #: Срезы закрытых инцидентов — отчёт берёт отсюда итоговые длительности.
         self._closed: list[dict[str, Any]] = []
         #: Имена наблюдений, для которых нет правила — видно в stats(), не падаем.
@@ -623,6 +700,9 @@ class EventEngine:
         self._closed.clear()
         self._unknown.clear()
         self._mode_suppressed.clear()
+        self._ladder_runs.clear()
+        self._ladder_seq.clear()
+        self._ladder_folded.clear()
         self._speech = False
         self._speech_detail = {}
         self._mouth_ratio = 0.0
@@ -948,6 +1028,10 @@ class EventEngine:
         st.fired = False
         st.open_event = None
         st.detail.clear()
+        # Условие снято — возможно, это конец прогона лестницы наблюдения.
+        # Проверять надо после очистки состояния: `_ladder_release` смотрит
+        # именно на то, держится ли ещё хоть одна ступень.
+        self._ladder_release(st.name)
 
     # ------------------------------------------------------- сборка события
     def _build(self, rule: Rule | None, kind: EventKind, key: str,
@@ -970,7 +1054,7 @@ class EventEngine:
         ready = detail.get("message")
         message = (str(ready) if isinstance(ready, str) and ready.strip()
                    else self._message(rule, key, detail, duration))
-        return ProctorEvent(
+        event = ProctorEvent(
             kind=kind,
             severity=sev,
             channel=channel,
@@ -980,6 +1064,215 @@ class EventEngine:
             message=message,
             detail=detail,
         )
+        # Разметка лестницы ставится ПОСЛЕ сборки текста: `escalation` — это
+        # служебная связь между событиями, а не подстановка в формулировку.
+        self._ladder_annotate(kind, event, ts)
+        return event
+
+    # ------------------------------------------------- лестницы наблюдения
+    def _ladder_annotate(self, kind: EventKind, event: ProctorEvent,
+                         ts: float) -> None:
+        """Отметить ступень лестницы в `detail["escalation"]`.
+
+        Без этой разметки три вида про один телефон выглядят для risk-score
+        как три независимых обвинения. Разметка не меняет ни вес, ни severity
+        события — она говорит счёту, какие вклады описывают ОДНО наблюдение, а
+        отчёту — какая запись какую уточняет.
+        """
+        spec = ladder_of(kind)
+        if spec is None:
+            return
+        ladder, level = spec
+        subject = ladder_subject(ladder, event.detail)
+        run = self._ladder_run(ladder, subject, ts)
+        weight = RISK_WEIGHTS.get(kind, 10.0)
+
+        ann: dict[str, Any] = {
+            "ladder": ladder,
+            "ladder_ru": LADDER_LABELS.get(ladder, ladder),
+            "run": run.key,
+            "step": level + 1,
+            "steps": ladder_steps(ladder),
+            "weight": weight,
+            "top_weight": ladder_top_weight(ladder),
+        }
+        if subject:
+            ann["subject"] = subject
+
+        lower = [row for row in run.rows if int(row.get("level", -1)) < level]
+        if level > run.level:
+            # Настоящая эскалация: старшее показание уточняет младшие. В risk
+            # она даёт разницу ступеней, а не полный вес сверху.
+            if lower:
+                ann["refines"] = lower
+                for ev_level, ev in run.objs:
+                    if ev_level >= level:
+                        continue
+                    # Ключ ИМЕННО `refined_by`, а не `replaced_by`: у того в
+                    # этой же системе другое значение — `mode_report()` ставит
+                    # его там, где аудио-правила ЗАМЕНЕНЫ проверкой устройств.
+                    # Ступень лестницы не заменена, а уточнена, и смешивать
+                    # два смысла в одном ключе значит печатать в отчёте
+                    # «Заменено записью» там, где запись никуда не делась.
+                    ev.detail["refined_by"] = kind.value
+                    ev.detail["refined_by_code"] = code_for(kind)
+            run.level = level
+            run.peak_kind = kind.value
+            # Разрыв прогона (`ladder_gap`) отсчитывается от последней НОВОЙ
+            # ступени. Повтор уже достигнутой ступени прогон не продлевает:
+            # иначе поток повторов с интервалом короче `ladder_gap` (20 с) и
+            # длиннее cooldown вида (12 с) держал бы прогон бессмертным и
+            # сворачивал в ноль всё, что в него попадёт. Для покадровых
+            # лестниц прогон и так закрывает `_ladder_release` по снятию
+            # показания, но у мгновенных внешних ступеней состояния нет, и
+            # время — единственный признак конца прогона.
+            run.last_ts = max(run.last_ts, ts)
+        else:
+            # Ступень не выше уже достигнутой: то же наблюдение, показанное
+            # повторно (или шаг назад). Нового вклада в risk не даёт, но в
+            # журнале остаётся — по ней видно, как эпизод развивался.
+            ann["superseded_by"] = run.peak_kind
+            ann["peak_step"] = run.level + 1
+            self._ladder_folded[ladder] = self._ladder_folded.get(ladder, 0) + 1
+
+        run.rows.append({
+            "kind": kind.value,
+            "code": code_for(kind),
+            "id": event.id,
+            "ts": round(float(ts), 3),
+            "level": level,
+            "weight": weight,
+        })
+        if len(run.rows) > 16:
+            del run.rows[:-16]
+        run.objs.append((level, event))
+        if len(run.objs) > 8:
+            del run.objs[:-8]
+        event.detail["escalation"] = ann
+
+    def _ladder_run(self, ladder: str, subject: str, ts: float) -> _LadderRun:
+        """Текущий прогон лестницы или новый, если прежний закончился.
+
+        Прогон продолжается, пока он не закрыт по снятию условий
+        (`_ladder_release`), пока с последней ступени прошло не больше
+        `ladder_gap`, и пока речь идёт о том же объекте. Молчание источника о
+        субъекте (пустая строка) трактуется в пользу продолжения: сейчас
+        PHONE_IN_FRAME приходит без `track_id`, и если считать его «другим
+        объектом», двойной счёт вернётся сам собой.
+        """
+        run = self._ladder_runs.get(ladder)
+        if run is not None and not run.ended:
+            fresh = (ts - run.last_ts) <= ladder_gap(ladder) + _EPS
+            if fresh and ladder_same_subject(run.subject, subject, ladder):
+                # Признаки накапливаются: находки об одной программе называют
+                # разные подмножества её процессов.
+                run.subject = ladder_merge_subject(run.subject, subject)
+                return run
+        seq = self._ladder_seq.get(ladder, 0) + 1
+        self._ladder_seq[ladder] = seq
+        run = _LadderRun(
+            ladder=ladder,
+            seq=seq,
+            key=f"{LADDER_RUN_PREFIX}{ladder}/{subject or '-'}#{seq}",
+            subject=subject,
+            first_ts=ts,
+            last_ts=ts,
+        )
+        self._ladder_runs[ladder] = run
+        return run
+
+    def _ladder_release(self, name: str) -> None:
+        """Закрыть прогон, когда снято ТО САМОЕ показание, которым он оценён.
+
+        Вызывается из `_close`: условие снято по гистерезису.
+
+        Прогон оценён в risk-score по высшей достигнутой ступени (`peak_kind`).
+        Пока это показание наблюдается, всё остальное про тот же объект —
+        уточнение уже начисленного, и начислять его второй раз нельзя. Как
+        только оно СНЯТО, требование прогона исчерпано: следующее такое же
+        наблюдение — новый эпизод, и он обязан быть начислен заново.
+
+        РАНЬШЕ прогон закрывался только когда снята КАЖДАЯ ступень лестницы, и
+        это давало рабочий обход на обеих покадровых лестницах:
+
+        * телефон, который не выносят из кадра. `PHONE_IN_FRAME` держится —
+          прогон бессмертен. Разрыв прогона (`ladder_gap` = 20 с) больше, чем
+          cooldown старших ступеней (12 с), поэтому каждое следующее «поднял →
+          навёл» попадало внутрь живого прогона и давало НОЛЬ. За 5 минут
+          20 циклов: пик 38.85, финал 4.18, вердикт `none` — счёт ПАДАЛ с
+          каждым следующим использованием телефона;
+        * взгляд. `GAZE_DOWN` и `GAZE_SIDE` стоят на одной ступени, и пока
+          студент переводит взгляд между ними, не возвращая его на экран,
+          вторая ступень всегда активна — прогон не закрывался никогда.
+          Шесть минут взгляда мимо экрана давали пик 8.00, тогда как честный
+          студент, который периодически смотрит на экран, получал `lock`.
+          Правило инвертировало стимул: непрерывное нарушение дешевле
+          прерывистого.
+
+        Теперь снятие `peak_kind` закрывает прогон независимо от того, что ещё
+        наблюдается. Свёртка ОДНОГО эпизода не страдает: пока телефон наведён
+        на экран, показание держится, и младшие ступени про тот же телефон
+        по-прежнему уточняют начисленное, а не добавляют к нему. Повтор того же
+        показания внутри живого прогона (взгляд вниз при уже отведённом
+        взгляде) тоже сворачивается как прежде — это буквально одновременное
+        наблюдение.
+
+        Для мгновенных внешних ступеней состояния нет, и прогон закрывается по
+        времени (`ladder_gap`) — эта ветка не менялась.
+        """
+        rule = self.rules.get(name)
+        spec = ladder_of(rule.kind if rule is not None else name)
+        if spec is None:
+            return
+        ladder = spec[0]
+        run = self._ladder_runs.get(ladder)
+        if run is None or run.ended:
+            return
+        # Прогон без выпущенных ступеней закрывать нечего и не от чего.
+        if not run.peak_kind:
+            return
+        st = self._states.get(self.normalize(run.peak_kind))
+        if st is not None and (st.since is not None or st.open_event is not None):
+            # Показание, которым прогон оценён, ещё наблюдается.
+            return
+        run.ended = True
+        run.objs.clear()
+
+    def escalation_report(self) -> dict[str, Any]:
+        """Лестницы наблюдения: объявленное правило и что происходило.
+
+        Нужен отчёту и защите: число «риск 45 вместо 105» надо уметь объяснить
+        не словами, а таблицей — какие виды объявлены ступенями одного
+        наблюдения и сколько раз правило сработало.
+        """
+        return {
+            "rule": ("в risk-score идёт вклад только высшей достигнутой ступени "
+                     "прогона лестницы; младшие ступени остаются в журнале с "
+                     "пометкой refined_by"),
+            "ladders": {
+                ladder: {
+                    "label": LADDER_LABELS.get(ladder, ladder),
+                    "steps": [[kind.value for kind in level_kinds]
+                              for level_kinds in levels],
+                    "top_weight": ladder_top_weight(ladder),
+                    "gap_sec": ladder_gap(ladder),
+                }
+                for ladder, levels in ESCALATION_LADDERS.items()
+            },
+            "runs_total": dict(self._ladder_seq),
+            "folded_steps": dict(self._ladder_folded),
+            "active": [
+                {
+                    "ladder": run.ladder,
+                    "run": run.key,
+                    "subject": run.subject,
+                    "peak_kind": run.peak_kind,
+                    "peak_step": run.level + 1,
+                    "steps_fired": [row["kind"] for row in run.rows],
+                }
+                for run in self._ladder_runs.values() if not run.ended
+            ],
+        }
 
     def _confidence(self, key: str, detail: dict[str, Any]) -> float:
         """Уверенность инцидента.
@@ -1172,8 +1465,17 @@ class EventEngine:
             else:
                 out[var] = f" {fallback}" if fallback else ""
 
-        # для env-проверок имя процесса/устройства лежит под разными ключами
-        for candidate in ("name", "process", "device", "software", "app", "reason"):
+        # Для env-проверок имя процесса/устройства лежит под разными ключами.
+        #
+        # "summary" обязан стоять перед "reason". У находок, где совпадений
+        # несколько (запрещённые процессы, аудио-устройства), имена лежат
+        # ВЛОЖЕННО — в ai_clients[].name, messengers[].name и т.п., — а на верхнем
+        # уровне есть только обезличенное reason вроде «Запущено ПО, через которое
+        # можно получить подсказку». Без summary сообщение не называет ни одной
+        # программы: студент не знает, что закрывать, преподаватель не может
+        # проверить. Именно так и вышло на живом прогоне 07.10.
+        # summary собирается в env_checks и уже содержит имена, pid и число процессов.
+        for candidate in ("name", "process", "device", "software", "app", "summary", "reason"):
             value = detail.get(candidate)
             if value:
                 out["name_or_detail"] = _fmt(value)
@@ -1246,6 +1548,9 @@ class EventEngine:
             "rules_registered": len(self.rules),
             # Факт в человекочитаемом виде — его и показывать на защите.
             "mode": self.mode_report(),
+            # Лестницы наблюдения: что объявлено эскалацией и как часто
+            # младшая ступень оказывалась уточнена старшей.
+            "escalation": self.escalation_report(),
             # не ошибка, а штатная работа режима: источник шлёт, движок не ведёт
             "suppressed_by_mode": dict(self._mode_suppressed),
         }
@@ -1346,7 +1651,7 @@ def rule_names(exam_mode: Any = None) -> Iterable[str]:
 
 
 __all__ = ["EventEngine", "Rule", "RULES", "ALIASES", "COMPOSITE_INPUTS",
-           "EVENT_CODES", "UNKNOWN_CODE", "code_for",
+           "EVENT_CODES", "UNKNOWN_CODE", "code_for", "LADDER_RUN_PREFIX",
            "REMOTE_ONLY_RULES", "STATEFUL_EXTERNAL", "EXAM_MODES",
            "CLASSROOM_AUDIO_OFF_REASON", "DEFAULT_EXAM_MODE",
            "normalize_exam_mode", "rules_for_mode",

@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+<title>Разведка источников LMS</title>
+<style>
+  :root {
+    --bg: #11161d;
+    --fg: #e8edf4;
+    --dim: #93a1b4;
+    --line: #26303d;
+    --warn: #e0a33a;
+    --ok: #4fae6a;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 168px; overflow: hidden;
+    background: var(--bg); color: var(--fg);
+    font: 13px/1.4 -apple-system, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+    user-select: none; -webkit-user-select: none;
+  }
+  .bar { display: flex; align-items: center; gap: 14px; padding: 10px 16px 8px; }
+  .title { font-weight: 600; font-size: 14px; white-space: nowrap; }
+  .mode {
+    border: 1px solid var(--warn); color: var(--warn);
+    border-radius: 4px; padding: 2px 8px; font-size: 11px; white-space: nowrap;
+  }
+  .spacer { flex: 1; }
+  button {
+    font: inherit; color: var(--fg); background: #1c2531;
+    border: 1px solid var(--line); border-radius: 5px;
+    padding: 7px 13px; cursor: pointer; white-space: nowrap;
+  }
+  button:hover { background: #243040; }
+  button.primary { border-color: #3d6ea8; background: #22364f; }
+  button.done { color: var(--ok); border-color: var(--ok); }
+  .stats { display: flex; gap: 22px; padding: 0 16px; color: var(--dim); font-size: 12px; }
+  .stats b { color: var(--fg); font-weight: 600; }
+  .note {
+    padding: 6px 16px 0; color: var(--dim); font-size: 11px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    border-top: 1px solid var(--line); margin-top: 7px;
+  }
+  .note.alarm { color: var(--warn); }
+  /* Предупреждение о неполноте — ПЕРВОЙ строкой окна, а не мелким шрифтом
+     внизу. Снять его нечем: это не уведомление, а состояние файла. */
+  .draft {
+    background: #3a2410; color: #f0c678; border-bottom: 1px solid #6b451c;
+    padding: 7px 16px; font-size: 12px; line-height: 1.35;
+  }
+  .draft b { color: #ffd79a; }
+</style>
+</head>
+<body>
+  <div class="draft">
+    <b>ЭТО ЧЕРНОВИК, И ПРИМЕНЯТЬ ЕГО НЕЛЬЗЯ.</b>
+    Собрано только то, что вы прошли руками: чего не открыли — того в списке
+    нет. Список обязан прочитать человек; пока в файле стоят заглушки
+    &lt;…&gt;, сайдкар не считает экзамен готовым.
+  </div>
+  <div class="bar">
+    <span class="title">Разведка источников LMS</span>
+    <span class="mode">наблюдение: фильтр НИЧЕГО не блокирует</span>
+    <span class="spacer"></span>
+    <button id="mark" class="primary">Вход завершён (⌘⇧L)</button>
+    <button id="save">Сохранить черновик (⌘S)</button>
+    <button id="reveal">Показать файл</button>
+  </div>
+  <div class="stats">
+    <span>фаза: <b id="phase">вход</b></span>
+    <span>запросов: <b id="requests">0</b></span>
+    <span>источников: <b id="sources">0</b></span>
+    <span>в черновик: <b id="included">0</b></span>
+    <span>кандидатов (не включено): <b id="candidates">0</b></span>
+    <span>страниц: <b id="pages">0</b></span>
+    <span id="page"></span>
+  </div>
+  <div class="note" id="note">
+    Пройдите путь студента: страница входа, курс, тест — прогоны НАКАПЛИВАЮТСЯ,
+    прошлый файл не затирается. Правило инструмента: не опознал — не включил.
+  </div>
+
+<script>
+  'use strict';
+  var $ = function (id) { return document.getElementById(id); };
+
+  $('mark').addEventListener('click', function () { window.discover.mark(); });
+  $('save').addEventListener('click', function () { window.discover.save(); });
+  $('reveal').addEventListener('click', function () { window.discover.openOut(); });
+
+  window.discover.onState(function (s) {
+    $('phase').textContent = s.phase === 'exam' ? 'экзамен (после входа)' : 'вход';
+    $('requests').textContent = String(s.requests);
+    $('sources').textContent = String(s.sources);
+    $('included').textContent = String(s.included);
+    $('candidates').textContent = String(s.candidates || 0);
+    $('pages').textContent = String(s.pages || 0);
+    $('page').textContent = s.url ? ('страница: ' + s.url) : '';
+    if (s.marked) {
+      $('mark').disabled = true;
+      $('mark').className = 'done';
+      $('mark').textContent = 'Вход отмечен';
+    }
+    // Единый вход — единственное, из-за чего полоса меняет цвет: это тот
+    // случай, когда человек обязан прочитать текст, а не нажать «сохранить».
+    if (s.sso && s.sso.length) {
+      $('note').className = 'note alarm';
+      $('note').textContent = 'НАЙДЕН ЕДИНЫЙ ВХОД: ' + s.sso.join(', ')
+        + ' — разрешив его, вы откроете почту, чат и файлы того же аккаунта. '
+        + 'В черновик он НЕ включён; читайте разбор в Terminal.';
+    }
+  });
+</script>
+</body>
+</html>

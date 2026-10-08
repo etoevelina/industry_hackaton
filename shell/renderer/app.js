@@ -18,6 +18,13 @@
  *   — моноширинный шрифт — только идентификаторы и таймкоды;
  *   — цвета риска берутся из переменных tokens.css, в коде их нет.
  *
+ * ПРАВИЛА ЭКЗАМЕНА. Профиль (какой адрес открыт, какие источники разрешил
+ * проктор, разрешены ли поисковики) показывается студенту ТРИЖДЫ: на экране
+ * согласия, в предполётной проверке и отметкой в шапке отчёта рядом с
+ * вердиктом. Разбор профиля — в hud.js (window.Proctor.profile), здесь только
+ * отрисовка. Профиля может не быть вовсе: тогда блок честно пишет, что правила
+ * не задавались и открыт только локальный тест, — пустым он не остаётся.
+ *
  * ТОН СООБЩЕНИЙ (раздел Alerts гайда): наблюдаемый факт → контекст → действие.
  * Обвинительных формулировок в текстах нет: система сообщает наблюдение,
  * решение принимает человек.
@@ -31,6 +38,19 @@
   var LINK_STALE_MS = 7000;   // ядро молчит дольше — связь деградировала
 
   var SCREENS = ['consent', 'preflight', 'calibration', 'exam', 'report'];
+
+  /**
+   * Экран интерфейса -> состояние оболочки (shell/main.js, SHELL_STATES).
+   * Оболочка включает блокировки только на exam и paused, поэтому имя экрана
+   * обязано совпадать с реальностью: наврём здесь — машина залочится не вовремя.
+   */
+  var SCREEN_STATE = {
+    consent: 'consent',
+    preflight: 'preflight',
+    calibration: 'calibration',
+    exam: 'exam',
+    report: 'finished'
+  };
 
   /**
    * Поверхность экрана по правилу гайда (Р-13): тёмное — наблюдение и
@@ -94,10 +114,21 @@
               'короткий клип вокруг события, в каталоге сессии на этом компьютере.'
     },
     {
+      // Эталон — вектор признаков в памяти сайдкара (detectors/identity.py):
+      // ни снимок, ни вектор на диск не пишутся. Обещание «остаётся в каталоге
+      // сессии» расходилось и с кодом, и с экраном калибровки.
       signal: 'Эталон лица с калибровки',
-      mode: 'yes',
+      mode: 'ram',
       detail: 'Нужен, чтобы подтвердить: за компьютером всё время один и тот же человек. ' +
-              'Остаётся в каталоге сессии.'
+              'Держится в памяти программы до конца сессии: ни снимок, ни вектор признаков ' +
+              'на диск не пишутся.'
+    },
+    {
+      signal: 'Итоги калибровки',
+      mode: 'yes',
+      detail: 'Числа: ваша нулевая точка взгляда, личные пороги, карта экрана и оценка ' +
+              'качества эталона лица. Лежат в каталоге сессии, чтобы экзаменатор видел, ' +
+              'с какими настройками шло наблюдение.'
     },
     {
       signal: 'Интервалы между нажатиями клавиш',
@@ -146,10 +177,19 @@
               'клавиши, факт вставки из буфера.'
     },
     {
+      // Правила экзамена пишут адрес каждой попытки выйти за список, и об этом
+      // нужно сказать до согласия, а не только в журнале.
+      signal: 'Попытки открыть адрес вне правил экзамена',
+      mode: 'yes',
+      detail: 'Если проктор задал правила: полный адрес попытки и время попадают в журнал ' +
+              'сессии. Сама страница не открывается и не сохраняется.'
+    },
+    {
       signal: 'Сетевые обращения',
       mode: 'no',
-      detail: 'Ни одного исходящего запроса. Доказательства и отчёт остаются на этом ' +
-              'компьютере, облака и внешней аналитики нет.'
+      detail: 'Сама система ничего не отправляет: доказательства и отчёт остаются на этом ' +
+              'компьютере, облака и внешней аналитики нет. Если правила экзамена открывают ' +
+              'страницу LMS, с ней работает только окно теста.'
     }
   ];
 
@@ -157,6 +197,39 @@
     yes: 'пишется, локально',
     ram: 'только в памяти',
     no: 'не пишется'
+  };
+
+  /* =========================================================================
+   * ПРАВИЛА ЭКЗАМЕНА НА ЭКРАНЕ.
+   *
+   * Зачем этот блок есть. Человек не может соблюдать правила, которых не знает.
+   * Это прямое следствие позиционирования («Integrity Score вместо надзора»,
+   * студент всегда видит, что фиксируется) и обычной этики: если список
+   * разрешённых источников существует, но показан только проктору, то первая
+   * же заблокированная ссылка выглядит как поломка программы, а запись о
+   * попытке — как ловушка. Поэтому правила показаны ДВАЖДЫ до начала теста
+   * (на согласии и в предполётной проверке) и остаются видимыми в HUD.
+   *
+   * Чего здесь нет и не будет. Утверждения, что профиль нельзя обойти.
+   * Профиль — улика, а не защита: Safe Exam Browser проиграл не технически,
+   * а организационно (подпись .seb была, а сверять Config Key в Moodle надо
+   * было включать отдельно, и вузы не включали). Поэтому формулировки говорят
+   * ровно то, что система действительно делает: фиксирует попытку с полным
+   * адресом и кладёт хеш правил в подписанную цепочку.
+   *
+   * Значения по умолчанию, если профиль пуст: открыт только локальный тест,
+   * поисковые системы запрещены. Пустой профиль — штатный режим, не ошибка.
+   * ========================================================================= */
+
+  var RULES_TITLE = 'Правила этого экзамена';
+
+  /** Подписи строк блока правил. Порядок — от «куда смотреть» к «чем подписано». */
+  var RULE_TERMS = {
+    url: 'Адрес теста',
+    sources: 'Разрешённые источники',
+    search: 'Поисковые системы',
+    rejected: 'Не принятые записи',
+    hash: 'Профиль экзамена'
   };
 
   function el(id) { return document.getElementById(id); }
@@ -222,6 +295,23 @@
     return o + '<path d="M9.6 9.6 L18.4 18.4 M18.4 9.6 L9.6 18.4"></path></svg>';
   }
 
+  /**
+   * Маркер строки блока правил. Форма — второй носитель смысла, цвет третий:
+   * галочка — правило задано, восклицание — правило ослаблено, пустое кольцо
+   * с чертой — правило не задавалось. Цвет приходит из --tone, который задаёт
+   * styles.css по data-state и по поверхности (на светлом фоне кислотный как
+   * цвет текста запрещён, см. tokens.css).
+   */
+  function ruleSvg(state) {
+    var o = svgOpen(16);
+    if (state === 'ok') return o + '<path d="M3.2 8.6 L6.3 11.6 L12.8 4.6"></path></svg>';
+    if (state === 'warn') {
+      return o + '<path d="M8 1.6 L14.6 13.4 L1.4 13.4 Z"></path>' +
+                 '<path d="M8 6 L8 9.4 M8 11.3 L8 11.4"></path></svg>';
+    }
+    return o + '<circle cx="8" cy="8" r="5.4"></circle><path d="M4.6 11.4 L11.4 4.6"></path></svg>';
+  }
+
   /** Маркер строки таблицы согласия. */
   function modeSvg(mode) {
     var o = svgOpen(16);
@@ -255,7 +345,28 @@
     ':where(.preflight-block){flex:1 1 32ch;max-width:64ch;font-size:var(--fs-small,14px);line-height:var(--lh-body,1.55);}',
     ':where(.chk__state){display:flex;flex-direction:column;gap:2px;align-items:flex-end;text-align:right;}',
     ':where(.chk__word),:where(.chk__note){font-size:var(--fs-small,14px);}',
-    ':where(.chk__mark) svg{display:block;width:24px;height:24px;}'
+    ':where(.chk__mark) svg{display:block;width:24px;height:24px;}',
+    // блок «Правила этого экзамена»: согласие, предполётная проверка, шапка отчёта
+    ':where(.rules){display:flex;flex-direction:column;gap:var(--space-4,16px);' +
+      'padding:var(--space-6,24px);border:1px solid var(--border-hair);' +
+      'border-radius:var(--radius-md,12px);}',
+    ':where(.rules__head){display:flex;flex-wrap:wrap;gap:var(--space-2,8px);' +
+      'align-items:baseline;justify-content:space-between;}',
+    ':where(.rules__grid){display:flex;flex-direction:column;gap:var(--space-3,12px);margin:0;}',
+    ':where(.rules__row){display:grid;grid-template-columns:minmax(0,22ch) minmax(0,1fr);' +
+      'gap:var(--space-2,8px) var(--space-4,16px);align-items:start;}',
+    ':where(.rules__term){display:flex;gap:var(--space-2,8px);align-items:flex-start;' +
+      'margin:0;font-size:var(--fs-small,14px);font-weight:600;}',
+    ':where(.rules__term) svg{flex:none;width:16px;height:16px;margin-top:0.2em;}',
+    ':where(.rules__value){margin:0;min-width:0;font-size:var(--fs-small,14px);' +
+      'line-height:var(--lh-body,1.55);overflow-wrap:anywhere;}',
+    ':where(.rules__srclist){list-style:none;margin:0;padding:0;display:flex;' +
+      'flex-direction:column;gap:var(--space-1,4px);}',
+    ':where(.rules__note){margin:0;max-width:72ch;font-size:var(--fs-small,14px);' +
+      'line-height:var(--lh-body,1.55);}',
+    ':where(.rules__stamp){font-size:var(--fs-small,14px);overflow-wrap:anywhere;}',
+    ':where(.report__rules){margin:0;font-size:var(--fs-small,14px);' +
+      'line-height:var(--lh-body,1.55);overflow-wrap:anywhere;}'
   ].join('\n');
 
   function installFallbackStyles() {
@@ -354,6 +465,12 @@
     try { this.api.sendTelemetry(msg); return true; } catch (e) { return false; }
   };
 
+  /** Сколько места наша вёрстка оставила свободным под страницу экзамена. */
+  Bridge.prototype.reportExamViewInset = function (inset) {
+    if (!this.api || typeof this.api.reportExamViewInset !== 'function') return false;
+    try { this.api.reportExamViewInset(inset); return true; } catch (e) { return false; }
+  };
+
   Bridge.prototype.sendCommand = function (name) {
     var method = this._pick(['sendCommand', 'command']);
     if (method) {
@@ -389,6 +506,26 @@
       }
     }
     return false;
+  };
+
+  /**
+   * Сообщить оболочке, где находится студент. Оболочка включает блокировки
+   * только на exam и paused, поэтому экран обязан быть назван честно.
+   * Ответа не ждём: решение принимает main-процесс, он же вернёт реальное
+   * состояние через onProtection.
+   */
+  Bridge.prototype.setExamState = function (next) {
+    if (!this.api || typeof this.api.setExamState !== 'function') return false;
+    try {
+      Promise.resolve(this.api.setExamState(next)).then(function (res) {
+        if (res && res.ok === false) {
+          // Оболочка отвергла переход — это не ошибка интерфейса, но знать полезно.
+          // eslint-disable-next-line no-console
+          console.warn('[proctor] оболочка отвергла состояние', next, res.reason);
+        }
+      }).catch(function () { /* канала нет — интерфейс не рвётся */ });
+      return true;
+    } catch (e) { return false; }
   };
 
   Bridge.prototype.sessionEnd = function (reason) {
@@ -469,7 +606,9 @@
   App.prototype._levelOf = function (score) {
     if (this.text && typeof this.text.levelOf === 'function') return this.text.levelOf(score);
     var th = this._thresholds();
-    if (score >= th.lock) return { cls: 'lvl-lock', text: 'блокировка' };
+    // Та же подпись, что в hud.js: автоматика до блокировки не доходит, её
+    // потолок — приостановка, а решение принимает человек.
+    if (score >= th.lock) return { cls: 'lvl-lock', text: 'решение проктора' };
     if (score >= th.pause) return { cls: 'lvl-pause', text: 'высокий' };
     if (score >= th.warn) return { cls: 'lvl-warn', text: 'внимание' };
     return { cls: 'lvl-ok', text: 'норма' };
@@ -483,8 +622,17 @@
     this.telemetry.init(function (msg) { self.bridge.sendTelemetry(msg); });
 
     this.hud.init({
-      onPause: function () { self.exam.pause(); },
-      onResume: function () { self.exam.resume(); },
+      // Пауза остаётся под блокировками (см. комментарий к LOCKED_STATES в
+      // shell/main.js): иначе пауза стала бы легальным окном «сходить
+      // посмотреть ответ». Оболочке сообщаем честно, что это именно пауза.
+      onPause: function () {
+        self.bridge.setExamState('paused');
+        self.exam.pause();
+      },
+      onResume: function () {
+        self.bridge.setExamState('exam');
+        self.exam.resume();
+      },
       onLock: function () { self.onLocked(); },
       onReport: function () { self.hud.hideLock(); self.showReport(); }
     });
@@ -505,6 +653,11 @@
     this._wireReport();
 
     this._renderDisclosure();
+    // Правила рисуем сразу, не дожидаясь профиля: пустой профиль — такой же
+    // валидный ответ («правила не задавались»), и экран согласия обязан
+    // показать его с первого кадра, а не пустым местом.
+    this._renderRules();
+    this._watchProfile();
     this._initChecks();
     this._subscribe();
     this._loadCapabilities();
@@ -513,8 +666,40 @@
     // идентификаторы и таймкоды на экране отчёта — моноширинным
     markMono(['report-session', 'report-duration']);
 
+    this._watchLayout();
+
     this.calibration.reset();
     this.show('consent');
+  };
+
+  /**
+   * Следить за раскладкой и докладывать её оболочке.
+   *
+   * Изменение размера окна — отдельный путь, на котором страница экзамена
+   * может накрыть HUD: окно у студента обычное (его можно потянуть за край),
+   * а перейдя границу 1100px вёрстка перекладывается целиком. Поэтому
+   * подписываемся и на resize окна, и на изменение самих коробок через
+   * ResizeObserver: шапка растёт в две строки не от размера окна, а от того,
+   * что в неё перестало влезать.
+   */
+  App.prototype._watchLayout = function () {
+    var self = this;
+    var tick = null;
+    function schedule() {
+      if (tick) return;
+      tick = setTimeout(function () { tick = null; self._reportExamViewInset(); }, 50);
+    }
+    try { window.addEventListener('resize', schedule); } catch (e) { /* нет окна */ }
+    if (typeof window.ResizeObserver === 'function') {
+      try {
+        var ro = new window.ResizeObserver(schedule);
+        var bar = document.querySelector('.topbar');
+        var hud = el('hud');
+        if (bar) ro.observe(bar);
+        if (hud) ro.observe(hud);
+        this._layoutObserver = ro;
+      } catch (e) { /* наблюдатель не обязателен: resize уже подписан */ }
+    }
   };
 
   // --- экраны ---
@@ -522,6 +707,9 @@
   App.prototype.show = function (name) {
     if (SCREENS.indexOf(name) === -1) return;
     this.screen = name;
+    // Оболочка узнаёт о смене экрана до отрисовки: блокировки должны стоять
+    // к моменту, когда студент увидит первый вопрос, и сняться к отчёту.
+    if (SCREEN_STATE[name]) this.bridge.setExamState(SCREEN_STATE[name]);
     for (var i = 0; i < SCREENS.length; i++) {
       var key = SCREENS[i];
       var node = el('screen-' + key);
@@ -555,6 +743,79 @@
       root.classList.toggle('has-hud', withHud);
       root.setAttribute('data-screen', name);
     }
+    // Раскладка изменилась — пересчитываем место под страницу экзамена.
+    // Второй вызов на следующем кадре: классы уже проставлены, но браузер
+    // ещё не пересчитал геометрию, и измерять сейчас рано.
+    this._reportExamViewInset();
+    var self2 = this;
+    if (typeof window.requestAnimationFrame === 'function') {
+      window.requestAnimationFrame(function () { self2._reportExamViewInset(); });
+    }
+  };
+
+  /**
+   * Измерить и доложить оболочке место под страницу экзамена.
+   *
+   * ЗАЧЕМ ЭТО ВООБЩЕ ЕСТЬ. Страница LMS живёт в BrowserView — нативном слое
+   * ПОВЕРХ нашей веб-страницы. Он не участвует в раскладке CSS: что попало
+   * под его прямоугольник, то закрыто целиком и не принимает ни клика, ни
+   * ввода, ни прокрутки. Прежде этот прямоугольник был прибит константой в
+   * main.js ({top:72,right:392}) — то есть повторял ОДНУ из наших раскладок.
+   * На живом запуске 08.10 при окне 1000x800 сработал медиа-запрос
+   * max-width:1100px: HUD лёг нижней полосой во всю ширину, шапка выросла до
+   * ~125px — и страница экзамена накрыла и вторую строку шапки, и HUD
+   * целиком, вместе с риск-индикатором, лентой инцидентов и кнопкой паузы.
+   * Справа при этом осталась мёртвая полоса 392px, где HUD уже не жил.
+   *
+   * Поэтому место считает тот, кто знает раскладку, — вёрстка. Меряем по
+   * факту (getBoundingClientRect), а не по медиа-запросу: правило здесь одно
+   * и переживёт любой новый breakpoint.
+   */
+  App.prototype._reportExamViewInset = function () {
+    if (!this.bridge) return null;
+    var vw = window.innerWidth || 0;
+    var vh = window.innerHeight || 0;
+    if (!vw || !vh) return null;
+    // Зазор между нашим интерфейсом и чужой страницей: без него край LMS
+    // прилипает к HUD и читается как его часть.
+    var GAP = 16;
+
+    var top = 0;
+    var bar = document.querySelector('.topbar');
+    if (bar) {
+      var b = bar.getBoundingClientRect();
+      if (b.height > 0) top = Math.ceil(b.bottom);
+    }
+
+    var right = 0;
+    var bottom = 0;
+    var hud = el('hud');
+    var shown = false;
+    if (hud && !hud.hidden) {
+      var h = hud.getBoundingClientRect();
+      var cs = window.getComputedStyle ? window.getComputedStyle(hud) : null;
+      shown = h.width > 0 && h.height > 0
+        && (!cs || (cs.visibility !== 'hidden' && cs.display !== 'none'));
+      if (shown) {
+        /*
+         * Правая колонка или нижняя полоса — решаем по тому, какую сторону
+         * HUD занял НА САМОМ ДЕЛЕ, а не по ширине окна. Полоса во всю ширину
+         * (шире 70% окна) резервирует низ, узкая панель — право. Одна
+         * формула на оба медиа-запроса и на любой следующий.
+         */
+        if (h.width >= vw * 0.7) bottom = Math.ceil(vh - h.top) + GAP;
+        else right = Math.ceil(vw - h.left) + GAP;
+      }
+    }
+
+    // HUD не показан — докладывать нечего: вне калибровки и экзамена
+    // представление всё равно не прикреплено, а отчёт без места под HUD
+    // оболочка справедливо отвергнет и напишет об этом в журнал.
+    if (!shown) return null;
+
+    var inset = { top: top, right: right, bottom: bottom, left: 0 };
+    this.bridge.reportExamViewInset(inset);
+    return inset;
   };
 
   // --- подписки на поток от сайдкара ---
@@ -580,6 +841,7 @@
     this.bridge.subscribe('onHello', null, function (h) {
       var caps = pickSidecarCaps(h);
       if (caps) self._applyCaps(caps);
+      self._feedProfile(h);
     });
     this.bridge.subscribe('onError', null, function (err) {
       if (!err || typeof err !== 'object') return;
@@ -591,6 +853,10 @@
     // Этот канал не считается признаком живого сайдкара — он про оболочку.
     this.bridge.subscribeRaw('onShellStatus', null, function (st) {
       self._applyShellStatus(st);
+    });
+    // Защищённый режим: включился или снялся. Канал оболочки, не сайдкара.
+    this.bridge.subscribeRaw('onProtection', null, function (p) {
+      self.hud.setProtection(p);
     });
   };
 
@@ -616,6 +882,14 @@
   /** Состояние оболочки: мониторы и наличие связи с сайдкаром. */
   App.prototype._applyShellStatus = function (st) {
     if (!st || typeof st !== 'object') return;
+    // Профиль экзамена задаёт оболочка, и его состояние может приехать здесь.
+    this._feedProfile(st);
+    // Состояние защищённого режима приходит и отдельным событием, и здесь:
+    // статус оболочки — страховка на случай, если renderer загрузился позже
+    // первого push и пропустил его.
+    if (st.protection && typeof st.protection === 'object') {
+      this.hud.setProtection(st.protection);
+    }
     if (typeof st.displayCount === 'number') {
       // живое состояние оболочки — ведущее: отключили второй экран, пункт зеленеет сам
       if (st.displayCount > 1) {
@@ -667,6 +941,8 @@
   App.prototype.onLocked = function () {
     this.locked = true;
     if (this.exam.running) this.exam.finish('lock');
+    // Тест окончен блокировкой — машину отпускаем: экзамена больше нет.
+    this.bridge.setExamState('finished');
     this.bridge.sessionEnd('lock');
   };
 
@@ -676,6 +952,7 @@
     var self = this;
     this.bridge.capabilities().then(function (raw) {
       self.capsLoaded = true;
+      self._feedProfile(raw);
       var caps = pickSidecarCaps(raw);
       if (caps) {
         // карта каналов пришла прямо из capabilities() — сайдкар отвечал
@@ -868,6 +1145,299 @@
           '<tbody>' + rows + '</tbody>' +
         '</table>' +
       '</div>';
+  };
+
+  // --- правила экзамена: согласие, предполётная проверка, шапка отчёта ---
+
+  /** Профиль может дойти позже первого кадра — тогда экраны перерисуются. */
+  App.prototype._watchProfile = function () {
+    var self = this;
+    var mod = window.Proctor?.profile;
+    if (!mod || typeof mod.onChange !== 'function') return;
+    try { mod.onChange(function () { self._renderRules(); }); } catch (e) { /* не критично */ }
+  };
+
+  /**
+   * Отдать модулю правил конверт, в котором профиль МОЖЕТ лежать: shell-status,
+   * capabilities, hello. hud.js спрашивает window.proctor напрямую, но какой
+   * именно канал оболочка выбрала для профиля, на момент написания неизвестно,
+   * поэтому все приходящие конверты проверяются тоже. Конверт без профиля
+   * ничего не затирает — это проверяет setExamProfile.
+   */
+  App.prototype._feedProfile = function (raw) {
+    var mod = window.Proctor?.profile;
+    if (!mod || typeof mod.apply !== 'function') return;
+    // перерисовку делает подписка в _watchProfile, второй раз звать не нужно
+    try { mod.apply(raw); } catch (e) { /* чужой формат не ломает экран */ }
+  };
+
+  /**
+   * Текущие правила. Разбор живёт в hud.js (он подключается раньше), здесь
+   * только безопасное чтение: модуля может не быть вовсе, и тогда интерфейс
+   * обязан вести себя как при пустом профиле, а не падать.
+   */
+  App.prototype._profile = function () {
+    var mod = window.Proctor?.profile;
+    if (mod && typeof mod.current === 'function') {
+      try {
+        var p = mod.current();
+        if (p && typeof p === 'object') return p;
+      } catch (e) { /* ниже вернём пустые правила */ }
+    }
+    return {
+      present: false, hash: '', hashShort: '', url: '', host: '', local: true,
+      sources: [], allowSearch: false, searchKnown: false, preset: '', title: '', source: ''
+    };
+  };
+
+  /**
+   * Строки блока правил. Каждая — своё состояние: ok (правило задано),
+   * warn (правило ослаблено), off (правило не задавалось). Смысл несут
+   * подпись и значение словами, форма значка дублирует, цвет только усиливает.
+   */
+  App.prototype._rulesRows = function (p) {
+    var rows = [];
+    var online = p.present && p.url && !p.local;
+
+    rows.push(online
+      ? { key: 'url', state: 'ok', html: '<span class="mono">' + this._esc(p.url) + '</span>' }
+      : { key: 'url', state: 'off',
+          html: 'локальный тест на этом компьютере, обращений в сеть нет' });
+
+    if (p.sources.length) {
+      var items = '';
+      for (var i = 0; i < p.sources.length; i++) {
+        var s = p.sources[i];
+        // «и поддомены» словом: запись приходит как `host/*`, и звёздочка
+        // в списке правил читается хуже, чем сказанное по-русски условие.
+        items += '<li><span class="mono">' + this._esc(s.host) + '</span>' +
+                 (s.wildcard ? ' и его поддомены' : '') +
+                 (s.note ? ' — ' + this._esc(s.note) : '') + '</li>';
+      }
+      rows.push({ key: 'sources', state: 'ok',
+                  html: '<ul class="rules__srclist">' + items + '</ul>' });
+    } else if (online) {
+      rows.push({ key: 'sources', state: 'ok',
+                  html: 'только адрес теста выше: других источников проктор не открывал' });
+    } else {
+      rows.push({ key: 'sources', state: 'off',
+                  html: 'не заданы: доступен только локальный тест' });
+    }
+
+    // Поисковики запрещены по умолчанию и остаются запрещёнными, пока правила
+    // прямо не говорят иначе. Разрешение — ослабление, поэтому state=warn.
+    // ЧЕМ разрешены — важно: флаг запуска и сам профиль это разные основания,
+    // и оболочка их различает (allowSearchBy в shell/state.js).
+    if (p.allowSearch) {
+      var by = p.allowSearchBy === '--allow-search'
+        ? 'разрешены флагом запуска --allow-search'
+        : 'разрешены правилами этого экзамена';
+      rows.push({ key: 'search', state: 'warn', html: this._esc(by) });
+    } else {
+      rows.push({ key: 'search', state: 'ok',
+                  html: p.present ? 'запрещены' : 'запрещены: правила не задавались' });
+    }
+
+    /*
+     * Записи, которые проктор написал, а оболочка не приняла. Показываем их
+     * студенту сознательно: не принятая запись означает, что источник, который
+     * проктор считал открытым, в действительности закрыт. Молчать об этом —
+     * значит отправить человека на экзамен с неверным представлением о
+     * правилах и зафиксировать ему попытку перехода туда, куда его отправили.
+     */
+    if (p.rejected.length) {
+      var bad = '';
+      for (var r = 0; r < p.rejected.length; r++) {
+        bad += '<li><span class="mono">' + this._esc(p.rejected[r].raw) + '</span>' +
+               (p.rejected[r].text ? ' — ' + this._esc(p.rejected[r].text) : '') + '</li>';
+      }
+      rows.push({ key: 'rejected', state: 'warn',
+                  html: '<ul class="rules__srclist">' + bad + '</ul>' });
+    }
+
+    if (!p.present) {
+      rows.push({ key: 'hash', state: 'off', html: 'проктором не задавался' });
+    } else if (p.hash) {
+      rows.push({ key: 'hash', state: 'ok',
+                  html: '<span class="mono">' + this._esc(p.hash) + '</span>' });
+    } else {
+      rows.push({ key: 'hash', state: 'warn',
+                  html: 'хеш оболочкой не передан; правила выше действуют' });
+    }
+    return rows;
+  };
+
+  /**
+   * Отметка о профиле — короткая строка рядом с заголовком блока и рядом с
+   * вердиктом в шапке отчёта. Ровно две возможные формулировки, третьей нет:
+   * «действует профиль <хеш>» либо «правила экзамена проктором не задавались».
+   * Пустое место вместо отметки означало бы, что про правила просто забыли,
+   * а это именно та неоднозначность, из-за которой провалился Config Key.
+   */
+  App.prototype._rulesStamp = function (p) {
+    if (!p.present) return 'правила экзамена проктором не задавались';
+    if (!p.hash) return 'действует профиль, хеш оболочкой не передан';
+    return 'действует профиль <span class="mono">' + this._esc(p.hash) + '</span>';
+  };
+
+  /** Пояснение под блоком правил. Формула та же: факт, контекст, действие. */
+  App.prototype._rulesNote = function (p) {
+    if (!p.present) {
+      return 'Правила этого экзамена проктором не задавались, поэтому открыт только ' +
+             'локальный тест на этом компьютере. В подписанную цепочку сессии уйдёт ' +
+             'именно эта отметка — «правила не задавались», — а не пустое место: по ' +
+             'отчёту видно, что список не забыли показать, его не было.';
+    }
+    var note = 'Список задаёт проктор под конкретный экзамен. Профиль — это правила и ' +
+               'доказательство, а не непреодолимый барьер: мы не утверждаем, что обойти ' +
+               'его невозможно. Ценность в другом — попытка открыть адрес вне списка ' +
+               'попадает в журнал вместе с полным адресом, а хеш действовавших правил ' +
+               'уходит в подписанную цепочку сессии. Отдельного переключателя, которым ' +
+               'эту запись выключают, в системе нет.';
+    if (p.allowSearch) {
+      note += ' Поисковые системы для этого экзамена разрешены правилами. Их выдача ' +
+              'часто показывает готовый ответ прямо на странице, поэтому разрешение ' +
+              'отмечено и здесь, и в шапке отчёта, и в подписанной цепочке.';
+    }
+    if (p.rejected.length) {
+      note += ' Часть записей списка не принята — они перечислены выше вместе с ' +
+              'причиной. По этим адресам доступа нет, и переход на них будет ' +
+              'зафиксирован так же, как на любой другой адрес вне списка.';
+    }
+    return note;
+  };
+
+  /**
+   * Контейнер блока правил. Берём узел из разметки, а если его там нет —
+   * создаём и ставим перед указанным ориентиром: правила должны стоять ДО
+   * того, что студент делает дальше (читает перечень данных, запускает тест).
+   */
+  App.prototype._rulesHost = function (id, screenId, beforeSel) {
+    var host = el(id);
+    if (host) return host;
+    var screen = el(screenId);
+    if (!screen) return null;
+    var inner = screen.querySelector('.screen__inner') || screen;
+    try {
+      host = document.createElement('section');
+      host.id = id;
+      host.className = 'rules';
+      var before = beforeSel ? inner.querySelector(beforeSel) : null;
+      if (before) inner.insertBefore(host, before);
+      else inner.appendChild(host);
+      return host;
+    } catch (e) { return null; }
+  };
+
+  App.prototype._renderRulesBlock = function (host, p, suffix) {
+    if (!host) return;
+    var titleId = 'rules-title-' + suffix;
+    var rows = this._rulesRows(p);
+    var fullSources = '';
+    if (suffix === 'consent' && p.sources.length > 2) {
+      // На согласии длинный список источников (разведка LMS даёт и 5–10
+      // доменов) выталкивал бы кнопку за экран. Видны первые два и счёт
+      // остальных; полный список — в «Подробнее о правилах» ниже и целиком
+      // на экране проверки окружения.
+      for (var k = 0; k < rows.length; k++) {
+        if (rows[k].key !== 'sources') continue;
+        fullSources = rows[k].html;
+        var shown = '';
+        for (var j = 0; j < 2; j++) {
+          shown += (j ? ', ' : '') + '<span class="mono">' + this._esc(p.sources[j].host) + '</span>' +
+                   (p.sources[j].wildcard ? ' и поддомены' : '');
+        }
+        rows[k] = { key: 'sources', state: rows[k].state,
+                    html: shown + ' и ещё ' + (p.sources.length - 2) + ' — полный список ниже' };
+      }
+    }
+    var body = '';
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      body += '<div class="rules__row" data-state="' + r.state + '" data-rule="' + r.key + '">' +
+                '<dt class="rules__term">' +
+                  '<span class="rules__mark" aria-hidden="true">' + ruleSvg(r.state) + '</span>' +
+                  '<span>' + this._esc(RULE_TERMS[r.key]) + '</span>' +
+                '</dt>' +
+                '<dd class="rules__value">' + r.html + '</dd>' +
+              '</div>';
+    }
+    host.className = 'rules';
+    host.setAttribute('aria-labelledby', titleId);
+    host.setAttribute('data-profile', p.present ? 'yes' : 'no');
+    var note = '<p class="rules__note muted">' + this._esc(this._rulesNote(p)) + '</p>';
+    var key = '';
+    if (suffix === 'consent') {
+      // На согласии блок — колонка рядом с перечнем данных, экран обязан
+      // помещаться без прокрутки. Пояснение свёрнуто, но то, на что человек
+      // соглашается, остаётся на виду: попытка выйти за список пишется в
+      // журнал с полным адресом. Полностью пояснение повторяется на экране
+      // проверки окружения.
+      // Строка о последствии стоит сразу под заголовком, выше правил: даже
+      // если длинный профиль не уместится в колонку, её видно всегда.
+      key = p.present
+        ? '<p class="rules__key">Адрес любой попытки выйти за список пишется в журнал.</p>'
+        : '';
+      var list = fullSources
+        ? '<p class="rules__note"><b>Разрешённые источники полностью:</b></p>' + fullSources
+        : '';
+      note = '<details class="rules__more"><summary>Подробнее о правилах</summary>' +
+          list + note + '</details>';
+    }
+    host.innerHTML =
+      '<div class="rules__head">' +
+        '<h2 class="card__title" id="' + titleId + '">' + this._esc(RULES_TITLE) + '</h2>' +
+        '<span class="rules__stamp">' + this._rulesStamp(p) + '</span>' +
+      '</div>' + key +
+      '<dl class="rules__grid">' + body + '</dl>' + note;
+  };
+
+  /**
+   * Отметка о правилах в ШАПКЕ отчёта, рядом с вердиктом, — а не в разделе
+   * ограничений внизу. Читающий отчёт видит оценку и действовавшие правила
+   * одним взглядом: оценка без правил, при которых она получена, ничего не
+   * значит, а внизу страницы её никто не ищет.
+   */
+  App.prototype._renderReportRules = function (p) {
+    var node = el('report-rules');
+    if (!node) {
+      var lede = el('report-lede');
+      if (!lede || !lede.parentNode) return;
+      try {
+        node = document.createElement('p');
+        node.id = 'report-rules';
+        node.className = 'report__rules';
+        lede.parentNode.insertBefore(node, lede.nextSibling);
+      } catch (e) { return; }
+    }
+    var state = p.present ? (p.allowSearch ? 'warn' : 'ok') : 'off';
+    var html;
+    if (!p.present) {
+      // Одна фраза, а не отметка плюс пояснение: в шапке отчёта повтор одного
+      // и того же утверждения двумя разными формулировками только мешает.
+      html = this._esc('Правила экзамена проктором не задавались: был открыт только ' +
+                       'локальный тест на этом компьютере.');
+    } else {
+      var head = p.hash
+        ? 'Действовал профиль экзамена <span class="mono">' + this._esc(p.hash) + '</span>. '
+        : this._esc('Действовал профиль экзамена, хеш оболочкой не передан. ');
+      html = head + this._esc('Поисковые системы ' +
+        (p.allowSearch ? 'были разрешены правилами экзамена.' : 'были запрещены.'));
+    }
+    node.setAttribute('data-state', state);
+    node.innerHTML =
+      '<span class="rules__mark" aria-hidden="true">' + ruleSvg(state) + '</span> ' +
+      '<span>' + html + '</span>';
+  };
+
+  /** Перерисовать все три места, где показаны правила. Идемпотентно. */
+  App.prototype._renderRules = function () {
+    var p = this._profile();
+    this._renderRulesBlock(
+      this._rulesHost('consent-rules', 'screen-consent', '.disclose'), p, 'consent');
+    this._renderRulesBlock(
+      this._rulesHost('preflight-rules', 'screen-preflight', '.checks'), p, 'preflight');
+    this._renderReportRules(p);
   };
 
   // --- экран проверок ---
@@ -1139,6 +1709,10 @@
   App.prototype._renderReport = function () {
     var sum = this.hud.summary();
     var tele = this.telemetry.sessionSummary();
+
+    // Отметка о правилах — в шапке, рядом с вердиктом, и обновляется здесь же:
+    // профиль мог дойти уже во время теста.
+    this._renderReportRules(this._profile());
 
     var score = Math.max(0, Math.min(100, sum.score || 0));
     var lv = this._levelOf(score);

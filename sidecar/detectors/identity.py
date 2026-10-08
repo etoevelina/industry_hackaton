@@ -10,18 +10,47 @@
 Что делает модуль
 -----------------
 1. `enroll()` — собирает эталон по кадрам калибровки (усреднённый нормированный
-   эмбеддинг insightface/buffalo_sc) с жёсткой отбраковкой плохих кадров.
+   эмбеддинг insightface/buffalo_sc) с жёсткой отбраковкой плохих кадров и
+   калибрует ПЕРСОНАЛЬНЫЙ порог по разбросу эталонных кадров этого студента.
 2. `verify()` — косинусная близость текущего лица к эталону, решение по скользящему
    окну с гистерезисом (одиночный плохой кадр не порождает тревогу).
 3. `update_liveness()` — ПРИЗНАКИ живости, а не события: отсутствие морганий,
    статичность области лица, повтор последовательности кадров (loop видеозаписи).
 
+Три состояния, а не два
+-----------------------
+`verify()` возвращает `status`: `verified` | `not_verified` | `undetermined`.
+Третье состояние появилось потому, что двух не хватало: «сравнили и совпало» и
+«сравнить не смогли» сходились в один `match=True`, а «кадр непригоден для
+сравнения» и «это другой человек» — в один плохой голос. Обе склейки дают
+ошибку в сторону, которая стоит студенту экзамена:
+
+* тёмная или мелкая область лица -> плохие голоса -> IDENTITY_MISMATCH -> PAUSE.
+  Причина лежит в модели и условиях съёмки, а не в поведении человека: NIST IR
+  8280 документирует дифференциалы FNMR по группам, Respondus измерил, что при
+  тёмном освещении рост FPR для тона кожи 6 по Фицпатрику значим и исчезает при
+  контроле освещения;
+* отсутствие эталона или лица -> `match=True` -> «личность подтверждена» там,
+  где сравнения не было вовсе.
+
+Поэтому: непригодный кадр идёт в ОТДЕЛЬНЫЙ счётчик, в окно голосования не
+попадает, и при устойчивой непригодности канал заявляет «условия съёмки не
+позволяют подтвердить личность» — утверждение про аудиторию, не про студента.
+Порог сверки калибруется под конкретного человека и только в сторону
+ослабления (`_calibrate_threshold`). Все пороги, метрики кадра и основание
+вывода уходят в `IdentityObservation.to_dict()["detail"]`, чтобы отчёт мог
+объяснить преподавателю, на каком основании сделан вывод.
+
 Что модуль НЕ делает
 --------------------
 * Не порождает `ProctorEvent`. Все наблюдения уходят в EventEngine, который сам
   отвечает за окно подтверждения, cooldown и формулировки:
-    - `IdentityObservation.enrolled and not match` -> наблюдение `IDENTITY_MISMATCH`;
-    - `LivenessObservation.suspect`                -> наблюдение `LIVENESS_FAIL`.
+    - `IdentityObservation.status == "not_verified"` -> наблюдение `IDENTITY_MISMATCH`
+      (эквивалентно старому `enrolled and not match`, но `undetermined` в него
+      больше не попадает: такие кадры помечены `checked=False`);
+    - `LivenessObservation.suspect`                 -> наблюдение `LIVENESS_FAIL`.
+* Не принимает решения об экзамене. `undetermined` — это отсутствие данных,
+  которое показывают человеку, а не основание для паузы или блокировки.
 * Не проверяет виртуальную камеру — это `sidecar/env_checks.py` (`VIRTUAL_CAMERA`),
   метода `check_virtual_camera()` здесь сознательно нет.
 * Не ходит в сеть. insightface умеет скачивать модели — поэтому модель берётся
@@ -59,7 +88,45 @@ __all__ = [
     "IdentityObservation",
     "LivenessObservation",
     "DEFAULT_IDENTITY_CONFIG",
+    "STATUS_VERIFIED",
+    "STATUS_NOT_VERIFIED",
+    "STATUS_UNDETERMINED",
 ]
+
+
+# --------------------------------------------------------------------------
+# Три состояния канала личности.
+#
+# Раньше их было два (`match: bool`), и оба хвоста сходились в `match=True`:
+# «сравнили и совпало» и «сравнить не смогли» выглядели для движка одинаково.
+# Это ошибка в обе стороны сразу: отсутствие данных выдавалось за
+# подтверждение личности, а непригодный кадр — за плохую проверку.
+# --------------------------------------------------------------------------
+#: Сравнение выполнено, близость выше действующего порога.
+STATUS_VERIFIED = "verified"
+#: Сравнение выполнено, устойчиво ниже порога. ЕДИНСТВЕННОЕ состояние,
+#: из которого имеет право родиться IDENTITY_MISMATCH.
+STATUS_NOT_VERIFIED = "not_verified"
+#: Сравнения не было или оно недостоверно: канал выключен, эталон не снят,
+#: лица нет, кадр непригоден. Это НЕ обвинение и НЕ подтверждение.
+STATUS_UNDETERMINED = "undetermined"
+
+#: Машинный код причины -> формулировка для человека (HUD, отчёт, объяснение
+#: преподавателю). Текст отвечает на вопрос «на каком основании», а не «кто виноват».
+UNDETERMINED_REASONS: dict[str, str] = {
+    "channel_off": "канал личности отключён",
+    "not_enrolled": "эталон личности не снят",
+    "no_face": "лицо не найдено — сравнивать нечего",
+    "too_dark": "область лица слишком тёмная для сравнения",
+    "too_bright": "область лица пересвечена",
+    "low_contrast": "область лица без контраста (засветка или шум)",
+    "face_too_small": "лицо занимает слишком малую часть кадра",
+    "low_det_score": "детектор не уверен, что это лицо",
+    "blurred": "кадр смазан",
+    "head_turned": "голова повёрнута — виден профиль, а не лицо",
+    "conditions": "условия съёмки не позволяют подтвердить личность",
+    "insufficient_checks": "сравнений пока недостаточно для вывода",
+}
 
 
 # --------------------------------------------------------------------------
@@ -90,6 +157,33 @@ DEFAULT_IDENTITY_CONFIG: dict[str, Any] = {
     "pitch_ratio_range": (0.25, 0.78),  # нос между линией глаз и линией рта
     "min_sharpness": 25.0,           # дисперсия лапласиана кропа лица (анти-смаз)
     "enroll_outlier_cos": 0.5,       # эмбеддинг с таким косинусом к среднему — выброс
+    # --- пригодность кадра В СЕССИИ (не на калибровке) ---
+    # Порог «кадр непригоден» СЛАБЕЕ, чем порог отбраковки на калибровке:
+    # на калибровке мы можем требовать идеальный кадр и просто ждать следующий,
+    # в сессии студент сидит как сидит. Задача этих порогов — не улучшить
+    # качество, а отличить «не смогли посмотреть» от «посмотрели и не совпало».
+    "quality_gate": True,            # False -> старое поведение (всё идёт в окно)
+    "verify_min_face_px": 70,        # меньшая сторона bbox; мельче — эмбеддинг шумный
+    "verify_min_det_score": 0.45,
+    "verify_min_sharpness": 12.0,    # дисперсия лапласиана кропа лица
+    "verify_max_yaw_ratio": 0.34,    # профиль сравнивать нельзя, это не «другой человек»
+    "min_face_luma": 42.0,           # средняя яркость области лица, уровни 0..255
+    "max_face_luma": 238.0,          # пересвет: лицо «выбито» в белое
+    "min_face_contrast": 10.0,       # СКО яркости области лица
+    # Доля непригодных кадров, после которой канал честно говорит
+    # «условия съёмки не позволяют подтвердить личность».
+    "unusable_window": 10,
+    "unusable_ratio": 0.6,
+    "unusable_min_frames": 3,
+    # --- персональная калибровка порога (ответ на дифференциалы FNMR) ---
+    # Калибровка может только ОСЛАБИТЬ порог, не усилить: ужесточение порога —
+    # это ровно тот вред, который документирует NIST IR 8280, и глобальное
+    # значение уже проверено на нашей модели.
+    "personal_threshold": True,
+    "personal_k": 2.0,               # порог = mean(pairwise cos) - k*sigma
+    "personal_min_samples": 6,       # меньше эмбеддингов — остаёмся на глобальном
+    "threshold_floor": 0.22,         # ниже не опускаемся никогда: пройдёт чужой
+    "threshold_ceiling": 0.35,       # и не выше глобального (см. active_threshold)
 }
 
 DEFAULT_LIVENESS_CONFIG: dict[str, Any] = {
@@ -151,21 +245,92 @@ def _cfg(config: Any, section: str, key: str, default: Any) -> Any:
 # --------------------------------------------------------------------------
 @dataclass
 class IdentityObservation:
-    """Наблюдение канала личности. Контракт: match / similarity / enrolled."""
+    """Наблюдение канала личности.
+
+    Авторитетное поле — `status` (`verified` / `not_verified` / `undetermined`).
+
+    `match` остаётся в контракте для совместимости, но читать его как
+    «личность подтверждена» НЕЛЬЗЯ: оно означает лишь «вывода о несовпадении
+    нет», то есть `status != not_verified`. Подтверждение — это `verified`
+    (см. свойство `confirmed`).
+
+    `checked` означает «на этом кадре получен вывод о личности». Непригодный
+    кадр и кадр без лица дают `checked=False`: данных нет, и правило движка
+    (`sidecar/main.py::_identity_observations`) такой кадр пропускает целиком —
+    серия несовпадений не растёт и не обнуляется.
+    """
 
     match: bool = True
     similarity: float = 0.0
     enrolled: bool = False
     # --- расширения (не ломают контракт, нужны движку и HUD) ---
     available: bool = False     # канал вообще работает (модель загружена)
-    checked: bool = False       # на этом кадре реально считался эмбеддинг
+    checked: bool = False       # на этом кадре получен вывод о личности
     face_found: bool = False    # insightface нашёл лицо для сравнения
     votes: int = 0              # сколько проверок в скользящем окне
     mismatch_ratio: float = 0.0  # доля «чужих» проверок в окне
-    threshold: float = 0.0
+    threshold: float = 0.0      # ДЕЙСТВУЮЩИЙ порог (персональный или глобальный)
     quality: float = 0.0        # det_score найденного лица
     reason: str = ""            # по-русски, для HUD/отчёта
+    # --- третье состояние и обоснование вывода ---
+    status: str = STATUS_UNDETERMINED
+    status_code: str = ""        # машинный код причины undetermined
+    usable: bool = False         # кадр пригоден для сравнения
+    unusable_ratio: float = 0.0  # доля непригодных кадров в своём окне
+    unusable_streak: int = 0     # подряд непригодных кадров
+    conditions_block: bool = False  # условия съёмки устойчиво мешают сверке
+    threshold_source: str = "global"  # global | personal
+    threshold_global: float = 0.0     # для сравнения в отчёте
+    quality_metrics: dict[str, float] = field(default_factory=dict)
     ts: float = field(default_factory=time.time)
+
+    @property
+    def confirmed(self) -> bool:
+        """Личность действительно подтверждена сравнением (а не «не опровергнута»)."""
+        return self.status == STATUS_VERIFIED
+
+    @property
+    def accusing(self) -> bool:
+        """Из этого наблюдения имеет право родиться IDENTITY_MISMATCH."""
+        return self.status == STATUS_NOT_VERIFIED
+
+    def explain(self) -> str:
+        """Человекочитаемое обоснование вывода — то, что читает преподаватель.
+
+        Формула: что решено -> на каком основании -> с каким порогом и откуда
+        этот порог взялся. Без этого отчёт не может объяснить решение, а
+        расхождение «документ обещает объяснимость, код её не даёт» — ровно то,
+        на чём ловят на защите.
+        """
+        src = (
+            "персональный порог, откалиброван по эталонным кадрам этого студента"
+            if self.threshold_source == "personal"
+            else "глобальный порог по умолчанию"
+        )
+        if self.status == STATUS_UNDETERMINED:
+            why = UNDETERMINED_REASONS.get(self.status_code, self.status_code or "нет данных")
+            tail = ""
+            if self.unusable_ratio > 0:
+                tail = (
+                    f"; непригодных кадров в окне: "
+                    f"{int(round(self.unusable_ratio * 100))}%"
+                )
+            return (
+                f"Личность не проверена: {why}{tail}. "
+                "Это отсутствие данных, а не признак подмены; "
+                "решение остаётся за преподавателем."
+            )
+        if self.status == STATUS_NOT_VERIFIED:
+            return (
+                f"Лицо устойчиво не совпадает с эталоном калибровки: близость "
+                f"{self.similarity:.2f} против порога {self.threshold:.2f} ({src}); "
+                f"доля несовпавших проверок в окне {int(round(self.mismatch_ratio * 100))}% "
+                f"из {self.votes}. Непригодные кадры в подсчёт не включены."
+            )
+        return (
+            f"Личность подтверждена: близость {self.similarity:.2f} "
+            f"при пороге {self.threshold:.2f} ({src})."
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -180,6 +345,19 @@ class IdentityObservation:
             "threshold": round(float(self.threshold), 3),
             "quality": round(float(self.quality), 3),
             "reason": self.reason,
+            "status": self.status,
+            "status_code": self.status_code,
+            "confirmed": self.confirmed,
+            "usable": self.usable,
+            "unusable_ratio": round(float(self.unusable_ratio), 3),
+            "unusable_streak": self.unusable_streak,
+            "conditions_block": self.conditions_block,
+            "threshold_source": self.threshold_source,
+            "threshold_global": round(float(self.threshold_global), 3),
+            "quality_metrics": {
+                k: round(float(v), 2) for k, v in (self.quality_metrics or {}).items()
+            },
+            "detail": self.explain(),
             "ts": self.ts,
         }
 
@@ -370,6 +548,26 @@ class IdentityVerifier:
         self.min_sharpness = float(ic("min_sharpness"))
         self.enroll_outlier_cos = float(ic("enroll_outlier_cos"))
 
+        # --- пригодность кадра в сессии ---
+        self.quality_gate = bool(ic("quality_gate"))
+        self.verify_min_face_px = int(ic("verify_min_face_px"))
+        self.verify_min_det_score = float(ic("verify_min_det_score"))
+        self.verify_min_sharpness = float(ic("verify_min_sharpness"))
+        self.verify_max_yaw_ratio = float(ic("verify_max_yaw_ratio"))
+        self.min_face_luma = float(ic("min_face_luma"))
+        self.max_face_luma = float(ic("max_face_luma"))
+        self.min_face_contrast = float(ic("min_face_contrast"))
+        self.unusable_window = max(3, int(ic("unusable_window")))
+        self.unusable_ratio_cfg = float(ic("unusable_ratio"))
+        self.unusable_min_frames = max(1, int(ic("unusable_min_frames")))
+
+        # --- персональная калибровка порога ---
+        self.personal_threshold_enabled = bool(ic("personal_threshold"))
+        self.personal_k = float(ic("personal_k"))
+        self.personal_min_samples = max(3, int(ic("personal_min_samples")))
+        self.threshold_floor = float(ic("threshold_floor"))
+        self.threshold_ceiling = float(ic("threshold_ceiling"))
+
         # --- liveness ---
         self.patch_size = int(lc("patch_size"))
         self.hash_grid = int(lc("hash_grid"))
@@ -410,6 +608,25 @@ class IdentityVerifier:
         self._similarity_ema: float = 0.0
         self._checks_total: int = 0
         self._mismatch_streak: int = 0
+
+        # --- состояние пригодности кадров (отдельное от окна голосов!) ---
+        self._usable_votes: deque[bool] = deque(maxlen=self.unusable_window)
+        self._unusable_streak: int = 0
+        self._unusable_total: int = 0
+        self._unusable_reasons: dict[str, int] = {}
+        self._conditions_block: bool = False
+
+        # --- персональный порог ---
+        # Через `_calibrate_threshold(None)`, а не литералом: так начальное
+        # состояние и причина «порог глобальный» описаны в одном месте.
+        self._personal_threshold: float | None = None
+        self._threshold_source: str = "global"
+        self._threshold_stats: dict[str, Any] = {}
+        #: Представительность эталона — см. `_grade_reference()`. Не вердикт,
+        #: а метка для отчёта: рыхлый эталон ОСЛАБЛЯЕТ порог, и человек обязан
+        #: об этом знать.
+        self._reference_quality: dict[str, Any] = {"frames": 0, "issues": [], "ok": True}
+        self._calibrate_threshold(None)
 
         # --- состояние liveness ---
         self._prev_patch: Any = None
@@ -709,6 +926,143 @@ class IdentityVerifier:
         return None
 
     # ----------------------------------------------------------------- #
+    # Пригодность кадра В СЕССИИ: «не смогли посмотреть» != «не совпало»
+    # ----------------------------------------------------------------- #
+    def _usability(
+        self,
+        frame: Any,
+        meta: dict[str, Any],
+    ) -> tuple[str | None, dict[str, float]]:
+        """Годен ли кадр для сравнения с эталоном.
+
+        Возвращает `(код причины | None, метрики)`. Код не None — кадр
+        НЕПРИГОДЕН, и это отсутствие данных: голос в окно голосования не
+        кладётся, серия несовпадений не растёт.
+
+        Зачем проверка существует
+        -------------------------
+        Respondus в собственном замере показал, что тёмное освещение значимо
+        повышает частоту ложных срабатываний во всех группах, а для тона кожи 6
+        по Фицпатрику рост значим и ИСЧЕЗАЕТ при контроле освещения. То есть
+        причина лежит в условиях съёмки, а не в поведении студента, — и
+        различить эти два случая обязан код, а не преподаватель по факту
+        остановленного экзамена. Анализ детекторов Proctorio (Satheesan, Vice,
+        апрель 2021: на наборе FairFaces лица, помеченные как Black, не
+        находились в 57% случаев) показывает цену того, чтобы этого не делать.
+
+        Метрики считаются по области лица, а не по всему кадру: яркая лампа за
+        спиной при тёмном лице — это именно тот случай, который глобальная
+        яркость кадра скрывает.
+        """
+        metrics: dict[str, float] = {}
+        bbox = meta.get("bbox")
+        if bbox is None:
+            return "no_face", metrics
+        _, _, bw, bh = bbox
+        metrics["face_px"] = float(min(bw, bh))
+        metrics["det_score"] = float(meta.get("det_score", 0.0) or 0.0)
+
+        if not self.quality_gate:
+            return None, metrics
+
+        try:
+            arr = np.asarray(frame)
+            box = _norm_bbox(bbox, arr.shape[1], arr.shape[0])
+        except Exception:
+            box = None
+        if box is not None:
+            x0, y0, w0, h0 = box
+            patch = _to_gray(arr[y0 : y0 + h0, x0 : x0 + w0])
+            if patch.size:
+                metrics["luma"] = float(patch.mean())
+                metrics["contrast"] = float(patch.std())
+                metrics["sharpness"] = float(_laplacian_var(patch))
+
+        kps = meta.get("kps")
+        if kps is not None:
+            try:
+                k = np.asarray(kps, dtype=np.float32)
+                if k.shape[0] >= 3:
+                    le, re, nose = k[0], k[1], k[2]
+                    axis = re - le
+                    eye_dist = float(np.linalg.norm(axis))
+                    if eye_dist >= 4.0:
+                        eye_mid = (le + re) / 2.0
+                        metrics["yaw_ratio"] = abs(
+                            float(np.dot(nose - eye_mid, axis) / (eye_dist * eye_dist))
+                        )
+            except Exception:
+                pass
+
+        # Порядок проверок = порядок объяснения человеку: сначала то, что
+        # студент может исправить сам (свет, расстояние), потом поза.
+        if "luma" in metrics:
+            if metrics["luma"] < self.min_face_luma:
+                return "too_dark", metrics
+            if metrics["luma"] > self.max_face_luma:
+                return "too_bright", metrics
+        if "contrast" in metrics and metrics["contrast"] < self.min_face_contrast:
+            return "low_contrast", metrics
+        if metrics["face_px"] < self.verify_min_face_px:
+            return "face_too_small", metrics
+        if metrics["det_score"] < self.verify_min_det_score:
+            return "low_det_score", metrics
+        if "sharpness" in metrics and metrics["sharpness"] < self.verify_min_sharpness:
+            return "blurred", metrics
+        if "yaw_ratio" in metrics and metrics["yaw_ratio"] > self.verify_max_yaw_ratio:
+            return "head_turned", metrics
+        return None, metrics
+
+    def _note_unusable(self, code: str) -> None:
+        """Учесть непригодный кадр в ОТДЕЛЬНОМ счётчике, не в окне голосов."""
+        self._usable_votes.append(False)
+        self._unusable_streak += 1
+        self._unusable_total += 1
+        self._unusable_reasons[code] = self._unusable_reasons.get(code, 0) + 1
+        self._conditions_block = (
+            self._unusable_streak >= self.unusable_min_frames
+            and self._unusable_rate() >= self.unusable_ratio_cfg
+        )
+
+    def _note_usable(self) -> None:
+        self._usable_votes.append(True)
+        self._unusable_streak = 0
+        if self._unusable_rate() < self.unusable_ratio_cfg:
+            self._conditions_block = False
+
+    def _unusable_rate(self) -> float:
+        if not self._usable_votes:
+            return 0.0
+        bad = sum(1 for v in self._usable_votes if not v)
+        return float(bad) / float(len(self._usable_votes))
+
+    def conditions_summary(self) -> dict[str, Any]:
+        """Сводка условий съёмки для отчёта.
+
+        Отчёт обязан уметь сказать преподавателю: «сверка личности не
+        выполнялась 4 минуты, потому что в аудитории темно», а не молчать.
+        """
+        total = self._unusable_total + self._checks_total
+        reasons = {
+            UNDETERMINED_REASONS.get(code, code): count
+            for code, count in sorted(
+                self._unusable_reasons.items(), key=lambda kv: -kv[1]
+            )
+        }
+        return {
+            "comparisons": self._checks_total,
+            "unusable_frames": self._unusable_total,
+            "unusable_share": round(self._unusable_total / float(max(1, total)), 3),
+            "unusable_ratio_window": round(self._unusable_rate(), 3),
+            "conditions_block": self._conditions_block,
+            "reasons": reasons,
+            "note": (
+                "непригодные кадры НЕ учитывались как несовпадения: "
+                "это отсутствие данных, а не признак подмены"
+            ),
+        }
+
+    # ----------------------------------------------------------------- #
     # enroll
     # ----------------------------------------------------------------- #
     def enroll(
@@ -763,19 +1117,23 @@ class IdentityVerifier:
         if not self._enroll_embeddings or len(self._enroll_embeddings) < self.min_enroll_frames:
             self._reference = None
             self._reference_cohesion = 0.0
+            self._calibrate_threshold(None)
             return
         mat = np.stack(self._enroll_embeddings).astype(np.float32)
         mean = mat.mean(axis=0)
         norm = float(np.linalg.norm(mean))
         if norm < 1e-6:
             self._reference = None
+            self._calibrate_threshold(None)
             return
         mean /= norm
         cos = mat @ mean
         keep = cos >= self.enroll_outlier_cos
         if cos.size >= 4:
             keep &= cos >= (float(cos.mean()) - 2.0 * float(cos.std()) - 1e-6)
-        if int(keep.sum()) >= self.min_enroll_frames:
+        dropped = int(cos.size - int(keep.sum()))
+        fail_open = int(keep.sum()) < self.min_enroll_frames
+        if not fail_open:
             mat = mat[keep]
             mean = mat.mean(axis=0)
             n2 = float(np.linalg.norm(mean))
@@ -784,6 +1142,198 @@ class IdentityVerifier:
             cos = mat @ mean
         self._reference = mean
         self._reference_cohesion = float(cos.mean())
+        self._reference_quality = self._grade_reference(mat, cos, dropped, fail_open)
+        self._calibrate_threshold(mat)
+
+    def _grade_reference(self, mat: Any, cos: Any, dropped: int,
+                         fail_open: bool) -> dict[str, Any]:
+        """Оценить ПРЕДСТАВИТЕЛЬНОСТЬ эталона и назвать проблемы прямо.
+
+        Это не проверка кадра — её делает `_quality_reject` (смаз, поза) по
+        одному кадру. Здесь оценивается разнородность эталона МЕЖДУ кадрами, и
+        она важна сама по себе, потому что работает в сторону ослабления:
+        порог = clamp(pair_mean - k*pair_sigma, floor, ceiling), и чем рыхлее
+        эталон, тем ниже планка. Студент, который двигается и меняет свет на
+        калибровочных кадрах, законно получает самый мягкий порог — и до этой
+        правки ничто об этом не сообщало.
+
+        Две вещи, которые здесь честно НЕ закрыты, а только названы:
+
+        * рыхлый эталон (`loose`) по-прежнему ослабляет порог. Менять саму
+          формулу без измерений под дедлайн было бы хуже: занижение потолка
+          ослабления — это рост ложных отказов, то есть ровно тот вред, который
+          документирует NIST IR 8280. Поэтому факт выносится человеку;
+        * СМЕСЬ двух лиц в эталоне (`mixture`) фильтр выбросов не ловит:
+          подставные кадры сами сдвигают центроид, относительно которого их
+          меряют, и при 6 своих + 6 чужих проходят все 12. Признак здесь —
+          бимодальность попарных косинусов, и он эвристический. Он НЕ
+          останавливает сессию: ложное срабатывание означало бы отказ в
+          экзамене, а это решение человека.
+
+        Поэтому результат — метка для отчёта и для проктора, а не вердикт.
+        """
+        out: dict[str, Any] = {"frames": int(mat.shape[0]), "dropped": int(dropped),
+                               "issues": [], "ok": True}
+        if fail_open:
+            # Фильтр выбросов пропущен целиком: чем грязнее enroll, тем меньше
+            # фильтрации. Это обязано быть видно, а не оставаться тихой ветвью.
+            out["issues"].append(
+                "фильтр выбросов не применён: после отбора осталось меньше "
+                f"{self.min_enroll_frames} кадров, в эталон и в калибровку "
+                "вошли ВСЕ кадры, включая выбросы")
+        try:
+            n = int(mat.shape[0])
+            if n >= 4:
+                gram = np.asarray(mat @ mat.T, dtype=np.float32)
+                pairs = gram[np.triu_indices(n, k=1)]
+                if pairs.size >= 3:
+                    p_mean = float(pairs.mean())
+                    p_sigma = float(pairs.std())
+                    p_min = float(pairs.min())
+                    out.update({"pair_mean": round(p_mean, 4),
+                                "pair_sigma": round(p_sigma, 4),
+                                "pair_min": round(p_min, 4)})
+                    # Рыхлость: разброс настолько велик, что порог уедет к полу.
+                    if p_mean - self.personal_k * p_sigma <= self.threshold_floor + 1e-6:
+                        out["issues"].append(
+                            f"эталон разнородный (попарная sigma {p_sigma:.3f}): "
+                            f"персональный порог упирается в нижнюю границу "
+                            f"{self.threshold_floor:.2f}, то есть сверка идёт по "
+                            "самой мягкой из допустимых планок — переснимите "
+                            "эталон при ровном свете и без движения")
+                    # Смесь: пары непохожи МЕЖДУ СОБОЙ, и разброс при этом
+                    # большой. Одной доли непохожих пар недостаточно: у
+                    # рыхлого, но одного лица все пары дружно низкие, а sigma
+                    # мала (~0.06). У настоящей смеси двух лиц пары
+                    # расслаиваются на «свои» и «чужие», и sigma велика
+                    # (~0.5). Разделяем именно по этому, иначе метка кричала бы
+                    # на каждом неаккуратном эталоне и перестала бы что-то
+                    # значить.
+                    low = float((pairs < self.enroll_outlier_cos).mean())
+                    if low >= 0.15 and p_sigma >= 0.12:
+                        out["issues"].append(
+                            f"эталон похож на СМЕСЬ: {low * 100:.0f}% пар кадров "
+                            f"непохожи между собой (косинус ниже "
+                            f"{self.enroll_outlier_cos:.2f}). Возможно, в кадр "
+                            "попал второй человек — проверьте эталонные кадры "
+                            "глазами перед тем, как доверять сверке личности")
+        except Exception as exc:
+            out["issues"].append(f"оценка эталона не выполнена: {exc}")
+        out["ok"] = not out["issues"]
+        return out
+
+    # ----------------------------------------------------------------- #
+    # Персональный порог
+    # ----------------------------------------------------------------- #
+    def _calibrate_threshold(self, mat: Any) -> None:
+        """Подобрать порог под то, как модель видит ИМЕННО этого человека.
+
+        Зачем
+        -----
+        NIST IR 8280 (декабрь 2019) показал, что ложные отказы распознавания
+        лиц распределены по группам неравномерно: для части групп FNMR выше на
+        порядок. Одно глобальное число 0.35 переносит этот дифференциал прямо в
+        решение об экзамене: человек, которого модель «видит» хуже, получает
+        обвинение в подмене за поведение, которого не было.
+
+        Как
+        ---
+        По эталонным кадрам считается распределение ПОПАРНЫХ косинусов между
+        разными кадрами одного и того же студента — это и есть наблюдаемая
+        «своя» вариативность под этой моделью. Порог = mean - k*sigma.
+
+        Почему попарно, а не к среднему: косинус кадра к среднему, в которое он
+        сам же входит, смещён вверх (кадр похож на себя) и тем сильнее, чем
+        меньше кадров. Попарная оценка такого смещения не имеет.
+
+        Почему только ОСЛАБЛЯЕТ
+        -----------------------
+        Действующий порог = clamp(mean - k*sigma, floor, min(ceiling, global)).
+        Верхняя граница — глобальный порог: калибровка не имеет права сделать
+        проверку строже. Ужесточение порога — ровно тот вред, который
+        документирует NIST, и глобальное значение уже проверено на модели.
+        Нижняя граница `threshold_floor` защищает от обратного: у человека с
+        очень «рыхлым» эталоном порог не должен падать настолько, что сверку
+        пройдёт посторонний.
+
+        Мало кадров (< `personal_min_samples`) -> остаёмся на глобальном пороге
+        и помечаем это в `threshold_source`, чтобы отчёт не выдавал
+        неоткалиброванный порог за откалиброванный.
+        """
+        self._personal_threshold = None
+        self._threshold_source = "global"
+        n = 0 if mat is None else int(mat.shape[0])
+        self._threshold_stats = {
+            "samples": n,
+            "needed": self.personal_min_samples,
+            "k": self.personal_k,
+            "global": self.threshold,
+            "floor": self.threshold_floor,
+            "ceiling": min(self.threshold_ceiling, self.threshold),
+        }
+        if not self.personal_threshold_enabled:
+            self._threshold_stats["skipped"] = "персональная калибровка выключена"
+            return
+        if np is None or n < self.personal_min_samples:
+            self._threshold_stats["skipped"] = (
+                f"эталонных кадров {n}, нужно {self.personal_min_samples} — "
+                "порог остаётся глобальным"
+            )
+            return
+        try:
+            gram = np.asarray(mat @ mat.T, dtype=np.float32)
+            iu = np.triu_indices(n, k=1)
+            pairs = gram[iu]
+            if pairs.size < 3:
+                self._threshold_stats["skipped"] = "слишком мало пар эталонных кадров"
+                return
+            mean_pair = float(pairs.mean())
+            sigma_pair = float(pairs.std())
+            raw = mean_pair - self.personal_k * sigma_pair
+            ceiling = min(self.threshold_ceiling, self.threshold)
+            value = max(self.threshold_floor, min(ceiling, raw))
+            self._personal_threshold = float(value)
+            self._threshold_source = "personal"
+            self._threshold_stats.update({
+                "pairs": int(pairs.size),
+                "pair_mean": round(mean_pair, 4),
+                "pair_sigma": round(sigma_pair, 4),
+                "raw": round(float(raw), 4),
+                "value": round(float(value), 4),
+                "clamped": bool(abs(raw - value) > 1e-6),
+                "relaxed_by": round(float(self.threshold - value), 4),
+            })
+        except Exception as exc:  # калибровка не имеет права ломать сверку
+            self._personal_threshold = None
+            self._threshold_source = "global"
+            self._threshold_stats["skipped"] = f"калибровка не удалась: {exc}"
+
+    @property
+    def active_threshold(self) -> float:
+        """Порог, по которому реально принимается решение на этом кадре."""
+        if self._personal_threshold is None:
+            return self.threshold
+        return float(self._personal_threshold)
+
+    @property
+    def threshold_source(self) -> str:
+        return self._threshold_source
+
+    def threshold_info(self) -> dict[str, Any]:
+        """Чем и почему мерили — для `detail` события и шапки отчёта."""
+        info = dict(self._threshold_stats)
+        info["active"] = round(self.active_threshold, 4)
+        info["source"] = self._threshold_source
+        info["reference_quality"] = dict(self._reference_quality)
+        info["explanation"] = (
+            "порог откалиброван по разбросу эталонных кадров этого студента "
+            f"(mean {info.get('pair_mean')} - {self.personal_k}*sigma "
+            f"{info.get('pair_sigma')}), калибровка может только ослабить порог"
+            if self._threshold_source == "personal"
+            else "используется глобальный порог: "
+                 + str(info.get("skipped", "персональная калибровка недоступна"))
+        )
+        return info
 
     def finalize_enroll(self) -> dict[str, Any]:
         """Завершить калибровку личности. Результат уходит в `calibration.result`."""
@@ -793,7 +1343,12 @@ class IdentityVerifier:
             "accepted": len(self._enroll_embeddings),
             "needed": self.min_enroll_frames,
             "cohesion": round(self._reference_cohesion, 4),
-            "threshold": self.threshold,
+            # `threshold` — ДЕЙСТВУЮЩИЙ порог; глобальный отдаём отдельно,
+            # чтобы отчёт мог показать, насколько калибровка его ослабила.
+            "threshold": round(self.active_threshold, 4),
+            "threshold_global": self.threshold,
+            "threshold_source": self._threshold_source,
+            "threshold_info": self.threshold_info(),
             "rejected": dict(self._enroll_rejected),
             "available": self.available(),
             "error": self.last_error,
@@ -821,6 +1376,9 @@ class IdentityVerifier:
         self._reference = None
         self._reference_cohesion = 0.0
         self._last_reject = ""
+        # Персональный порог принадлежит эталону: нет эталона — нет и порога,
+        # иначе он пережил бы повторную калибровку другого человека.
+        self._calibrate_threshold(None)
 
     def export_reference(self) -> list[float] | None:
         """Эталон для сохранения в сессии (список float). Фото НЕ сохраняется."""
@@ -828,10 +1386,50 @@ class IdentityVerifier:
             return None
         return [float(v) for v in self._reference]
 
-    def load_reference(self, vector: Any) -> bool:
-        """Загрузить эталон из прошлой сессии (например, из профиля студента)."""
+    def export_identity_profile(self) -> dict[str, Any] | None:
+        """Эталон ВМЕСТЕ с персональным порогом — для переноса между сессиями.
+
+        `export_reference()` отдаёт только вектор, и порог при переносе
+        терялся: студент, которому калибровка ослабила порог, в следующей
+        сессии снова получал глобальный. Фото не сохраняется ни здесь, ни там.
+        """
+        vector = self.export_reference()
+        if vector is None:
+            return None
+        return {
+            "vector": vector,
+            "threshold": round(self.active_threshold, 4),
+            "threshold_source": self._threshold_source,
+            "threshold_stats": dict(self._threshold_stats),
+            "cohesion": round(self._reference_cohesion, 4),
+        }
+
+    def load_reference(
+        self,
+        vector: Any,
+        threshold: float | None = None,
+        threshold_stats: dict[str, Any] | None = None,
+    ) -> bool:
+        """Загрузить эталон из прошлой сессии (например, из профиля студента).
+
+        `threshold` — персональный порог, посчитанный тогда же, когда снимался
+        эталон. Без него порог молча становится глобальным, и про это обязан
+        честно сказать `threshold_source`: неоткалиброванный порог не должен
+        выглядеть в отчёте откалиброванным.
+        Принимается и целиком словарь из `export_identity_profile()`.
+        """
         if np is None or vector is None:
             return False
+        if isinstance(vector, dict):
+            payload = vector
+            vector = payload.get("vector")
+            if threshold is None:
+                threshold = payload.get("threshold")
+            if threshold_stats is None:
+                stats = payload.get("threshold_stats")
+                threshold_stats = stats if isinstance(stats, dict) else None
+            if vector is None:
+                return False
         try:
             emb = np.asarray(list(vector), dtype=np.float32).reshape(-1)
             norm = float(np.linalg.norm(emb))
@@ -839,47 +1437,123 @@ class IdentityVerifier:
                 return False
             self._reference = emb / norm
             self._reference_cohesion = 1.0
-            return True
         except Exception:
             return False
+
+        # Порог восстанавливаем только в пределах разрешённого диапазона и
+        # только как ослабление: загруженный профиль не может сделать проверку
+        # строже глобального порога (см. `_calibrate_threshold`).
+        self._personal_threshold = None
+        self._threshold_source = "global"
+        self._threshold_stats = {
+            "samples": 0,
+            "global": self.threshold,
+            "floor": self.threshold_floor,
+            "ceiling": min(self.threshold_ceiling, self.threshold),
+            "skipped": "эталон загружен из профиля без персонального порога",
+        }
+        if self.personal_threshold_enabled and threshold is not None:
+            try:
+                ceiling = min(self.threshold_ceiling, self.threshold)
+                value = max(self.threshold_floor, min(ceiling, float(threshold)))
+                self._personal_threshold = value
+                self._threshold_source = "personal"
+                self._threshold_stats = dict(threshold_stats or {})
+                self._threshold_stats.update({
+                    "global": self.threshold,
+                    "floor": self.threshold_floor,
+                    "ceiling": ceiling,
+                    "value": round(value, 4),
+                    "restored": True,
+                    "loaded_from_profile": True,
+                })
+            except (TypeError, ValueError):
+                self._personal_threshold = None
+                self._threshold_source = "global"
+        return True
 
     # ----------------------------------------------------------------- #
     # verify
     # ----------------------------------------------------------------- #
-    def verify(self, frame_bgr: Any, face_bbox: Any = None) -> IdentityObservation:
-        """Сравнить текущее лицо с эталоном.
+    def _undetermined(
+        self,
+        code: str,
+        now: float,
+        *,
+        face_found: bool = False,
+        quality: float = 0.0,
+        metrics: dict[str, float] | None = None,
+        enrolled: bool | None = None,
+        available: bool = True,
+        note: str = "",
+    ) -> IdentityObservation:
+        """Собрать наблюдение «сравнения не было».
 
-        Решение НЕ принимается по одному кадру: каждая проверка кладёт голос в
-        скользящее окно длины `window`, и состояние переключается только когда
-        доля голосов превышает порог (гистерезис):
-          ok -> mismatch:  доля «чужих» >= mismatch_ratio (0.6) при >= min_checks
-          mismatch -> ok:  доля «своих»  >= recover_ratio  (0.6)
-        Вызовы чаще, чем раз в `check_interval_s`, возвращают прошлое наблюдение
-        с `checked=False` — эмбеддинг не считается, CPU не тратится.
+        `match=True` и `checked=False` — не «подтверждено», а «вывода нет»:
+        правило движка такой кадр пропускает целиком, обвинение не растёт и
+        подтверждение не выдаётся. Настоящее состояние лежит в `status`.
+        """
+        reason = note or UNDETERMINED_REASONS.get(code, code)
+        obs = IdentityObservation(
+            match=True,
+            similarity=self._similarity_ema,
+            enrolled=self.enrolled if enrolled is None else bool(enrolled),
+            available=available,
+            checked=False,
+            face_found=face_found,
+            votes=len(self._votes),
+            mismatch_ratio=self._current_mismatch_ratio(),
+            threshold=self.active_threshold,
+            quality=quality,
+            reason=reason,
+            status=STATUS_UNDETERMINED,
+            status_code=code,
+            usable=False,
+            unusable_ratio=self._unusable_rate(),
+            unusable_streak=self._unusable_streak,
+            conditions_block=self._conditions_block,
+            threshold_source=self._threshold_source,
+            threshold_global=self.threshold,
+            quality_metrics=dict(metrics or {}),
+            ts=now,
+        )
+        self._last_obs = obs
+        return obs
+
+    def verify(self, frame_bgr: Any, face_bbox: Any = None) -> IdentityObservation:
+        """Сравнить текущее лицо с эталоном. Три исхода, не два.
+
+        Порядок решений
+        ---------------
+        1. Канал выключен / эталон не снят -> `undetermined`. Раньше здесь
+           возвращался `match=True`, то есть «личность подтверждена» при
+           отсутствии сравнения вовсе.
+        2. Вызов чаще `check_interval_s` -> кэш прошлого наблюдения,
+           `checked=False`.
+        3. Лица нет -> `undetermined/no_face`. Это канал NO_FACE, не подмена.
+        4. Кадр НЕПРИГОДЕН (темно, мелко, смазано, профиль) ->
+           `undetermined/<код>`. Голос в окно НЕ кладётся: непригодный кадр —
+           отсутствие данных. При устойчивой непригодности состояние канала —
+           «условия съёмки не позволяют подтвердить личность», и это
+           формулировка про аудиторию, а не про студента.
+        5. Сравнение выполнено -> `verified` / `not_verified` по скользящему
+           окну с гистерезисом и по ДЕЙСТВУЮЩЕМУ (персональному) порогу:
+             ok -> mismatch:  доля «чужих» >= mismatch_ratio при >= min_checks
+             mismatch -> ok:  доля «своих»  >= recover_ratio
+
+        Важное следствие пункта 4: в окно попадают только РЕАЛЬНО сравненные
+        кадры, поэтому `min_checks` набирается по сравнениям, а не по времени.
+        Прежняя цепочка «темно -> 5 плохих проверок -> PAUSE через 40 с»
+        больше не существует: тёмные кадры в окно не попадают вообще.
         """
         now = time.time()
         if not self.available():
-            obs = IdentityObservation(
-                match=True,
-                enrolled=self.enrolled,
-                available=False,
-                threshold=self.threshold,
-                reason=self.last_error or "канал личности отключён",
-                ts=now,
+            return self._undetermined(
+                "channel_off", now, available=False,
+                note=self.last_error or UNDETERMINED_REASONS["channel_off"],
             )
-            self._last_obs = obs
-            return obs
         if not self.enrolled:
-            obs = IdentityObservation(
-                match=True,
-                enrolled=False,
-                available=True,
-                threshold=self.threshold,
-                reason="эталон личности не снят",
-                ts=now,
-            )
-            self._last_obs = obs
-            return obs
+            return self._undetermined("not_enrolled", now, enrolled=False)
         if now - self._last_check_ts < self.check_interval_s:
             cached = self._last_obs
             return IdentityObservation(
@@ -891,9 +1565,18 @@ class IdentityVerifier:
                 face_found=cached.face_found,
                 votes=len(self._votes),
                 mismatch_ratio=self._current_mismatch_ratio(),
-                threshold=self.threshold,
+                threshold=self.active_threshold,
                 quality=cached.quality,
                 reason=cached.reason,
+                status=cached.status,
+                status_code=cached.status_code,
+                usable=cached.usable,
+                unusable_ratio=self._unusable_rate(),
+                unusable_streak=self._unusable_streak,
+                conditions_block=self._conditions_block,
+                threshold_source=self._threshold_source,
+                threshold_global=self.threshold,
+                quality_metrics=dict(cached.quality_metrics),
                 ts=now,
             )
 
@@ -901,22 +1584,33 @@ class IdentityVerifier:
         emb, meta = self._extract(frame_bgr, face_bbox)
         if emb is None:
             # Нет лица — это канал NO_FACE, а не подмена: голос в окно не кладём.
-            obs = IdentityObservation(
-                match=self._state_ok,
-                similarity=self._similarity_ema,
-                enrolled=True,
-                available=True,
-                checked=True,
-                face_found=False,
-                votes=len(self._votes),
-                mismatch_ratio=self._current_mismatch_ratio(),
-                threshold=self.threshold,
-                reason="лицо не найдено — сравнение пропущено",
-                ts=now,
+            self._note_unusable("no_face")
+            return self._undetermined(
+                "no_face", now, metrics={"det_score": float(meta.get("det_score", 0.0) or 0.0)}
             )
-            self._last_obs = obs
-            return obs
 
+        code, metrics = self._usability(frame_bgr, meta)
+        if code is not None:
+            # Кадр непригоден: данных для сравнения нет. Ни голоса в окно, ни
+            # роста серии несовпадений — иначе плохой свет становится обвинением.
+            self._note_unusable(code)
+            note = ""
+            if self._conditions_block:
+                note = (
+                    f"{UNDETERMINED_REASONS['conditions']}: "
+                    f"{UNDETERMINED_REASONS.get(code, code)}"
+                )
+            return self._undetermined(
+                "conditions" if self._conditions_block else code,
+                now,
+                face_found=True,
+                quality=metrics.get("det_score", 0.0),
+                metrics=metrics,
+                note=note,
+            )
+
+        self._note_usable()
+        threshold = self.active_threshold
         similarity = float(np.dot(self._reference, emb))
         self._checks_total += 1
         self._similarity_ema = (
@@ -924,7 +1618,7 @@ class IdentityVerifier:
             if self._checks_total == 1
             else 0.7 * self._similarity_ema + 0.3 * similarity
         )
-        good = similarity >= self.threshold
+        good = similarity >= threshold
         self._votes.append(good)
         self._mismatch_streak = 0 if good else self._mismatch_streak + 1
 
@@ -939,24 +1633,54 @@ class IdentityVerifier:
                 self._state_ok = True
 
         if self._state_ok:
-            reason = f"личность подтверждена (близость {similarity:.2f})"
+            status = STATUS_VERIFIED
+        elif not enough:
+            # Окно ещё не набрано: вывод о несовпадении делать не на чем.
+            status = STATUS_UNDETERMINED
+        else:
+            status = STATUS_NOT_VERIFIED
+
+        src = "персональный" if self._threshold_source == "personal" else "глобальный"
+        if status == STATUS_VERIFIED:
+            reason = (
+                f"личность подтверждена (близость {similarity:.2f} "
+                f"при пороге {threshold:.2f}, {src})"
+            )
+        elif status == STATUS_NOT_VERIFIED:
+            reason = (
+                "лицо устойчиво не совпадает с эталоном калибровки "
+                f"(близость {similarity:.2f} < {threshold:.2f}, {src}; "
+                f"{int(round(bad_ratio * 100))}% из {len(self._votes)} сравнений)"
+            )
         else:
             reason = (
-                "лицо не совпадает с эталоном калибровки "
-                f"(близость {similarity:.2f} < {self.threshold:.2f})"
+                f"сравнений пока {len(self._votes)} из {self.min_checks} — "
+                "вывод не сделан"
             )
+
         obs = IdentityObservation(
-            match=self._state_ok,
+            match=status != STATUS_NOT_VERIFIED,
             similarity=similarity,
             enrolled=True,
             available=True,
-            checked=True,
+            # Вывод получен только когда окно набрано: иначе для движка это
+            # по-прежнему «данных нет», и серия несовпадений не растёт.
+            checked=status != STATUS_UNDETERMINED,
             face_found=True,
             votes=len(self._votes),
             mismatch_ratio=bad_ratio,
-            threshold=self.threshold,
+            threshold=threshold,
             quality=float(meta.get("det_score", 0.0)),
             reason=reason,
+            status=status,
+            status_code="" if status != STATUS_UNDETERMINED else "insufficient_checks",
+            usable=True,
+            unusable_ratio=self._unusable_rate(),
+            unusable_streak=0,
+            conditions_block=self._conditions_block,
+            threshold_source=self._threshold_source,
+            threshold_global=self.threshold,
+            quality_metrics=metrics,
             ts=now,
         )
         self._last_obs = obs
@@ -1145,6 +1869,11 @@ class IdentityVerifier:
         self._similarity_ema = 0.0
         self._checks_total = 0
         self._mismatch_streak = 0
+        self._usable_votes.clear()
+        self._unusable_streak = 0
+        self._unusable_total = 0
+        self._unusable_reasons.clear()
+        self._conditions_block = False
         self._prev_patch = None
         self._motion.clear()
         self._hashes.clear()
@@ -1154,16 +1883,40 @@ class IdentityVerifier:
         self._last_frame_ts = None
         self._last_loop_check = 0.0
         self._loop_cache = (False, 0, 0.0, 0.0)
-        self._last_obs = IdentityObservation(threshold=self.threshold)
+        self._last_obs = IdentityObservation(
+            threshold=self.active_threshold,
+            threshold_global=self.threshold,
+            threshold_source=self._threshold_source,
+        )
 
     def status(self) -> dict[str, Any]:
-        """Короткая сводка для сообщения `status` протокола."""
+        """Короткая сводка для сообщения `status` протокола.
+
+        `identity_ok` сохраняет старый смысл «не обвиняем» (HUD красит плашку
+        по нему). Отличить «подтверждено» от «не смогли проверить» позволяет
+        `identity_status`: HUD обязан показывать условия съёмки как условия, а
+        не как неподтверждённую сверку.
+        """
+        last = self._last_obs
         return {
             "available": self.available(),
             "enrolled": self.enrolled,
-            "identity_ok": bool(self._last_obs.match),
+            "identity_ok": bool(last.match),
+            "identity_status": last.status,
+            "identity_status_reason": UNDETERMINED_REASONS.get(
+                last.status_code, last.status_code
+            ),
+            "identity_detail": last.explain(),
+            "conditions_block": self._conditions_block,
+            "unusable_share": round(
+                self._unusable_total
+                / float(max(1, self._unusable_total + self._checks_total)),
+                3,
+            ),
             "similarity": round(float(self._similarity_ema), 3),
-            "threshold": self.threshold,
+            "threshold": round(self.active_threshold, 3),
+            "threshold_global": self.threshold,
+            "threshold_source": self._threshold_source,
             "cohesion": round(self._reference_cohesion, 3),
             "checks": self._checks_total,
             "fps_estimate": round(self._fps_estimate, 1),

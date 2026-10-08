@@ -1022,11 +1022,73 @@ code {
 
 .consent__form { grid-template-columns: 2fr 1fr 2fr; }
 
+/* Правила экзамена — первая колонка той же сетки, что «сохраняется / не
+   записывается» (app.js _renderRules рисует в #consent-rules). Отдельной
+   полосой блок занимал ~300 px и возвращал прокрутку на 1280×720. В колонке:
+   термин над значением, пояснение свёрнуто (app.js кладёт его в <details>
+   только на этом экране). В шапке отчёта и на тёмных экранах блок прежний. */
+.consent-sum:has(> .rules) {
+  grid-template-columns: minmax(0, 1.6fr) repeat(2, minmax(0, 1fr));
+}
+/* на 1024 колонка правил выше соседних — отдаём ей больше ширины; шапка окна
+   здесь в две строки, поэтому и потолок колонки ниже */
+@media (max-width: 1200px) {
+  .consent-sum:has(> .rules) { grid-template-columns: minmax(0, 2fr) repeat(2, minmax(0, 1fr)); }
+}
+/* три колонки текста — экрану нужна полная ширина раскладки, иначе строки
+   правил переносятся на два-три ряда и колонка вырастает */
+.consent:has(.consent-sum > .rules) { max-width: var(--layout-max); }
+.consent-sum > .rules {
+  padding: var(--space-4) var(--space-6);
+  gap: var(--space-3);
+}
+.consent-sum > .rules .card__title {
+  font-size: var(--fs-small);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+}
+.consent .rules__head { gap: 0 var(--space-3); }
+/* хеш профиля уже стоит в отметке под заголовком — строкой он повторялся */
+.consent .rules__row[data-rule="hash"] { display: none; }
+.consent .rules__more .rules__srclist { margin-bottom: var(--space-2); font-size: var(--fs-small); }
+.consent .rules__grid { gap: var(--space-2); }
+.consent .rules__row { grid-template-columns: minmax(0, 15ch) minmax(0, 1fr); gap: 0 var(--space-3); }
+.consent .rules__key { margin: 0; font-size: var(--fs-small); line-height: var(--lh-body); }
+.consent .rules__more > summary {
+  font-size: var(--fs-small);
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
+  cursor: pointer;
+}
+.consent .rules__more > summary:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-offset);
+}
+.consent .rules__more[open] > summary { margin-bottom: var(--space-2); }
+.consent .rules__note { max-width: none; }
+
 /* Невысокие экраны (проектор 1280×720, 1024×768) — плотнее по вертикали */
 @media (max-height: 800px) {
-  .consent { gap: var(--space-4); padding-top: var(--space-6); padding-bottom: var(--space-6); }
+  .consent { gap: var(--space-2); padding-top: var(--space-4); padding-bottom: var(--space-4); }
   .consent-sum__col { padding: var(--space-3) var(--space-4); gap: var(--space-2); }
   .consent-more > summary { min-height: var(--space-6); }
+  .consent-sum > .rules { padding: var(--space-3) var(--space-4); gap: var(--space-2); }
+  /* Профиль с десятком источников, разрешённым поиском и отклонёнными
+     записями в колонку не влезает. Тогда прокручивается колонка, а не экран:
+     кнопка согласия остаётся на виду, строка о последствии стоит первой,
+     правила целиком повторяются на экране проверки окружения. */
+  /* 400px — всё остальное на экране: шапка окна, заголовок, поля, кнопка */
+  .consent-sum > .rules { max-height: max(calc(100vh - 400px), 240px); overflow-y: auto; }
+  /* засечка CONSENT — оформление, заголовок экрана остаётся */
+  .consent .eyebrow { display: none; }
+  .consent-bar { padding: var(--space-2) var(--space-4); }
+  .consent-bar .btn--lg { min-height: var(--tap-min); }
+}
+/* шапка окна на этой ширине в две строки — остатка под колонку меньше */
+@media (max-width: 1200px) and (max-height: 800px) {
+  .consent-sum > .rules { max-height: max(calc(100vh - 450px), 240px); }
 }
 
 /* ===========================================================================
@@ -1802,11 +1864,30 @@ code {
 .chan.s-off  { --tone: var(--gray-500); }
 .chan.s-off .chan__dot { background: transparent; }
 
+/* Профиль экзамена — не датчик, а правила, и ему нужна вся ширина строки:
+   в подписи живёт хеш, который в половину панели не влезает. Сетка .chans
+   двухколоночная, поэтому строка объявляется через span на все колонки. */
+.chan--profile { grid-column: 1 / -1; }
+/* Хеш в подписи канала — идентификатор: моноширинный и с переносом по знаку */
+.chan__id { font-family: var(--font-mono); overflow-wrap: anywhere; }
+
 /* ----------------------------- лента событий ------------------------------ */
 
 .feed { list-style: none; margin: 0; padding: 0; }
 .feed li:first-child { border-top: 0; }
 .feed__msg { line-height: var(--lh-body); color: var(--text-muted-on-dark); }
+/* Полный адрес попытки перехода. Это и есть доказательство попытки, поэтому
+   он стоит в журнале целиком: идентификатор — значит моноширинный, и перенос
+   по любому знаку, иначе длинная ссылка растянет панель наблюдения. */
+.event__url {
+  display: block;
+  margin-top: 2px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-label);
+  color: var(--text-muted-on-dark);
+  overflow-wrap: anywhere;
+}
+.sheet .event__url { color: var(--text-muted); }
 .feed__new { animation: feed-in var(--transition) both; }
 @keyframes feed-in {
   from { opacity: 0; transform: translateY(calc(var(--space-2) * -1)); }
@@ -2046,6 +2127,116 @@ code {
 .disclose__mode[data-mode="no"]  { color: var(--text-primary); }
 .disclose__detail { max-width: 62ch; color: var(--text-muted); }
 
+/* ----------- app.js: правила экзамена (#consent-rules, #preflight-rules) ---
+   Один и тот же блок стоит на ДВУХ поверхностях: светлое согласие (.sheet) и
+   тёмная предполётная проверка (.monitor). Поэтому ни один цвет здесь не
+   задан на месте — только через --tone, который переопределяется по
+   поверхности ниже.
+
+   Смысл строки несут подпись и значение СЛОВАМИ, форма значка (галочка /
+   треугольник / перечёркнутое кольцо) дублирует, цвет — третий носитель.
+   Проверять блок надо именно так: убрать цвет и убедиться, что всё читается.
+   -------------------------------------------------------------------------- */
+
+.rules {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-6);
+  border: 1px solid var(--text-primary);
+  border-radius: var(--radius-md);
+  background: var(--bg-canvas);
+  color: var(--text-primary);
+}
+.monitor .rules {
+  border-color: var(--border-hair-dark);
+  background: var(--bg-panel);
+  color: var(--text-on-dark);
+}
+
+.rules__head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-4);
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+/* Отметка о профиле рядом с заголовком. Хеш — идентификатор, поэтому он
+   моноширинный и темнее подписи: его читают и сверяют, а не пробегают. */
+.rules__stamp { font-size: var(--fs-small); color: var(--text-muted); }
+.rules__stamp .mono { color: var(--text-primary); }
+.monitor .rules__stamp { color: var(--text-muted-on-dark); }
+.monitor .rules__stamp .mono { color: var(--text-on-dark); }
+
+.rules__grid { display: flex; flex-direction: column; gap: var(--space-3); margin: 0; }
+
+.rules__row {
+  --tone: var(--gray-500);
+  display: grid;
+  grid-template-columns: minmax(0, 22ch) minmax(0, 1fr);
+  gap: var(--space-2) var(--space-4);
+  align-items: start;
+}
+
+.rules__term {
+  display: flex;
+  gap: var(--space-2);
+  align-items: flex-start;
+  margin: 0;
+  font-size: var(--fs-small);
+  font-weight: 600;
+}
+.rules__mark { display: inline-flex; flex: none; color: var(--tone); }
+.rules__mark svg { display: block; width: var(--space-4); height: var(--space-4); margin-top: 0.2em; }
+
+.rules__value {
+  margin: 0;
+  min-width: 0;
+  font-size: var(--fs-small);
+  line-height: var(--lh-body);
+  /* полный адрес и хеш не должны растягивать блок по горизонтали */
+  overflow-wrap: anywhere;
+}
+.rules__srclist { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-1); }
+
+.rules__note { margin: 0; max-width: 72ch; font-size: var(--fs-small); line-height: var(--lh-body); }
+
+/* Тон строки по состоянию правила. На ТЁМНОМ берём цвета риска напрямую.  */
+.monitor .rules__row[data-state="ok"]   { --tone: var(--risk-ok); }
+.monitor .rules__row[data-state="warn"] { --tone: var(--warning); }
+.monitor .rules__row[data-state="off"]  { --tone: var(--gray-500); }
+
+/* На СВЕТЛОМ оба сигнальных цвета как цвет значка не годятся и запрещены
+   гайдом: #c6ff00 на белом даёт ~1.4:1, #ffb800 — 1.73:1, то есть ниже порога
+   3:1 для нетекстовых объектов (WCAG 1.4.11). Поэтому «правило задано» —
+   затемнённый кислотный, а «правило ослаблено» — основной цвет текста:
+   ослабление там несёт ФОРМА (треугольник с восклицанием) и слово
+   «разрешены», а не цвет. */
+.sheet .rules__row[data-state="ok"]   { --tone: var(--signal-text-on-light); }
+.sheet .rules__row[data-state="warn"] { --tone: var(--text-primary); }
+.sheet .rules__row[data-state="off"]  { --tone: var(--gray-500); }
+
+/* ------- app.js: отметка о правилах в шапке отчёта (#report-rules) -------- */
+/* Светлая среда анализа: стоит рядом с вердиктом, читается вместе с ним. */
+
+.report__rules {
+  --tone: var(--gray-500);
+  display: flex;
+  gap: var(--space-2);
+  align-items: flex-start;
+  margin: 0;
+  max-width: 72ch;
+  font-size: var(--fs-small);
+  line-height: var(--lh-body);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+.report__rules .mono { color: var(--text-primary); }
+.report__rules[data-state="ok"]   { --tone: var(--signal-text-on-light); }
+.report__rules[data-state="warn"] { --tone: var(--text-primary); }
+.report__rules[data-state="off"]  { --tone: var(--gray-500); }
+
 /* --------------- app.js: причина блокировки старта и статусы -------------- */
 
 .preflight-block {
@@ -2224,12 +2415,17 @@ code {
   .exam__footspacer { order: 3; flex-basis: 100%; }
 
   .chans { grid-template-columns: 1fr; }
+  /* Подпись правила и его значение в одну колонку: 22ch + значение на узком
+     экране не помещаются, а резать подпись нельзя — слово несёт смысл. */
+  .rules__row { grid-template-columns: 1fr; }
+  .rules { padding: var(--space-4); }
   .chk { grid-template-columns: var(--space-8) minmax(0, 1fr); }
   .chk__state { grid-column: 2; justify-self: start; }
   .report__tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .calib__viewport { height: calc(var(--space-22) * 4); }
   .form-grid { grid-template-columns: 1fr; }
   .consent-sum { grid-template-columns: 1fr; }
+  .consent-sum:has(> .rules) { grid-template-columns: 1fr; }
   .consent-bar { padding: var(--space-4); }
   .alert { grid-template-columns: var(--space-1) minmax(0, 1fr); }
   .alert__code { grid-column: 2; }
@@ -2289,6 +2485,7 @@ code {
   .alert--toast,
   .scan-panel,
   .chart,
+  .rules,
   .table-wrap { border-width: 2px; }
 
   .brand__ring,

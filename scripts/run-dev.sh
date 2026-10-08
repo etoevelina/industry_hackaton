@@ -19,6 +19,18 @@
 #   bash scripts/run-dev.sh -- --no-yolo    # всё после '--' уходит сайдкару как есть
 #   bash scripts/run-dev.sh --mock -- --speed 2 --no-loop   # сценарий вдвое быстрее, один раз
 #
+# Правила экзамена (какой LMS открывать и какие источники разрешены):
+#   bash scripts/run-dev.sh --exam-profile exam-profile.json
+#   bash scripts/run-dev.sh --exam-profile exam-profile.json --exam-profile-pubkey key.pub
+#   bash scripts/run-dev.sh --exam-profile exam-profile.json --allow-search
+#   Заготовку файла печатает ядро:
+#     .venv/bin/python sidecar/main.py --exam-profile-example ksu > exam-profile.json
+#   Правила ПРИНИМАЕТ ЯДРО: оно читает файл, считает хеш, кладёт его в
+#   подписанную цепочку и присылает оболочке готовый действующий список.
+#   Флагов --exam-url/--exam-origin/--exam-preset у оболочки больше нет: два
+#   владельца одних правил давали два противоречащих документа об одной
+#   сессии (подробно — в shell/main.js у CLI.examProfilePath).
+#
 # Переменные окружения:
 #   PROCTOR_PYTHON  — интерпретатор сайдкара (по умолчанию .venv/bin/python3, затем python3)
 #   PROCTOR_LOG     — уровень логов сайдкара (DEBUG/INFO/WARNING)
@@ -49,7 +61,7 @@ say()  { printf '[run] %s\n' "$*"; }
 warn() { printf '[run] ВНИМАНИЕ: %s\n' "$*" >&2; }
 fail() { printf '[run] ОШИБКА: %s\n' "$*" >&2; exit 1; }
 
-usage() { sed -n '3,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n "3,39p" "${BASH_SOURCE[0]}" | sed "s|^# \{0,1\}||"; }
 
 # --------------------------------------------------------------------------- аргументы
 while [ $# -gt 0 ]; do
@@ -67,6 +79,37 @@ while [ $# -gt 0 ]; do
         --port=*)        WS_PORT="${1#--port=}" ;;
         --host)          shift; [ $# -gt 0 ] || fail "--host без значения"; WS_HOST="$1" ;;
         --host=*)        WS_HOST="${1#--host=}" ;;
+        # --- правила экзамена: уходят ЯДРУ, не оболочке ---
+        # Без этих веток единственный рабочий путь задать правила был
+        # `run-dev.sh -- --exam-profile <файл>`, а про `--` на демо забывают.
+        # Хуже: `run-dev.sh --exam-profile ...` падал с «неизвестный аргумент»,
+        # и человек под часы шёл запускать оболочку напрямую — то есть ровно в
+        # тот путь, где правила не попадают в цепочку.
+        --exam-profile)  shift; [ $# -gt 0 ] || fail "--exam-profile без значения"
+                         [ -f "$1" ] || fail "файл профиля не найден: '$1'. Заготовку печатает ядро: --exam-profile-example ksu"
+                         EXTRA_SIDECAR+=(--exam-profile "$1") ;;
+        --exam-profile=*) _v="${1#--exam-profile=}"
+                         [ -f "${_v}" ] || fail "файл профиля не найден: '${_v}'"
+                         EXTRA_SIDECAR+=(--exam-profile "${_v}") ;;
+        --exam-profile-pubkey) shift; [ $# -gt 0 ] || fail "--exam-profile-pubkey без значения"
+                         [ -f "$1" ] || fail "файл ключа не найден: '$1'"
+                         EXTRA_SIDECAR+=(--exam-profile-pubkey "$1") ;;
+        --exam-profile-pubkey=*) _v="${1#--exam-profile-pubkey=}"
+                         [ -f "${_v}" ] || fail "файл ключа не найден: '${_v}'"
+                         EXTRA_SIDECAR+=(--exam-profile-pubkey "${_v}") ;;
+        # Поиск запрещён по умолчанию. Флаг — для экзаменов, где он разрешён
+        # правилами; факт идёт в цепочку и в шапку отчёта.
+        --allow-search)  EXTRA_SIDECAR+=(--allow-search) ;;
+        # Флаги, которых больше нет. Отказ с объяснением, а не «неизвестный
+        # аргумент»: человек под часы должен узнать, куда идти, а не что он
+        # опечатался.
+        --exam-url|--exam-url=*|--exam-origin|--exam-origin=*|--exam-preset|--exam-preset=*)
+            fail "флаг '${1%%=*}' убран: правила экзамена задаёт ЯДРО файлом профиля.
+    1) заготовка: .venv/bin/python sidecar/main.py --exam-profile-example ksu > exam-profile.json
+    2) правка руками: адрес экзамена и КОНКРЕТНЫЕ источники, а не класс .edu.kz
+    3) запуск:    bash scripts/run-dev.sh --exam-profile exam-profile.json
+  Почему так: профиль, которого нет у ядра, не попадает в подписанную цепочку —
+  HUD показывал бы «действовал профиль», а отчёт «правила не задавались»." ;;
         --)              PASSTHROUGH=1 ;;
         -h|--help)       usage; exit 0 ;;
         *)               fail "неизвестный аргумент '$1'. Справка: bash scripts/run-dev.sh --help" ;;
