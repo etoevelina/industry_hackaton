@@ -122,6 +122,37 @@ DEFAULT_HEURISTICS: dict[str, float] = {
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
+def _version_tuple(text: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in re.findall(r"\d+", text or "")[:3])
+
+
+def _ultralytics_version() -> tuple[int, ...] | None:
+    """Версия ultralytics БЕЗ импорта пакета (импорт старой версии уже ходит в сеть).
+
+    None — пакета нет (импорт и так не удастся); () — пакет есть, а версию не
+    определить: такой не поднимаем, раз нельзя убедиться в офлайн-режиме.
+    """
+    try:
+        from importlib.metadata import version
+        return _version_tuple(version("ultralytics"))
+    except Exception:
+        pass
+    # без dist-info (вендоринг, замороженная сборка) — читаем __version__ из исходника
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("ultralytics")
+    except Exception:
+        spec = None
+    if spec is None or not spec.origin:
+        return None
+    try:
+        text = Path(spec.origin).read_text(encoding="utf-8", errors="ignore")
+        m = re.search(r"__version__\s*=\s*['\"]([^'\"]+)", text)
+        return _version_tuple(m.group(1)) if m else ()
+    except Exception:
+        return ()
+
+
 # --------------------------------------------------------------------------
 # Структуры наблюдений
 # --------------------------------------------------------------------------
@@ -443,15 +474,12 @@ class ObjectDetector:
             # нет вовсе. С "1" или на старой версии при импорте идёт сетевой
             # пробник, а при predict — аналитика: это нарушало бы обещание
             # «данные наблюдения в сеть не уходят». Старую версию не импортируем.
-            try:
-                from importlib.metadata import version as _pkg_version
-                found = tuple(int(x) for x in re.findall(r"\d+", _pkg_version("ultralytics"))[:3])
-            except Exception:
-                found = ()
-            if found and found < (8, 1, 44):
+            found = _ultralytics_version()
+            if found is not None and (not found or found < (8, 1, 44)):
                 self._yolo = None
-                self._backend_info = (f"ultralytics {'.'.join(map(str, found))} < 8.1.44 "
-                                      "не умеет офлайн-режим, бэкенд не поднят")
+                shown = ".".join(map(str, found)) if found else "неизвестной версии"
+                self._backend_info = (f"ultralytics {shown}: офлайн-режим есть только с 8.1.44, "
+                                      "бэкенд не поднят")
                 self._last_error = self._backend_info
                 return False
             os.environ["YOLO_OFFLINE"] = "True"

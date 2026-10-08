@@ -105,18 +105,20 @@
       signal: 'Кадры с камеры',
       mode: 'ram',
       detail: 'Разбираются покадрово в оперативной памяти: есть ли лицо, сколько лиц, ' +
-              'поворот головы, направление взгляда, посторонние предметы. Сами кадры не ' +
-              'сохраняются — на диск попадают только числа посекундной сводки.'
+              'поворот головы, направление взгляда, открыт ли рот, посторонние предметы. ' +
+              'Сами кадры сохраняются только при инциденте (см. ниже); в остальное время ' +
+              'на диск попадают лишь числа посекундной сводки.'
     },
     {
       // RawObservationLog в сайдкаре включён по умолчанию (log_raw) и пишет
       // посекундные окна наблюдений в журнал сессии независимо от инцидентов.
       signal: 'Посекундная сводка наблюдений',
       mode: 'yes',
-      detail: 'Раз в секунду в журнал сессии пишутся числа: есть ли лицо и сколько лиц, ' +
-              'сходство с эталоном лица, поворот головы и направление взгляда, моргание, ' +
-              'найденные предметы; при удалённой сдаче — была ли речь, громкость и сходство ' +
-              'с голосом владельца. Без кадров и звука.'
+      detail: 'Раз в секунду в журнал сессии пишутся числа и моменты смены состояния: ' +
+              'есть ли лицо и сколько лиц, сходство с эталоном лица, поворот головы и ' +
+              'направление взгляда, моргание, открыт ли рот, найденные предметы; при ' +
+              'удалённой сдаче — была ли речь, громкость и сходство с вашим голосом. ' +
+              'Без кадров и звука.'
     },
     {
       signal: 'Кадр и клип инцидента',
@@ -160,7 +162,9 @@
               'Сам ответ остаётся в окне теста.'
     },
     {
-      signal: 'Звук, речь, расшифровка',
+      // «не пишется» относится к самому звуку и расшифровке: факт речи при
+      // удалённой сдаче попадает в посекундную сводку (строка выше)
+      signal: 'Звук и расшифровка речи',
       mode: 'no',
       detail: 'Аудиозаписи нет: звук не сохраняется. В режиме аудитории аудиоканал ' +
               'выключен целиком: в классе он давал бы ложные срабатывания на соседей. ' +
@@ -555,6 +559,12 @@
     } catch (e) { return false; }
   };
 
+  /** Закрыть программу (отказ от согласия). Без моста — false. */
+  Bridge.prototype.exit = function (reason) {
+    if (!this.api || typeof this.api.exit !== 'function') return false;
+    try { this.api.exit(String(reason || 'renderer_exit')); return true; } catch (e) { return false; }
+  };
+
   Bridge.prototype.sessionEnd = function (reason) {
     if (!this.api) return false;
     if (typeof this.api.sessionEnd === 'function') {
@@ -734,6 +744,8 @@
   App.prototype.show = function (name) {
     if (SCREENS.indexOf(name) === -1) return;
     this.screen = name;
+    // скрытый экран не подгоняется — пока его не было видно, окно могло измениться
+    if (name === 'consent' && this._scheduleConsentFit) this._scheduleConsentFit();
     // Оболочка узнаёт о смене экрана до отрисовки: блокировки должны стоять
     // к моменту, когда студент увидит первый вопрос, и сняться к отчёту.
     if (SCREEN_STATE[name]) this.bridge.setExamState(SCREEN_STATE[name]);
@@ -1089,7 +1101,16 @@
     var self = this;
     var cb = el('consent-check');
     var btn = el('btn-consent');
+    var decline = el('btn-decline');
     this._watchConsentFit();
+    if (decline) {
+      decline.addEventListener('click', function () {
+        // сессия ещё не начата — закрываем программу, файлов не остаётся
+        if (!self.bridge.exit('consent_declined')) {
+          try { window.close(); } catch (e) { /* вне оболочки закрывать нечего */ }
+        }
+      });
+    }
     if (cb && btn) {
       cb.addEventListener('change', function () { btn.disabled = !cb.checked; });
       btn.addEventListener('click', function () {
@@ -1118,6 +1139,7 @@
     var rules = screen && screen.querySelector('.consent-sum > .rules');
     var more = screen && screen.querySelector('.consent-more');
     if (!screen || !rules || screen.hidden || (more && more.open)) return;
+    var keepTop = rules.scrollTop;
     rules.style.maxHeight = '';
     // узкий экран: колонки стопкой, страница прокручивается штатно — правила не режем
     var sum = rules.parentNode;
@@ -1128,11 +1150,13 @@
     // второй проход добирает пиксель, потерянный на округлении дробных высот
     for (var pass = 0; pass < 2; pass++) {
       var over = screen.scrollHeight - screen.clientHeight;
-      if (over <= 0) return;
+      if (over <= 0) break;
       var cap = Math.max(Math.floor(rules.getBoundingClientRect().height) - over, floor);
-      if (rules.style.maxHeight === cap + 'px') return;
+      if (rules.style.maxHeight === cap + 'px') break;
       rules.style.maxHeight = cap + 'px';
     }
+    // снятие потолка сбросило прокрутку колонки — вернуть, где читал человек
+    rules.scrollTop = keepTop;
   };
 
   App.prototype._watchConsentFit = function () {
@@ -1145,8 +1169,10 @@
     }
     this._scheduleConsentFit = schedule;
     try { window.addEventListener('resize', schedule); } catch (e) { /* нет окна */ }
-    var more = document.querySelector('#screen-consent .consent-more');
-    if (more) more.addEventListener('toggle', schedule);
+    // toggle не всплывает, а «Подробнее о правилах» пересоздаётся при каждой
+    // перерисовке правил — поэтому ловим на экране в фазе перехвата
+    var screen = el('screen-consent');
+    if (screen) screen.addEventListener('toggle', schedule, true);
     try { document.fonts.ready.then(schedule); } catch (e) { /* шрифты уже на месте */ }
     schedule();
   };
