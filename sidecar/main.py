@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import binascii
 import contextlib
 import hashlib
 import hmac
@@ -85,6 +87,25 @@ from protocol import (  # noqa: E402
     decode,
     envelope,
     event_message,
+    is_service_kind,
+    EVIDENCE_FRAME_MAX_AGE,
+    EVIDENCE_SKIP_DISABLED,
+    EVIDENCE_SKIP_NO_CAMERA,
+    EVIDENCE_SKIP_NOT_RECORDING,
+    EVIDENCE_SKIP_SERVICE,
+    EVIDENCE_SKIP_STALE,
+    EVIDENCE_SKIP_WRITE_FAILED,
+    SCREEN_EVIDENCE_CONTROL,
+    SCREEN_EVIDENCE_MAX_AGE,
+    SCREEN_EVIDENCE_MAX_BYTES,
+    SCREEN_EVIDENCE_SOURCES,
+    BLUR_HAAR,
+    BLUR_UNAVAILABLE,
+    CLIP_CANCELLED_CONTROL,
+    CLIP_CANCEL_MULTIPLE_FACES_AFTER,
+    CLIP_SKIP_FACES_UNKNOWN,
+    CLIP_SKIP_MULTIPLE_FACES,
+    WS_TRANSPORT_MAX_BYTES,
 )
 from capture import CameraCapture  # noqa: E402
 from config import (  # noqa: E402
@@ -322,9 +343,12 @@ OFF_PROFILE_MAX_EVENTS = 200
 #: прогоном лестницы и сворачивает его вклад в ноль, а `code` — это
 #: идентификатор для апелляции. Срез стоит на границе сокета — там же, где
 #: `engine/risk.py` его и предполагает (см. комментарий к `_ladder_obs_key`).
+#: `evidence_skipped` — причина отсутствия кадра камеры; её ставит только ядро
+#: (`_emit`), иначе оболочка могла бы сама объявить «камеры не было».
 SHELL_DETAIL_RESERVED: tuple[str, ...] = (
     "escalation", "code", "confirmed_by", "confirm_sec", "duration_total",
     "refines", "refined_by", "refined_by_code", "superseded_by",
+    "evidence_skipped",
 )
 
 
@@ -808,6 +832,106 @@ def _get(obj: Any, name: str, default: Any = None) -> Any:
     return default if value is None else value
 
 
+def _clamp_int(value: Any, lo: int, hi: int) -> int:
+    """Целое из сообщения клиента в пределах [lo, hi]; мусор -> lo."""
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return lo
+    return min(max(number, lo), hi)
+
+
+def _norm_box(box: Any, width: int, height: int) -> tuple[int, int, int, int] | None:
+    """(x, y, w, h) в пикселях или долях кадра -> целые пиксели внутри кадра."""
+    try:
+        x, y, w, h = (float(v) for v in list(box)[:4])
+    except (TypeError, ValueError):
+        return None
+    if max(abs(x), abs(y), w, h) <= 1.5:  # нормированные координаты
+        x, y, w, h = x * width, y * height, w * width, h * height
+    x0, y0 = max(int(round(x)), 0), max(int(round(y)), 0)
+    x1, y1 = min(int(round(x + w)), width), min(int(round(y + h)), height)
+    if x1 - x0 <= 1 or y1 - y0 <= 1:
+        return None
+    return x0, y0, x1 - x0, y1 - y0
+
+
+def _blurred(cv2: Any, frame: Any, regions: list[Any]) -> Any:
+    """Копия кадра с размытыми регионами (лица посторонних). Без регионов — сам кадр."""
+    if not regions:
+        return frame
+    image = frame.copy()
+    fh, fw = int(image.shape[0]), int(image.shape[1])
+    for region in regions:
+        box = _norm_box(region, fw, fh)
+        if box is None:
+            continue
+        x, y, w, h = box
+        roi = image[y:y + h, x:x + w]
+        if roi.size:
+            k = max(3, (min(w, h) // 4) * 2 + 1)
+            image[y:y + h, x:x + w] = cv2.GaussianBlur(roi, (k, k), 0)
+    return image
+
+
+def _overlap_share(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    """Какую долю площади рамки `b` закрывает рамка `a` (рамки в пикселях)."""
+    iw = max(0, min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0]))
+    ih = max(0, min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1]))
+    area = b[2] * b[3]
+    return (iw * ih) / float(area) if area > 0 else 0.0
+
+
+def _finite_float(value: Any) -> float | None:
+    """Конечное число из сообщения клиента или None."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _raw_size(raw: Any, limit: int) -> int:
+    """Размер сообщения WS в байтах UTF-8 (текст) или как есть (bytes).
+
+    Точный подсчёт для текста копирует строку, поэтому делается, только когда
+    предел вообще достижим: символ UTF-8 — не больше 4 байт.
+    """
+    if isinstance(raw, (bytes, bytearray, memoryview)):
+        return len(raw)
+    text = str(raw)
+    if len(text) * 4 <= limit:
+        return len(text)
+    return len(text.encode("utf-8", "surrogatepass"))
+
+
+def _decode_screen_jpeg(data_b64: str) -> bytes:
+    """base64 снимка окна экзамена -> байты JPEG. ValueError — снимок отклонён."""
+    try:
+        data = base64.b64decode(data_b64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"data_b64 не разбирается как base64: {exc}") from None
+    if not data:
+        raise ValueError("пустой снимок")
+    if len(data) > SCREEN_EVIDENCE_MAX_BYTES:
+        raise ValueError(f"снимок {len(data)} байт больше предела "
+                         f"{SCREEN_EVIDENCE_MAX_BYTES}")
+    if not data.startswith(b"\xff\xd8\xff"):
+        raise ValueError("не JPEG: нет сигнатуры FF D8 FF")
+    return data
+
+
+def _write_evidence_bytes(path: Path, data: bytes) -> str:
+    """Записать файл доказательства как есть и вернуть sha256 записанных байт."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "xb") as fh:  # "x": чужой файл с тем же именем не затираем
+        fh.write(data)
+        fh.flush()
+        with contextlib.suppress(OSError):
+            os.fsync(fh.fileno())
+    return hashlib.sha256(data).hexdigest()
+
+
 _ARITY_CACHE: dict[int, int] = {}
 
 
@@ -1172,6 +1296,25 @@ class ProctorSidecar:
 
         self._last_frame: Any = None
         self._last_frame_ts: float = 0.0
+        #: Лица на последнем разобранном кадре: (bbox основного, bbox прочих,
+        #: сколько всего). Живут рядом с `_last_frame` под тем же локом: кадр к
+        #: событию оболочки или окружения снимается НЕ в CV-потоке, а
+        #: посторонних на нём размыть и решить про клип всё равно нужно.
+        self._last_faces: tuple[Any, list[Any], int] = (None, [], 0)
+        #: Когда (time.time) в кадре последний раз было больше одного лица.
+        #: Клип берёт 10 с ДО события из буфера, поэтому смотреть только на
+        #: текущий кадр мало: посторонний мог уйти секунду назад.
+        self._multi_face_ts: float = 0.0
+        #: Запасной детектор лиц для размытия (`storage.evidence.plan_fallback_blur`),
+        #: загружается при первом кадре-доказательстве, см. `_fallback_planner`.
+        self._fallback_plan: Any = None
+        self._fallback_tried = False
+        #: События, разосланные оболочке с `screen: true`, в порядке рассылки:
+        #: id -> {kind, at, session, state}. По нему ядро принимает
+        #: `screen_evidence`: только к своему событию этой сессии, не позже
+        #: SCREEN_EVIDENCE_MAX_AGE и не больше одного раза. Ограничен по
+        #: размеру и по возрасту, см. `_note_screen_request`.
+        self._screen_requests: dict[str, dict[str, Any]] = {}
         self._calib: _CalibrationJob | None = None
         #: Новая сессия: GazeCalibration сбросит CV-поток на ближайшем кадре.
         self._calib_reset_pending = False
@@ -1957,7 +2100,11 @@ class ProctorSidecar:
             self.cfg.ws_port,
             ping_interval=self.cfg.ws_ping_interval,
             ping_timeout=self.cfg.ws_ping_interval,
-            max_size=self.cfg.ws_max_message,
+            # Не ниже, чем нужно снимку окна экзамена предельного размера в
+            # base64: сообщение сверх max_size рвёт соединение (1009), а не
+            # отклоняется, — см. комментарий к ws_max_message в config.py.
+            # Прочие типы больше ws_max_message отсекает `_on_message`.
+            max_size=max(int(self.cfg.ws_max_message or 0), WS_TRANSPORT_MAX_BYTES),
             process_request=self._process_request,
         )
 
@@ -2146,6 +2293,21 @@ class ProctorSidecar:
         if not isinstance(msg, dict):
             return
         mtype = str(msg.get("type", ""))
+        # Транспортный потолок поднят до ~4 МиБ ради одного типа — снимка окна
+        # экзамена. Всё остальное больше `ws_max_message` (1 МиБ) не
+        # обрабатывается: оболочке такие сообщения не нужны, а журнал и
+        # движок не должны принимать по 4 МиБ на сообщение от клиента.
+        limit = int(self.cfg.ws_max_message or 0) or (1 << 20)
+        if mtype != MsgType.SCREEN_EVIDENCE.value:
+            size = _raw_size(raw, limit)
+            if size > limit:
+                log.warning("сообщение %r отклонено: %d байт больше предела %d",
+                            mtype[:40], size, limit)
+                await self._send(ws, envelope(
+                    MsgType.ERROR, code="too_large",
+                    message=f"Сообщение {mtype[:40]} больше {limit} байт — не обработано",
+                    fatal=False))
+                return
         try:
             if mtype == MsgType.SESSION_START.value:
                 await self._cmd_session_start(msg)
@@ -2159,6 +2321,8 @@ class ProctorSidecar:
                 await self._cmd_shell_event(msg)
             elif mtype == MsgType.COMMAND.value:
                 await self._cmd_command(msg)
+            elif mtype == MsgType.SCREEN_EVIDENCE.value:
+                await self._cmd_screen_evidence(msg)
             else:
                 await self._send(ws, envelope(MsgType.ERROR, code="unknown_type",
                                               message=f"Неизвестный тип сообщения: {mtype}",
@@ -3398,9 +3562,6 @@ class ProctorSidecar:
                 with self._frame_lock:
                     self._last_frame = frame
                     self._last_frame_ts = ts
-                if self.recorder is not None:
-                    # кольцевой буфер: кадры «до» инцидента нужны для клипа
-                    self._safe_call(self.recorder.push, frame, ts, what="буфер кадров")
 
                 obs: list[tuple[EventKind, bool, dict[str, Any]]] = []
                 face_obs: Any = None
@@ -3411,8 +3572,16 @@ class ProctorSidecar:
                     face_obs = self._safe_call(self.face.analyze, frame, what="FaceMesh")
                     if face_obs is not None:
                         face_bbox = _get(face_obs, "face_bbox")
+                        self._safe_call(self._note_faces, face_obs, ts, what="учёт лиц")
                         obs.extend(self._safe_call(self._face_observations, face_obs, ts,
                                                    what="разбор лица") or [])
+
+                if self.recorder is not None:
+                    # Кольцевой буфер: кадры «до» инцидента нужны для клипа.
+                    # Кадр уходит в буфер ПОСЛЕ учёта лиц: если на нём второе
+                    # лицо, `_note_faces` уже снял незакрытые клипы, и в их
+                    # «после» этот кадр не попадёт.
+                    self._safe_call(self.recorder.push, frame, ts, what="буфер кадров")
 
                 # --- объекты: каждый N-й кадр (YOLO дорогой)
                 if self.objects is not None and frame_idx % max(cfg.yolo_every_n_frames, 1) == 0:
@@ -3437,8 +3606,11 @@ class ProctorSidecar:
 
                 events = self._push_observations(obs, ts)
                 if events:
+                    # Лица берутся из `_last_faces`: FaceMesh мог разбирать не
+                    # этот кадр (face_every_n_frames), а посторонних размыть
+                    # надо всё равно.
                     self._safe_call(self._attach_evidence, events, frame, face_bbox,
-                                    what="доказательства")
+                                    None, ts, what="доказательства")
                     self._post_events(events)
 
                 self._safe_call(self._handle_calibration, frame, face_obs, face_bbox, ts,
@@ -3887,6 +4059,8 @@ class ProctorSidecar:
                         self._after_calibration_stage(payload)
                 elif kind == "error":
                     await self._broadcast(envelope(MsgType.ERROR, **payload))
+                elif kind == "clip_cancelled":
+                    await self._store_clip_cancelled(payload)
             except Exception:
                 log.exception("ошибка обработки %s из CV-потока", kind)
 
@@ -3903,14 +4077,263 @@ class ProctorSidecar:
             if self.risk is not None:
                 with contextlib.suppress(Exception):
                     self.risk.add(ev)
-            if self.store is not None and self._store_open and self.session.recording:
+            recording = self.session.recording
+            # Кадр камеры — ДО записи в цепочку: путь к нему (или причина,
+            # почему его нет) входит в подписанное тело события. События
+            # CV-потока приходят уже с кадром своего момента; остальным
+            # (оболочка, окружение, связки, решения) достаётся последний кадр.
+            await self._ensure_frame(ev)
+            if self.store is not None and self._store_open and recording:
                 try:
                     await asyncio.to_thread(self.store.append, ev)
                 except Exception as exc:
                     log.warning("запись доказательства не удалась: %s", exc)
             log.info("[%s] %s %s", ev.severity.value, ev.kind.value, ev.message)
-            await self._broadcast(event_message(ev))
+            # `screen: true` — просьба к оболочке снять окно экзамена к этому
+            # событию и прислать `screen_evidence` с его id.
+            screen = recording and not is_service_kind(ev.kind)
+            if screen:
+                self._note_screen_request(ev)
+            await self._broadcast(event_message(ev, screen=screen))
         await self._push_risk()
+
+    # ------------------------------------------- кадр камеры к любому событию
+    async def _ensure_frame(self, ev: ProctorEvent) -> None:
+        """Приложить к событию кадр камеры или записать, почему его нет.
+
+        Итог всегда один из двух: `ev.evidence.frame_path` или
+        `ev.detail["evidence_skipped"]` (коды — `EVIDENCE_SKIP_*` в протоколе).
+        Молчаливого «кадра нет, и неизвестно почему» быть не должно: в отчёте
+        отсутствие кадра — такой же факт, как сам кадр.
+        """
+        if ev.evidence is not None:
+            if ev.evidence.frame_path:
+                self._mark_evidence_skipped(ev, "")
+            return
+        if _get(ev.detail, "evidence_skipped"):
+            # CV-поток уже пытался и записал причину (например, write_failed).
+            return
+        reason = self._frame_skip_reason(ev) or self._camera_skip_reason()
+        if reason:
+            self._mark_evidence_skipped(ev, reason)
+            return
+        try:
+            await asyncio.to_thread(self._attach_latest_frame, ev)
+        except Exception as exc:
+            log.warning("кадр к событию %s не приложен: %s", ev.kind.value, exc)
+            self._mark_evidence_skipped(ev, EVIDENCE_SKIP_WRITE_FAILED)
+        if ev.evidence is None or not ev.evidence.frame_path:
+            if not _get(ev.detail, "evidence_skipped"):
+                self._mark_evidence_skipped(ev, EVIDENCE_SKIP_WRITE_FAILED)
+
+    @staticmethod
+    def _mark_evidence_skipped(ev: ProctorEvent, reason: str) -> None:
+        """Записать причину отсутствия кадра (пустая строка — снять отметку)."""
+        if not isinstance(ev.detail, dict):
+            ev.detail = {}
+        if reason:
+            ev.detail["evidence_skipped"] = reason
+        else:
+            ev.detail.pop("evidence_skipped", None)
+
+    def _frame_skip_reason(self, ev: ProctorEvent) -> str:
+        """Причина НЕ снимать кадр по самому событию и политике. "" — снимать."""
+        if is_service_kind(ev.kind):
+            return EVIDENCE_SKIP_SERVICE
+        if not self.session.recording:
+            return EVIDENCE_SKIP_NOT_RECORDING
+        if not self._should_save_frame(ev):
+            return EVIDENCE_SKIP_DISABLED
+        return ""
+
+    def _camera_skip_reason(self) -> str:
+        """Причина, по которой кадра камеры нет вообще или он устарел. "" — есть."""
+        if self.cfg.headless or self.cfg.mock or self.capture is None:
+            # В --mock события берутся из сценария: настоящий кадр к
+            # выдуманному SECOND_FACE был бы подлогом, а не доказательством.
+            return EVIDENCE_SKIP_NO_CAMERA
+        if not self.capture.available():
+            # Нет opencv: кадров не будет ни у камеры, ни у рекордера.
+            return EVIDENCE_SKIP_NO_CAMERA
+        with self._frame_lock:
+            frame, frame_ts = self._last_frame, self._last_frame_ts
+        if frame is None:
+            return self._no_frame_reason()
+        if time.time() - frame_ts > EVIDENCE_FRAME_MAX_AGE:
+            return EVIDENCE_SKIP_STALE
+        return ""
+
+    def _no_frame_reason(self) -> str:
+        """Кадра нет: камеры не было вовсе или она пропала.
+
+        `_last_frame` за жизнь процесса не сбрасывается, поэтому None значит
+        «камера в этом процессе не отдала ни одного кадра» — устройства нет,
+        оно занято или доступ не выдан: это `no_camera`. `stale_frame` —
+        только камере, которая кадры отдавала, а потом замолчала.
+        """
+        with self._frame_lock:
+            ever = self._last_frame is not None
+        return EVIDENCE_SKIP_STALE if ever else EVIDENCE_SKIP_NO_CAMERA
+
+    def _attach_latest_frame(self, ev: ProctorEvent) -> None:
+        """Последний кадр камеры -> доказательство события (блокирующий, to_thread)."""
+        with self._frame_lock:
+            frame, frame_ts = self._last_frame, self._last_frame_ts
+            faces = self._last_faces
+        if frame is None:
+            self._mark_evidence_skipped(ev, EVIDENCE_SKIP_NO_CAMERA)
+            return
+        if time.time() - frame_ts > EVIDENCE_FRAME_MAX_AGE:
+            self._mark_evidence_skipped(ev, EVIDENCE_SKIP_STALE)
+            return
+        self._attach_evidence([ev], frame, faces[0], faces, frame_ts)
+
+    # ------------------------------------------- снимок окна экзамена (оболочка)
+    #: Сколько разосланных событий помнить для приёма `screen_evidence`.
+    SCREEN_REQUESTS_MAX = 512
+
+    def _note_screen_request(self, ev: ProctorEvent) -> None:
+        """Запомнить событие, к которому оболочку попросили снять окно экзамена."""
+        now = time.time()
+        self._screen_requests[ev.id] = {
+            "kind": ev.kind.value, "at": now,
+            "session": self.session.session_id, "state": "wait",
+        }
+        # dict хранит порядок вставки: старые записи — в начале.
+        horizon = now - SCREEN_EVIDENCE_MAX_AGE
+        while self._screen_requests:
+            oldest_id = next(iter(self._screen_requests))
+            oldest = self._screen_requests[oldest_id]
+            if (len(self._screen_requests) > self.SCREEN_REQUESTS_MAX
+                    or oldest["at"] < horizon):
+                self._screen_requests.pop(oldest_id, None)
+                continue
+            break
+
+    async def _cmd_screen_evidence(self, msg: dict[str, Any]) -> None:
+        """Снимок окна экзамена от оболочки -> файл + запись `evidence_screen`.
+
+        Сообщение приходит из сети, поэтому ядро ему не верит: принимает его
+        только пока сессия пишется, только к событию, которое само разослало
+        в этой сессии с `screen: true` не раньше SCREEN_EVIDENCE_MAX_AGE назад,
+        не больше одного раза на событие, не больше SCREEN_EVIDENCE_MAX_BYTES
+        и только JPEG (сигнатура FF D8 FF). Отклонённое пишется в лог, но не
+        в журнал: иначе клиент заливал бы цепочку чем угодно.
+
+        Снимок ложится в каталог доказательств, его sha256 — в хеш-цепочку
+        записью `control`/`evidence_screen`; связь с событием — по `event_id`.
+        """
+        received_at = time.time()
+        event_id = str(msg.get("event_id") or "").strip()[:64]
+
+        def reject(reason: str) -> None:
+            log.warning("снимок окна экзамена отклонён (событие %s): %s",
+                        event_id or "?", reason)
+
+        if not self.session.recording or self.store is None or not self._store_open:
+            reject("сессия не пишется")
+            return
+        if not callable(getattr(self.store, "append_control", None)):
+            # Резервный журнал (JSONL без SQLite) записей control не умеет:
+            # файл снимка без sha256 в цепочке был бы непроверяемым
+            # приложением к пакету. Отказ — ДО записи файла.
+            reject("хранилище не умеет записи control — снимок не к чему привязать")
+            return
+        entry = self._screen_requests.get(event_id) if event_id else None
+        if entry is None or entry.get("session") != self.session.session_id:
+            reject("ядро не рассылало такое событие в этой сессии")
+            return
+        if received_at - float(entry.get("at") or 0.0) > SCREEN_EVIDENCE_MAX_AGE:
+            reject(f"пришёл позже {SCREEN_EVIDENCE_MAX_AGE:.0f} с после события")
+            return
+        if entry.get("state") != "wait":
+            reject("снимок к этому событию уже принят")
+            return
+        kind = str(entry.get("kind") or "")
+
+        data_b64 = msg.get("data_b64")
+        if data_b64 is None or data_b64 == "":
+            error = msg.get("error")
+            if error is None or not str(error).strip():
+                reject("нет ни data_b64, ни error")
+                return
+            entry["state"] = "done"
+            # Текст причины приходит от клиента и ложится в подписанный
+            # журнал и в отчёт: одна строка, без управляющих символов, коротко.
+            text = "".join(ch for ch in " ".join(str(error).split()) if ch.isprintable())
+            await self._store_control(SCREEN_EVIDENCE_CONTROL, {
+                "event_id": event_id,
+                "kind": kind,
+                "error": text[:200] or "без причины",
+                "received_at": received_at,
+            })
+            return
+
+        if not isinstance(data_b64, str):
+            reject("data_b64 не строка")
+            return
+        # Предел проверяется ДО декодирования: 3 МБ в base64 — это ~4 МБ текста.
+        if len(data_b64) > (SCREEN_EVIDENCE_MAX_BYTES * 4) // 3 + 8:
+            reject("снимок больше 3 МБ")
+            return
+        mime = msg.get("mime")
+        if mime is not None and str(mime).lower() != "image/jpeg":
+            reject(f"тип {str(mime)[:40]!r} вместо image/jpeg")
+            return
+
+        # Пока идёт декодирование и запись, повтор того же event_id не пройдёт.
+        entry["state"] = "busy"
+        try:
+            data = await asyncio.to_thread(_decode_screen_jpeg, data_b64)
+        except ValueError as exc:
+            entry["state"] = "wait"
+            reject(str(exc))
+            return
+        if not self.session.recording or not self._store_open:
+            # Сессия закрылась, пока снимок декодировался: файл без записи в
+            # цепочке был бы непроверяемым приложением к пакету.
+            entry["state"] = "wait"
+            reject("сессия закрылась, пока снимок принимался")
+            return
+        target = self.session.evidence_file(f"{kind.lower()}_screen")
+        if target is None:
+            entry["state"] = "wait"
+            reject("каталог сессии недоступен")
+            return
+        path, rel = target
+        try:
+            digest = await asyncio.to_thread(_write_evidence_bytes, path, data)
+        except OSError as exc:
+            # Снимок пришёл, но ядро не смогло его сохранить: это не отказ
+            # клиенту, а факт о доказательстве, и в журнале он должен быть.
+            entry["state"] = "done"
+            log.warning("снимок окна экзамена не записан (%s): %s", rel, exc)
+            await self._store_control(SCREEN_EVIDENCE_CONTROL, {
+                "event_id": event_id,
+                "kind": kind,
+                "error": f"ядро не записало файл снимка: {exc}"[:200],
+                "received_at": received_at,
+            })
+            return
+        entry["state"] = "done"
+        if not self.session.recording or not self._store_open:
+            with contextlib.suppress(OSError):
+                path.unlink()
+            reject("сессия закрылась, пока снимок записывался")
+            return
+        source = str(msg.get("source") or "")
+        await self._store_control(SCREEN_EVIDENCE_CONTROL, {
+            "event_id": event_id,
+            "kind": kind,
+            "path": rel,
+            "sha256": digest,
+            "width": _clamp_int(msg.get("width"), 0, 20000),
+            "height": _clamp_int(msg.get("height"), 0, 20000),
+            "bytes": len(data),
+            "captured_at": _finite_float(msg.get("captured_at")),
+            "received_at": received_at,
+            "source": source if source in SCREEN_EVIDENCE_SOURCES else "unknown",
+        })
 
     def _profile_record(self) -> dict[str, Any]:
         """Объявленные правила оценки для записи `control`/`weight_profile`.
@@ -3959,6 +4382,53 @@ class ProctorSidecar:
             return ""
         log.info("в хеш-цепочку записано: %s (hash %s…)", name, str(digest)[:12])
         return str(digest or "")
+
+    async def _store_clip_cancelled(self, items: list[dict[str, Any]]) -> None:
+        """Снятые клипы -> записи `control`/`clip_cancelled` в хеш-цепочке.
+
+        Событие уже лежит в цепочке с `evidence.clip_path`, а файла по этому
+        пути не будет: отчёт и проверяющий должны видеть, что клип снят
+        намеренно (посторонний вошёл в кадр, пока набиралось «после»), а не
+        потерян. Связь с событием — по `event_id`. Обычно запись идёт после
+        события; у события оболочки, клип которого сняли, пока оно писалось,
+        может оказаться и раньше — порядок не гарантирован, связь только по id.
+        """
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            event_id = str(item.get("event_id") or "")
+            if not event_id:
+                continue
+            log.info("клип к событию %s (%s) снят до записи: %s", event_id,
+                     item.get("kind") or "?", item.get("reason") or "?")
+            await self._store_control(CLIP_CANCELLED_CONTROL, {
+                "event_id": event_id,
+                "kind": str(item.get("kind") or ""),
+                "reason": str(item.get("reason") or CLIP_CANCEL_MULTIPLE_FACES_AFTER),
+                "at": _finite_float(item.get("cancelled_at")) or time.time(),
+            })
+
+    def _cancel_pending_clips(self, reason: str) -> int:
+        """Снять незакрытые клипы рекордера и поставить записи об этом в очередь.
+
+        Зовётся из CV-потока и из рабочих потоков event loop (кадр к событию
+        оболочки), поэтому в цепочку пишет не сам, а через `_post`
+        (`call_soon_threadsafe`) — запись делает `_consume_cv` в event loop.
+        Вызывать под `_frame_lock`: так регистрация клипа в `_attach_evidence`
+        (тоже под ним) и его снятие не разъезжаются. Возвращает число снятых.
+        """
+        recorder = self.recorder
+        cancel = getattr(recorder, "cancel_pending", None) if recorder is not None else None
+        if not callable(cancel):
+            return 0
+        try:
+            cancelled = list(cancel(reason) or [])
+        except Exception as exc:
+            log.warning("клипы не сняты: %s", exc)
+            return 0
+        if cancelled:
+            self._post(("clip_cancelled", cancelled))
+        return len(cancelled)
 
     async def _store_observations(self, rows: list[dict[str, Any]]) -> None:
         """Отправить закрытые окна сырого слоя в журнал."""
@@ -4758,11 +5228,52 @@ class ProctorSidecar:
         self._update_snap(identity_ok=True, phone=False)
 
     # ------------------------------------------------------- доказательства
-    def _should_save(self, ev: ProctorEvent) -> bool:
+    def _should_save_frame(self, ev: ProctorEvent) -> bool:
+        """Правило КАДРА: severity не ниже `evidence_frame_min_severity`.
+
+        По умолчанию "info", то есть кадр снимается к любому неслужебному
+        событию. Служебные записи и запись вне сессии отсекает
+        `_frame_skip_reason`, у неё же коды причин для отчёта.
+        """
         if not self.cfg.save_evidence or not self.session.recording:
             return False
-        floor = SEVERITY_ORDER.get(self.cfg.evidence_min_severity, 2)
+        floor_name = getattr(self.cfg, "evidence_frame_min_severity", Severity.INFO.value)
+        floor = SEVERITY_ORDER.get(str(floor_name), 0)
         return SEVERITY_ORDER.get(ev.severity.value, 0) >= floor
+
+    def _should_save_clip(self, ev: ProctorEvent, face_count: int,
+                          multi_ts: float | None = None) -> str:
+        """Правило КЛИПА. Возвращает причину НЕ писать клип ("" — писать).
+
+        Клип пишется только при severity не ниже `evidence_min_severity`,
+        никогда для `_NO_CLIP_KINDS`, никогда без детектора лиц и никогда,
+        если в кадре больше одного лица: размывать посторонних рекордер умеет
+        только на снимке, а клип уехал бы на диск с их биометрией. «В кадре»
+        понимается с запасом — второе лицо, мелькнувшее в последние
+        `evidence_clip_seconds`, тоже закрывает клип: его 10 с «до» берутся из
+        буфера, и посторонний, ушедший секунду назад, в них есть. Вошедшего
+        ПОСЛЕ события ловит `_note_faces` -> `_cancel_pending_clips`.
+
+        Без FaceMesh (нет mediapipe, канал выключен флагом) лица считать
+        нечем: «одно лицо» не доказано, клип не пишется (`faces_unknown`).
+
+        `multi_ts` — `_multi_face_ts`, если вызывающий уже держит `_frame_lock`
+        (лок не реентерабельный); None — прочитать самому.
+        """
+        floor = SEVERITY_ORDER.get(self.cfg.evidence_min_severity, 2)
+        if SEVERITY_ORDER.get(ev.severity.value, 0) < floor:
+            return "severity"
+        if ev.kind in self._NO_CLIP_KINDS:
+            return "kind"
+        if self.face is None:
+            return CLIP_SKIP_FACES_UNKNOWN
+        window = max(float(self.cfg.evidence_clip_seconds or 0.0), 0.0)
+        if multi_ts is None:
+            with self._frame_lock:
+                multi_ts = self._multi_face_ts
+        if face_count > 1 or (multi_ts and time.time() - multi_ts <= window):
+            return CLIP_SKIP_MULTIPLE_FACES
+        return ""
 
     #: Единственные инциденты, где кроп уместен: поводом служит ПРЕДМЕТ.
     #: Для всего остального (лица, взгляд, голос) доказательство — полный кадр;
@@ -4777,94 +5288,313 @@ class ProctorSidecar:
     #: отдают преподавателю) с незамытой биометрией постороннего, а README и
     #: docs/LIMITATIONS.md обещают обратное. Доказательством остаётся размытый
     #: полный кадр: он подтверждает сам факт «в комнате второй человек».
+    #: То же правило для ЛЮБОГО инцидента с двумя лицами в кадре — в
+    #: `_should_save_clip`.
     _NO_CLIP_KINDS = (EventKind.SECOND_FACE,)
 
-    def _attach_evidence(self, events: list[ProctorEvent], frame: Any, face_bbox: Any) -> None:
+    def _attach_evidence(self, events: list[ProctorEvent], frame: Any, face_bbox: Any,
+                         faces: tuple[Any, list[Any], int] | None = None,
+                         frame_ts: float | None = None) -> None:
         """Сохранить кадр (и клип) инцидента, прописать пути в событие.
 
         Кроп делается только по bbox предмета-повода (телефон, книга). Для
         инцидентов про людей кроп не снимается — доказательством является
-        полный кадр, а лишние лица размываются рекордером. Для инцидентов из
-        `_NO_CLIP_KINDS` клип не пишется вообще: размыть постороннего в видео
-        нечем, см. комментарий к константе.
+        полный кадр. На КАЖДОМ кадре размываются все лица, кроме основного
+        (самого крупного): посторонний в кадре во время WINDOW_BLUR — такая же
+        чужая биометрия, как во время SECOND_FACE. Сверх рамок FaceMesh кадр
+        проходит каскад Хаара (`_fallback_blur`): FaceMesh видит не больше
+        `max_num_faces` лиц и пропускает мелкие. Клип — по `_should_save_clip`;
+        если каскад нашёл второе лицо, клипа к событию нет.
+
+        `faces` — (bbox основного, bbox прочих, число лиц) для этого кадра;
+        None — взять последний учтённый (`_last_faces`). Не удалось записать —
+        в `detail["evidence_skipped"]` ложится причина, а не тишина.
         """
+        if faces is None:
+            with self._frame_lock:
+                faces = self._last_faces
+        _primary, others, face_count = faces
+        shot_ts = float(frame_ts) if frame_ts else None
+        # Запасное размытие (каскад Хаара) — один раз на кадр, а не на событие.
+        fallback: tuple[list[Any], str, int] | None = None
         for ev in events:
-            if ev.evidence is not None or not self._should_save(ev):
+            if ev.evidence is not None:
+                continue
+            reason = self._frame_skip_reason(ev)
+            if reason:
+                self._mark_evidence_skipped(ev, reason)
+                continue
+            if frame is None:
+                self._mark_evidence_skipped(ev, self._no_frame_reason())
                 continue
             target = self.session.evidence_file(ev.kind.value.lower())
             if target is None:
+                self._mark_evidence_skipped(ev, EVIDENCE_SKIP_WRITE_FAILED)
                 continue
             path, rel = target
             box = ev.detail.get("bbox") if ev.kind in self._OBJECT_KINDS else None
-            blur = self._blur_regions(ev, face_bbox)
+            if fallback is None:
+                fallback = self._fallback_blur(frame, faces, shot_ts)
+            extra_faces, blur_mode, new_faces, subject = fallback
+            # Рамки FaceMesh и каскада одного и того же лица размываются обе
+            # (они разной формы), а считается лицо один раз. Лицо студента
+            # (`subject`) остаётся резким: запас вокруг чужих рамок на него не
+            # заходит.
+            size = (int(frame.shape[1]), int(frame.shape[0]))
+            own = self._blur_regions(ev, others, subject, size)
+            blur = own + self._blur_regions(None, extra_faces, subject, size)
+            # Подпись на кадре — латиницей: cv2.putText кириллицу не рисует.
+            caption = " ".join(part for part in (str(ev.detail.get("code") or ""),
+                                                 ev.kind.value) if part)
+            stamp = shot_ts or ev.ts
+            extra: dict[str, Any] = {"frame_ts": stamp}
+            if blur:
+                extra["blurred_faces"] = len(own) + new_faces
+            if blur_mode:
+                extra["blur"] = blur_mode
 
             if self.recorder is not None:
                 saved = self._safe_call(self.recorder.save_snapshot, frame, box, path,
-                                        ev.message[:60], blur, ev.ts, what="снимок")
+                                        caption, blur, stamp, what="снимок")
                 if not isinstance(saved, dict):
+                    self._mark_evidence_skipped(ev, EVIDENCE_SKIP_WRITE_FAILED)
                     continue
                 clip = None
-                if ev.kind not in self._NO_CLIP_KINDS:
-                    clip = self._safe_call(self.recorder.save_clip, ev.id, None, None, None,
-                                           ev.ts, what="клип")
+                # Правило клипа и регистрация — под одним `_frame_lock`, тем же,
+                # под которым `_note_faces` отмечает второе лицо и снимает
+                # незакрытые клипы: иначе клип, зарегистрированный рабочим
+                # потоком между этими двумя шагами CV-потока, не был бы снят.
+                with self._frame_lock:
+                    no_clip = self._should_save_clip(ev, face_count, self._multi_face_ts)
+                    if not no_clip:
+                        clip = self._safe_call(self.recorder.save_clip, ev.id, None, None,
+                                               None, ev.ts, ev.kind.value, what="клип")
+                if no_clip in (CLIP_SKIP_MULTIPLE_FACES, CLIP_SKIP_FACES_UNKNOWN):
+                    extra["clip_skipped"] = no_clip
+                extra.update({"crop_path": saved.get("crop_rel") or "",
+                              "saved_at": time.time()})
                 ev.evidence = Evidence(
                     frame_path=saved.get("frame_rel") or rel,
                     clip_path=str(clip) if clip else None,
                     bbox=saved.get("bbox"),
-                    extra={"crop_path": saved.get("crop_rel") or "", "saved_at": time.time()},
+                    extra=extra,
                 )
+                self._mark_evidence_skipped(ev, "")
                 continue
 
-            # рекордера нет — пишем одиночный кадр сами, без кропов и клипов
+            # рекордера нет — пишем одиночный кадр сами, без кропов и клипов,
+            # но посторонних размываем так же
             try:
                 import cv2  # type: ignore
+            except Exception as exc:
+                log.debug("кадр-доказательство не сохранён: нет opencv (%s)", exc)
+                self._mark_evidence_skipped(ev, EVIDENCE_SKIP_NO_CAMERA)
+                continue
+            try:
+                image = _blurred(cv2, frame, blur)
                 path.parent.mkdir(parents=True, exist_ok=True)
-                cv2.imwrite(str(path), frame,
-                            [int(cv2.IMWRITE_JPEG_QUALITY), int(self.cfg.evidence_jpeg_quality)])
+                ok = cv2.imwrite(str(path), image,
+                                 [int(cv2.IMWRITE_JPEG_QUALITY),
+                                  int(self.cfg.evidence_jpeg_quality)])
             except Exception as exc:
                 log.debug("кадр-доказательство не сохранён: %s", exc)
+                ok = False
+            if not ok:
+                self._mark_evidence_skipped(ev, EVIDENCE_SKIP_WRITE_FAILED)
                 continue
+            extra["saved_at"] = time.time()
             ev.evidence = Evidence(
                 frame_path=rel,
                 bbox=[float(v) for v in box] if isinstance(box, (list, tuple)) and len(box) >= 4 else None,
-                extra={"saved_at": time.time()},
+                extra=extra,
             )
+            self._mark_evidence_skipped(ev, "")
+
+    def _fallback_planner(self) -> Any:
+        """`storage.evidence.plan_fallback_blur` — лениво, один раз; None, если нет."""
+        if not self._fallback_tried:
+            self._fallback_tried = True
+            plan = self._import_attr("storage.evidence", "plan_fallback_blur")
+            available = self._import_attr("storage.evidence", "fallback_available")
+            ok = False
+            if callable(plan) and callable(available):
+                with contextlib.suppress(Exception):
+                    ok = bool(available())
+            if ok:
+                self._fallback_plan = plan
+            else:
+                why = ""
+                error = self._import_attr("storage.evidence", "fallback_error")
+                if callable(error):
+                    with contextlib.suppress(Exception):
+                        why = str(error() or "")
+                log.warning("запасной детектор лиц (каскад Хаара) недоступен%s: без "
+                            "FaceMesh лица на кадрах доказательств НЕ размываются, "
+                            "в доказательстве это помечается blur=unavailable",
+                            f" ({why})" if why else "")
+        return self._fallback_plan
+
+    def _fallback_blur(self, frame: Any, faces: tuple[Any, list[Any], int],
+                       frame_ts: float | None = None) -> tuple[list[Any], str, int, Any]:
+        """Запасное размытие каскадом Хаара: (рамки, `extra.blur`, сколько лиц
+        новых, рамка лица студента или None).
+
+        Рамки — все лица каскада, кроме основного; «новых» — сколько из них
+        FaceMesh не видел (для счётчика `blurred_faces`).
+
+        Каскад проходит КАЖДЫЙ кадр, который уходит на диск, а не только кадр
+        без FaceMesh или с двумя лицами. FaceMesh видит не больше
+        `max_num_faces` (2), без mediapipe не видит никого, а и при одном
+        найденном лице пропускает других: на кадре с тремя лицами разного
+        размера он насчитал одно, хотя каскад нашёл все три. Цена — десятки
+        миллисекунд на сохраняемый кадр, то есть на инцидент, а не на кадр
+        потока.
+
+        Метка: "haar" — каскад отработал, его лица (кроме основного) добавлены
+        к размытию; "unavailable" — каскада нет, кадр пишется как есть сверх
+        рамок FaceMesh, и это видно в доказательстве.
+
+        Каскад видит в кадре больше одного лица (вместе с основным от
+        FaceMesh) — это то же «второе лицо в кадре»: отметка `_multi_face_ts`
+        и снятие незакрытых клипов.
+        """
+        if frame is None:
+            return [], "", 0, None
+        primary, others, _face_count = faces
+        planner = self._fallback_planner()
+        if planner is None:
+            return [], BLUR_UNAVAILABLE, 0, primary
+        # FaceMesh работал и лица не нашёл — крупнейшее лицо каскада может
+        # оказаться посторонним, поэтому основного нет и размываются все.
+        face_ran = self.face is not None
+        try:
+            plan = planner(frame, primary, list(others or []), face_ran=face_ran)
+        except Exception as exc:
+            log.warning("каскад Хаара упал на кадре: %s", exc)
+            return [], BLUR_UNAVAILABLE, 0, primary
+        if not isinstance(plan, dict) or not plan.get("available"):
+            return [], BLUR_UNAVAILABLE, 0, primary
+        boxes = [list(b) for b in (plan.get("others") or [])]
+        subject = 1 if (primary is not None or plan.get("primary") is not None) else 0
+        if len(boxes) + subject >= 2:
+            with self._frame_lock:
+                self._multi_face_ts = max(self._multi_face_ts,
+                                          float(frame_ts or time.time()))
+                self._cancel_pending_clips(CLIP_CANCEL_MULTIPLE_FACES_AFTER)
+        subject_box = primary if primary is not None else plan.get("primary")
+        return boxes, BLUR_HAAR, int(plan.get("new") or 0), subject_box
+
+    def _note_faces(self, face: Any, ts: float) -> None:
+        """Запомнить лица разобранного кадра для размытия и правила клипа."""
+        boxes = [list(b) for b in (_get(face, "faces", []) or [])
+                 if isinstance(b, (list, tuple)) and len(b) >= 4]
+        primary = _get(face, "face_bbox")
+        count = int(_get(face, "face_count", 0) or 0)
+        if not boxes and isinstance(primary, (list, tuple)) and len(primary) >= 4:
+            boxes = [list(primary)]
+        others = boxes[1:]
+        second = _get(face, "second_face_bbox")
+        if (not others and count >= 2 and isinstance(second, (list, tuple))
+                and len(second) >= 4):
+            others = [list(second)]
+        count = max(count, len(boxes))
+        with self._frame_lock:
+            self._last_faces = (primary, others, count)
+            if count >= 2:
+                self._multi_face_ts = max(self._multi_face_ts, float(ts or time.time()))
+                # Посторонний вошёл, пока у клипов набирается «после»: их
+                # снимаем, файлы не пишутся (запись `clip_cancelled` в цепочке).
+                # Кадр уходит в буфер рекордера после этого вызова (`_cv_loop`),
+                # поэтому в снятые клипы он попасть не успевает.
+                self._cancel_pending_clips(CLIP_CANCEL_MULTIPLE_FACES_AFTER)
 
     @staticmethod
-    def _blur_regions(ev: ProctorEvent, face_bbox: Any) -> list[Any]:
+    def _blur_regions(ev: ProctorEvent | None, others: list[Any] | None = None,
+                      keep: Any = None, size: tuple[int, int] | None = None) -> list[Any]:
         """Лица посторонних, которые нужно размыть перед записью кадра.
 
-        Для SECOND_FACE известен bbox второго лица — размываем его: факт
-        присутствия второго человека фиксируется, биометрия нет.
+        Все лица кадра, кроме основного (`others`), плюс bbox второго лица из
+        самого SECOND_FACE: факт присутствия второго человека фиксируется,
+        биометрия нет. Рамка FaceMesh идёт по точкам сетки (от бровей до
+        подбородка), поэтому расширяется с запасом — волосы и уши тоже
+        узнаваемы.
+
+        `keep` — рамка лица студента, `size` — (ширина, высота) кадра. С ними
+        запас вокруг чужой рамки не заходит на лицо студента (тогда берётся
+        рамка без запаса), а рамка, покрывающая заметную часть его лица, —
+        это та же голова, и она не размывается.
         """
-        if ev.kind is not EventKind.SECOND_FACE:
-            return []
-        extra = ev.detail.get("second_face_bbox") or ev.detail.get("other_face_bbox")
-        return [extra] if isinstance(extra, (list, tuple)) and len(extra) >= 4 else []
+        keep_px = _norm_box(keep, size[0], size[1]) if keep is not None and size else None
+        raw: list[Any] = list(others or [])
+        if ev is not None and ev.kind is EventKind.SECOND_FACE:
+            extra = ev.detail.get("second_face_bbox") or ev.detail.get("other_face_bbox")
+            if isinstance(extra, (list, tuple)) and len(extra) >= 4:
+                raw.append(extra)
+        regions: list[Any] = []
+        seen: set[tuple[int, ...]] = set()
+        for box in raw:
+            try:
+                x, y, w, h = (float(v) for v in list(box)[:4])
+            except (TypeError, ValueError):
+                continue
+            key = tuple(int(round(v * 1000 if max(w, h) <= 1.5 else v)) for v in (x, y, w, h))
+            if w <= 0 or h <= 0 or key in seen:
+                continue  # bbox из SECOND_FACE обычно совпадает с одним из `others`
+            seen.add(key)
+            if keep_px is not None:
+                own = _norm_box([x, y, w, h], size[0], size[1])
+                if own is None:
+                    continue
+                if _overlap_share(own, keep_px) >= 0.3:
+                    continue  # та же голова, что у студента: не размываем
+                ox, oy, ow, oh = own
+                pad_x, pad_y = 0.25 * ow, 0.35 * oh
+                padded = [ox - pad_x, oy - pad_y, ow + 2 * pad_x, oh + 2 * pad_y]
+                padded_px = _norm_box(padded, size[0], size[1])
+                regions.append(list(own) if padded_px is not None
+                               and _overlap_share(padded_px, keep_px) > 0 else padded)
+                continue
+            pad_x, pad_y = 0.25 * w, 0.35 * h
+            regions.append([x - pad_x, y - pad_y, w + 2 * pad_x, h + 2 * pad_y])
+        return regions
 
     def _snapshot(self) -> str | None:
         """Снимок текущего кадра по команде оболочки (блокирующий, через to_thread)."""
         with self._frame_lock:
-            frame = self._last_frame
+            frame, frame_ts = self._last_frame, self._last_frame_ts
+            faces = self._last_faces
         if frame is None and self.capture is not None:
-            frame, _ts = self.capture.peek()
+            frame, frame_ts = self.capture.peek()
         if frame is None:
             return None
         target = self.session.evidence_file("snapshot")
         if target is None:
             return None
         path, _rel = target
+        # Посторонние размываются и здесь: снимок по команде — тоже кадр,
+        # который уходит в каталог сессии. Тот же запасной каскад, что у кадров
+        # к событиям; записи о снапшоте в цепочке нет, поэтому «размыть нечем»
+        # говорится в логе.
+        extra_faces, blur_mode, _new, subject = self._fallback_blur(frame, faces, frame_ts)
+        if blur_mode == BLUR_UNAVAILABLE:
+            log.warning("снапшот: лица сверх увиденных FaceMesh не размыты — "
+                        "запасного детектора лиц нет")
+        regions = self._blur_regions(None, list(faces[1] or []) + extra_faces, subject,
+                                     (int(frame.shape[1]), int(frame.shape[0])))
         if self.recorder is not None:
+            # Подпись латиницей (putText).
             saved = self._safe_call(self.recorder.save_snapshot, frame, None, path,
-                                    "снимок по команде", None, time.time(), what="снапшот")
+                                    "SNAPSHOT", regions, time.time(), what="снапшот")
             if isinstance(saved, dict):
                 return str(saved.get("frame_path") or path)
             return None
         try:
             import cv2  # type: ignore
             path.parent.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(path), frame,
-                        [int(cv2.IMWRITE_JPEG_QUALITY), int(self.cfg.evidence_jpeg_quality)])
+            if not cv2.imwrite(str(path), _blurred(cv2, frame, regions),
+                               [int(cv2.IMWRITE_JPEG_QUALITY),
+                                int(self.cfg.evidence_jpeg_quality)]):
+                raise OSError("cv2.imwrite вернул False")
             return str(path)
         except Exception as exc:
             log.warning("снапшот не сохранён: %s", exc)

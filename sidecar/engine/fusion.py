@@ -924,6 +924,12 @@ class FusionEngine:
                 "confidence": round(trig.confidence, 2),
                 "zone": trig.detail.get("zone", trig.detail.get("gaze_zone", "")),
                 "message": trig.message,
+                # Ссылка на событие-триггер и его кадр: связка фиксируется в
+                # момент ответа, а смотреть нужно на момент сигнала. Кадр
+                # сайдкар приложил к тому же объекту события до записи в
+                # цепочку, поэтому к моменту связки путь уже известен.
+                "event_id": str(getattr(trig.event, "id", "") or ""),
+                "frame_path": _trigger_frame_path(trig.event),
             },
             "response": dict(response),
             "baseline": self._base.as_dict(self._baseline_ready()),
@@ -1164,6 +1170,14 @@ def _hhmmss(ts: float) -> str:
         return time.strftime("%H:%M:%S", time.localtime(ts))
     except (ValueError, OSError, OverflowError):
         return "--:--:--"
+
+
+def _trigger_frame_path(event: Any) -> str:
+    """Путь кадра события-триггера (относительно каталога сессии) или ""."""
+    evidence = getattr(event, "evidence", None)
+    if isinstance(evidence, dict):
+        return str(evidence.get("frame_path") or "")
+    return str(getattr(evidence, "frame_path", "") or "")
 
 
 __all__ = ["FusionEngine", "DEFAULTS", "GAZE_TRIGGERS", "BLUR_TRIGGERS",

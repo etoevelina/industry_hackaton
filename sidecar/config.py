@@ -1598,7 +1598,15 @@ class ProctorConfig:
     ws_host: str = DEFAULT_WS_HOST
     ws_port: int = DEFAULT_WS_PORT
     ws_ping_interval: float = 20.0
-    ws_max_message: int = 1 << 20  # 1 МиБ, больше оболочке не нужно
+    #: Предел одного сообщения оболочки — для всех типов, КРОМЕ `screen_evidence`
+    #: (1 МиБ, больше оболочке не нужно). Больше — ядро не обрабатывает: отказ в
+    #: лог и `error`/`too_large` отправителю (`_on_message`).
+    #: Транспортный потолок WS-кадра выше: снимку окна экзамена до 3 МБ
+    #: (SCREEN_EVIDENCE_MAX_BYTES) в base64 нужно ~4 МиБ, а сообщение больше
+    #: max_size библиотека не отклоняет, а РВЁТ соединение (1009). Поэтому
+    #: max_size = max(ws_max_message, WS_TRANSPORT_MAX_BYTES), а 1 МиБ для
+    #: прочих типов проверяет само ядро.
+    ws_max_message: int = 1 << 20
 
     # -------------------------------------------------------------- захват камеры
     camera_index: int = 0
@@ -1821,7 +1829,13 @@ class ProctorConfig:
     db_filename: str = "evidence.sqlite"
     report_filename: str = "report.html"
     save_evidence: bool = True
-    evidence_min_severity: str = "medium"     # ниже этого кадры не сохраняем
+    #: Ниже этой severity КЛИП не пишется. Клип — 15 с видео вокруг момента,
+    #: дорогой и по диску, и по приватности, поэтому порог у него свой.
+    evidence_min_severity: str = "medium"
+    #: Ниже этой severity не снимается КАДР камеры. По умолчанию "info": кадр
+    #: прикладывается к каждому неслужебному событию, включая события
+    #: оболочки и окружения — без него инцидент в отчёте нечем проверить.
+    evidence_frame_min_severity: str = "info"
     evidence_jpeg_quality: int = 85
     evidence_clip_seconds: float = 15.0
     sign_report: bool = False
@@ -2285,6 +2299,7 @@ class ProctorConfig:
                 "jpeg_quality": self.evidence_jpeg_quality,
                 "clip_seconds": self.evidence_clip_seconds,
                 "min_severity": self.evidence_min_severity,
+                "frame_min_severity": self.evidence_frame_min_severity,
             },
         }
 

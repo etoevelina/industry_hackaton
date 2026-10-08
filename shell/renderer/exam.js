@@ -19,7 +19,10 @@
  *   answer_submit  — telemetry.answerSubmit(q.id, lengthInChars) при уходе с вопроса
  *   keystroke      — telemetry.attach(textarea, () => q.id) (интервалы и класс клавиши)
  *   paste          — тем же attach(); вставка НЕ блокируется, это доказательство
- * Текст ответа наружу не уходит никогда — только длина в символах.
+ * Текст ответа в телеметрию не уходит — только длина в символах. Но при
+ * инциденте оболочка снимает окно теста (screen_evidence, shell/main.js), и
+ * на снимке ответ виден таким, каким он был в этот момент. Об этом честно
+ * говорят подпись под полем ответа (_renderOpen) и экран согласия.
  *
  * Таймер умеет останавливаться: на verdict "pause" время не идёт.
  * =========================================================================== */
@@ -748,7 +751,12 @@
     }
   };
 
-  /** Развёрнутый ответ: крупное поле, видимый счётчик, напоминание о приватности. */
+  /**
+   * Развёрнутый ответ: крупное поле, видимый счётчик и подпись о том, что
+   * пишется. Подпись честная: символы не фиксируются, но снимок окна теста
+   * при инциденте показывает ответ целиком. Поэтому значок — «сведения», а
+   * не замок: обещать здесь закрытость текста нельзя.
+   */
   Exam.prototype._renderOpen = function (card, q, textId) {
     var countId = 'answer-count-' + q.id;
     var privacyId = 'answer-privacy-' + q.id;
@@ -773,10 +781,15 @@
       '<span class="qcard__privacy" id="' + privacyId + '">' +
         '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" ' +
           'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' +
-          '<rect x="4" y="10" width="16" height="10" rx="2.5"></rect>' +
-          '<path d="M8 10V7.5a4 4 0 0 1 8 0V10"></path>' +
+          '<circle cx="12" cy="12" r="9"></circle>' +
+          '<path d="M12 11v5.5"></path>' +
+          '<path d="M12 7.6v.1"></path>' +
         '</svg>' +
-        'Фиксируются интервалы между нажатиями, не символы. Текст ответа остаётся на этом компьютере.' +
+        // пробел между строками — для aria-describedby: textContent склеил бы фразы
+        '<span class="qcard__privacy-text">' +
+          '<span class="qcard__privacy-line">Фиксируются интервалы между нажатиями, не символы.</span> ' +
+          '<span class="qcard__privacy-line">При инциденте снимается окно теста — на снимке виден ваш ответ.</span>' +
+        '</span>' +
       '</span>';
     card.appendChild(foot);
 

@@ -142,10 +142,15 @@
           <section class="rules" id="consent-rules" aria-labelledby="rules-title-consent"></section>
           <section class="consent-sum__col" data-mode="yes" aria-labelledby="sum-yes">
             <h2 class="consent-sum__title" id="sum-yes">Сохраняется на этом компьютере</h2>
+            <!-- Снимок окна теста назван прямо, со словом «ответ»: на нём виден
+                 вопрос и ответ студента в момент инцидента, и обещание «текст ответа
+                 не записывается» больше не было бы правдой. Одной строкой с кадром и
+                 клипом — чтобы колонка не выросла и экран остался без прокрутки
+                 от 1024×728; подробности — в полном перечне (app.js, DISCLOSURE). -->
             <ul class="consent-sum__list">
-              <li>Кадр и короткий клип — только при инциденте</li>
+              <li>При инциденте: кадр, клип и снимок окна теста — вопрос и ваш ответ</li>
               <li>Посекундная сводка — числа, без кадров и звука</li>
-              <li>Итоги калибровки (без снимка лица) и ритм набора (без символов)</li>
+              <li>Калибровка (без снимка лица) и ритм набора (без символов)</li>
               <li>События окна теста и проверки окружения</li>
             </ul>
           </section>
@@ -154,8 +159,8 @@
             <ul class="consent-sum__list">
               <li>Видео целиком — кадры разбираются в памяти</li>
               <li>Звук — аудиозаписи нет</li>
-              <li>Текст ответа, нажатые клавиши, буфер обмена</li>
-              <li>Экран и другие окна</li>
+              <li>Нажатые клавиши и буфер обмена</li>
+              <li>Рабочий стол и другие окна — никогда</li>
             </ul>
           </section>
         </div>
@@ -353,6 +358,20 @@
           <p class="report__rules" id="report-rules"></p>
         </div>
 
+        <!-- Передача доказательств деградировала (degraded_handover): каталог,
+             который задал проктор, был недоступен, и сессия записана в запасной
+             каталог на этом компьютере. Это не мелкая сноска внизу: пакет
+             придётся передать руками, и человек у машины должен узнать об этом
+             здесь, а не на разборе. Показывает app.js (_renderReportFiles). -->
+        <div class="alert alert--warn" id="report-handover" role="alert" hidden>
+          <span class="alert-bar" aria-hidden="true"></span>
+          <div class="alert__body">
+            <strong>Доказательства не попали в каталог проктора</strong>
+            <p id="report-handover-text">Сессия записана в запасной каталог на этом компьютере. Передайте пакет проктору вручную.</p>
+          </div>
+          <code class="alert__code">DEGRADED</code>
+        </div>
+
         <div class="report">
           <div class="report__score">
             <div class="ring ring--lg" id="report-ring-wrap">
@@ -372,7 +391,7 @@
             <div class="tile"><div class="tile__num mono" id="report-incidents">0</div><div class="tile__cap">инцидентов</div></div>
             <div class="tile"><div class="tile__num mono" id="report-high">0</div><div class="tile__cap">высокой важности</div></div>
             <div class="tile"><div class="tile__num mono" id="report-duration">00:00</div><div class="tile__cap">длительность</div></div>
-            <div class="tile"><div class="tile__num mono" id="report-session">—</div><div class="tile__cap">номер сессии</div></div>
+            <div class="tile"><div class="tile__num mono" id="report-session">—</div><div class="tile__cap" id="report-session-cap">номер сессии</div></div>
           </div>
         </div>
 
@@ -409,37 +428,43 @@
           </article>
         </div>
 
-        <article class="card">
-          <h2 class="card__title">Состав доказательной базы</h2>
+        <!-- Где лежат отчёт и пакет. Пути — ФАКТИЧЕСКИЕ, со слов ядра (каталог
+             сессии из SESSION_STARTED, пакет из SESSION_ENDED), а готовность —
+             по диску: main-процесс раз в секунду проверяет, что файл на месте
+             (shellStatus().sessionReport). Строки ниже — только вид до первого
+             ответа; app.js (_renderReportFiles) заменяет их. -->
+        <article class="card report-files" id="report-files">
+          <h2 class="card__title">Где отчёт и доказательства</h2>
           <div class="table-wrap">
-            <table class="data-table">
+            <table class="data-table report-files__table">
               <thead>
-                <tr><th>Артефакт</th><th>Путь</th><th>Защита</th></tr>
+                <tr><th>Что</th><th>Где</th><th>Состояние</th></tr>
               </thead>
-              <tbody>
-                <tr>
-                  <td>Каталог сессии</td>
-                  <td class="mono">evidence/&lt;id-сессии&gt;/</td>
-                  <td>локально, без сети</td>
-                </tr>
-                <tr>
-                  <td>Журнал инцидентов</td>
-                  <td class="mono">evidence/proctor.db</td>
-                  <td>хеш-цепочка SHA-256</td>
-                </tr>
-                <tr>
-                  <td>Снимки и клипы</td>
-                  <td class="mono">evidence/&lt;id-сессии&gt;/*.jpg, *.mp4</td>
-                  <td>только моменты инцидентов</td>
-                </tr>
+              <tbody id="report-files-body">
                 <tr>
                   <td>Итоговый отчёт</td>
-                  <td class="mono">report.html + report.html.sig</td>
-                  <td>подпись Ed25519</td>
+                  <td class="mono">&lt;каталог сессии&gt;/report.html</td>
+                  <td>появится после завершения сессии</td>
+                </tr>
+                <tr>
+                  <td>Пакет для проктора</td>
+                  <td class="mono">&lt;сессия&gt;.proctor.zip</td>
+                  <td>собирается после отчёта</td>
+                </tr>
+                <tr>
+                  <td>Каталог сессии</td>
+                  <td class="mono">sessions/&lt;сессия&gt;/</td>
+                  <td>журнал evidence.sqlite с хеш-цепочкой; кадры, клипы и снимки окна теста — в evidence/</td>
                 </tr>
               </tbody>
             </table>
           </div>
+          <p class="report-files__note">
+            В отчёте у каждого инцидента — кадр с камеры и снимок окна теста в этот момент
+            (снимается только окно теста, рабочий стол и другие окна — никогда). Пакет
+            проверяется командой
+            <span class="mono">python3 scripts/verify_report.py &lt;пакет&gt;</span>.
+          </p>
           <div class="chips">
             <span class="status-chip status-chip--light">
               <span class="status-chip__text">Вычисление на этом компьютере</span>
@@ -456,8 +481,13 @@
           </div>
         </article>
 
+        <!-- «Открыть отчёт» открывает <каталог сессии>/report.html браузером по
+             умолчанию — только после конца сессии, когда блокировки сняты (это
+             проверяет main-процесс). Пересборка — прежняя команда export_report:
+             ядро собирает отчёт и пакет заново, на месте. -->
         <div class="actions">
-          <span class="report__hint" id="report-hint">Отчёт собирается локально, рядом с доказательствами.</span>
+          <span class="report__hint" id="report-hint" aria-live="polite">Отчёт собирается локально, рядом с доказательствами.</span>
+          <button class="btn btn--ghost" id="btn-report-rebuild" type="button">Пересобрать отчёт и пакет</button>
           <button class="btn btn--primary btn--lg" id="btn-report" type="button">Открыть отчёт</button>
         </div>
       </div>

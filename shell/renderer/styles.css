@@ -1602,8 +1602,12 @@ code {
   font-size: var(--fs-small);
   color: var(--text-muted);
 }
-.qcard__privacy { display: inline-flex; align-items: center; gap: var(--space-2); }
-.qcard__privacy svg { width: var(--space-4); height: var(--space-4); flex: none; }
+/* Подпись под полем ответа — две фразы, каждая своей строкой: что пишется
+   при наборе и что видно на снимке окна теста. Значок стоит у первой строки. */
+.qcard__privacy { display: inline-flex; align-items: flex-start; gap: var(--space-2); }
+.qcard__privacy svg { width: var(--space-4); height: var(--space-4); flex: none;
+  margin-top: calc(var(--fs-small) * var(--lh-body) / 2 - var(--space-4) / 2); }
+.qcard__privacy-line { display: block; }
 .qcard__privacy svg * { fill: none; stroke: var(--text-muted); stroke-width: 1.8; }
 
 /* -------------------------------- низ экрана ------------------------------- */
@@ -1687,6 +1691,23 @@ code {
 }
 .tile__cap { font-size: var(--fs-small); color: var(--text-muted); }
 .report__hint { flex: 1; font-size: var(--fs-small); color: var(--text-muted); }
+
+/* Где отчёт и пакет. Пути фактические и длинные (каталог сессии на шаре или
+   на флешке): переносим в любом месте, иначе таблица уезжает вбок и путь,
+   ради которого блок существует, читается только прокруткой. */
+.report-files__table td.mono { overflow-wrap: anywhere; word-break: break-word; }
+.report-files__table td:first-child { white-space: nowrap; font-weight: 600; }
+.report-files__note {
+  margin: var(--space-3) 0;
+  font-size: var(--fs-small);
+  line-height: var(--lh-body);
+  color: var(--text-muted);
+}
+.report-files__note .mono { color: var(--text-primary); overflow-wrap: anywhere; }
+
+/* Передача доказательств деградировала: тот же .alert, тон предупреждения. */
+.alert--warn { --tone: var(--warning); }
+.sheet .alert--warn { border-color: var(--warning); }
 
 /* ------------------------- вклад в оценку (.bars) ------------------------- */
 /* Цвет полосы приходит из app.js (T.colorFor) — он дублирует число справа. */

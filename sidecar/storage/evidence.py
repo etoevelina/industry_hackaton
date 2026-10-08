@@ -30,12 +30,25 @@ JPEG-кадров, а на диск попадает только то, что �
    сохраняется только полный кадр, он и является доказательством «в комнате
    есть второй человек».
 3. Лица людей, не являющихся субъектом экзамена, размываются на сохраняемом
-   кадре, если вызывающая сторона передала их регионы в `blur_regions`
-   (`EventEngine` знает bbox лишних лиц). Это осознанный компромисс: факт
-   присутствия второго человека фиксируется, его биометрия — нет.
+   кадре, если вызывающая сторона передала их регионы в `blur_regions`.
+   `sidecar/main.py` передаёт ВСЕ лица кадра, кроме основного (самого
+   крупного), — на снимке любого инцидента, а не только `SECOND_FACE`. Это
+   осознанный компромисс: факт присутствия второго человека фиксируется, его
+   биометрия — нет.
+   FaceMesh видит не больше `max_num_faces` лиц (по умолчанию 2), без
+   mediapipe не видит ни одного и пропускает мелкие лица. Поэтому каждый кадр
+   перед записью дополнительно проходит каскад Хаара OpenCV
+   (`fallback_face_boxes`, `plan_fallback_blur`): размываются все найденные
+   им лица, кроме совпавшего с основным. Каскад видит только лица анфас; если
+   нет и его, кадр всё равно пишется, а вызывающий помечает
+   `extra.blur = "unavailable"`.
    ВАЖНО: `save_clip()` размывать НЕ умеет — bbox известен только для кадра
    инцидента, а в клипе человек движется. Поэтому для инцидентов про посторонних
-   людей клип не запрашивается вообще (см. `_NO_CLIP_KINDS` в `sidecar/main.py`).
+   людей клип не запрашивается вообще (см. `_NO_CLIP_KINDS` в `sidecar/main.py`),
+   для любого инцидента клип не пишется, если в кадре больше одного лица или
+   лица считать нечем, а клип, «после» которого ещё набирается, снимается
+   `cancel_pending()`, как только в кадре появилось второе лицо: файл такого
+   клипа не создаётся вовсе.
    Если здесь появится покадровое размытие, запрет можно будет снять.
 4. Эмбеддинги лиц и голосов третьих лиц не вычисляются и не сохраняются.
    Эталон хранится только для самого студента и только на время сессии.
@@ -113,6 +126,12 @@ class _PendingClip:
     post: list[_BufferedFrame] = field(default_factory=list)
     max_post: int = 600
     done: bool = False
+    #: id события как его передал вызывающий (`event_id` выше — очищенный для
+    #: имени файла) и вид события: нужны записи `clip_cancelled`.
+    source_id: str = ""
+    kind: str = ""
+    #: Клип снят `cancel_pending()` — в запись он не уходит никогда.
+    cancelled: bool = False
 
     def ready(self, now: float) -> bool:
         return now >= self.deadline or len(self.post) >= self.max_post
@@ -174,6 +193,8 @@ class EvidenceRecorder:
         self._session_dir: Path | None = None
         self._errors: list[str] = []
         self._written: list[dict[str, Any]] = []
+        #: Сколько клипов снято `cancel_pending()` за жизнь рекордера.
+        self._cancelled_total = 0
 
         # фоновая запись файлов, чтобы не блокировать поток камеры
         self._jobs: "queue.Queue[_PendingClip | None]" = queue.Queue(maxsize=32)
@@ -210,8 +231,17 @@ class EvidenceRecorder:
     # --------------------------------------------------------------- сессия
     def set_session_dir(self, session_dir: str | Path | None) -> None:
         """Переключить каталог сессии. Старый буфер сбрасывается."""
+        # Клипы прошлой сессии дописываются ДО захвата лока: фоновый писатель
+        # в конце записи берёт тот же лок (`_written`), и ожидание под ним
+        # стояло бы до таймаута flush (10 с) — на столько задерживался бы
+        # старт следующей сессии. Но пока идёт flush, приём новых клипов
+        # закрыт (каталога нет, save_clip отвечает «каталог сессии не задан»):
+        # иначе клип события новой сессии, зарегистрированный в эти секунды,
+        # лёг бы в каталог прошлой.
         with self._lock:
-            self.flush(wait=True)
+            self._session_dir = None
+        self.flush(wait=True)
+        with self._lock:
             self._frames.clear()
             self._bytes = 0
             self._session_dir = Path(str(session_dir)) if session_dir else None
@@ -306,6 +336,7 @@ class EvidenceRecorder:
                 "dropped": self._dropped,
                 "pending_clips": sum(1 for c in self._pending if not c.done),
                 "written": len(self._written),
+                "cancelled_clips": self._cancelled_total,
                 "errors": list(self._errors[-5:]),
                 "available": self.available(),
             }
@@ -320,13 +351,17 @@ class EvidenceRecorder:
         `_crop`. `blur_regions` — прямоугольники (лица посторонних), которые
         размываются перед записью (см. политику хранения в докстринге модуля).
         Возвращает словарь путей и фактический bbox либо None, если записать
-        не удалось.
+        не удалось. `cv2.imwrite` о неудаче не бросает исключение, а
+        возвращает False (нет места, нет прав, кодек), поэтому результат
+        проверяется у обоих файлов: путь к несуществующему файлу в
+        подписанной записи хуже, чем честное `write_failed`.
         """
         cv, _np = self._deps()
         if cv is None or frame_bgr is None:
             return None
         out = Path(str(out_path))
         stamp = time.time() if ts is None else float(ts)
+        crop_path: Path | None = None
         try:
             out.parent.mkdir(parents=True, exist_ok=True)
             full = frame_bgr.copy()
@@ -343,7 +378,6 @@ class EvidenceRecorder:
                     full[y:y + h, x:x + w] = cv.GaussianBlur(roi, (k, k), 0)
 
             box = self._norm_bbox(bbox, fw, fh)
-            crop_path: Path | None = None
             if box is not None:
                 x, y, w, h = box
                 pad = max(8, int(0.08 * max(w, h)))
@@ -352,8 +386,9 @@ class EvidenceRecorder:
                 crop = full[cy0:cy1, cx0:cx1]
                 if crop.size:
                     crop_path = out.with_name(f"{out.stem}_crop{out.suffix or '.jpg'}")
-                    cv.imwrite(str(crop_path), crop,
-                               [int(cv.IMWRITE_JPEG_QUALITY), int(self.jpeg_quality)])
+                    if not cv.imwrite(str(crop_path), crop,
+                                      [int(cv.IMWRITE_JPEG_QUALITY), int(self.jpeg_quality)]):
+                        raise OSError(f"cv2.imwrite не записал кроп {crop_path.name}")
                 cv.rectangle(full, (x, y), (x + w, y + h), (0, 0, 255), 2)
 
             caption = label or ""
@@ -362,10 +397,18 @@ class EvidenceRecorder:
                 text = f"{text}  {caption}"
             self._draw_caption(cv, full, text)
 
-            cv.imwrite(str(out), full,
-                       [int(cv.IMWRITE_JPEG_QUALITY), int(self.jpeg_quality)])
+            if not cv.imwrite(str(out), full,
+                              [int(cv.IMWRITE_JPEG_QUALITY), int(self.jpeg_quality)]):
+                raise OSError(f"cv2.imwrite не записал кадр {out.name}")
         except Exception as exc:
             self._note_error(f"снимок не сохранён: {exc}")
+            # Кроп без кадра — осиротевший файл без записи в цепочке: убираем.
+            if crop_path is not None:
+                try:
+                    if crop_path.is_file():
+                        os.unlink(crop_path)
+                except OSError:
+                    pass
             return None
 
         result = {
@@ -381,7 +424,13 @@ class EvidenceRecorder:
 
     @staticmethod
     def _draw_caption(cv: Any, image: Any, text: str) -> None:
-        """Метка времени поверх кадра — читаемая на любом фоне."""
+        """Метка времени поверх кадра — читаемая на любом фоне.
+
+        `cv2.putText` рисует только ASCII (шрифты Hershey): кириллица выходит
+        строкой «?????». Поэтому подпись — код инцидента и вид события
+        латиницей (их собирает вызывающий), а всё прочее здесь отбрасывается.
+        """
+        text = " ".join(str(text or "").encode("ascii", "ignore").decode("ascii").split())
         if not text:
             return
         org = (8, max(18, int(image.shape[0] * 0.05)))
@@ -419,12 +468,14 @@ class EvidenceRecorder:
     # -------------------------------------------------------------- клипы
     def save_clip(self, event_id: str, pre_sec: float | None = None,
                   post_sec: float | None = None, out_path: str | Path | None = None,
-                  event_ts: float | None = None) -> str:
+                  event_ts: float | None = None, kind: str = "") -> str:
         """Зарегистрировать клип вокруг инцидента. Возвращает относительный путь.
 
         Файл появляется не сразу: часть «после» дописывается по мере прихода
         кадров, затем задача уходит в фоновый поток записи. Повторный вызов с
-        тем же `event_id` возвращает путь уже запланированного клипа.
+        тем же `event_id` возвращает путь уже запланированного клипа. Пока
+        окно «после» не закрыто, клип может быть снят `cancel_pending()` — тогда
+        файла не будет вовсе. `kind` — вид события, только для записи об отмене.
         """
         pre = self.clip_seconds * (2.0 / 3.0) if pre_sec is None else max(float(pre_sec), 0.0)
         post = self.clip_seconds * (1.0 / 3.0) if post_sec is None else max(float(post_sec), 0.0)
@@ -451,6 +502,7 @@ class EvidenceRecorder:
                 event_id=safe_id, out_path=target, rel_path=rel, event_ts=now,
                 deadline=now + post, pre=pre_frames,
                 max_post=int(max(post, 0.0) * self.fps) + 5,
+                source_id=str(event_id), kind=str(kind or ""),
             )
             self._pending.append(clip)
             # слишком много незакрытых клипов — старейший дописываем немедленно
@@ -458,6 +510,49 @@ class EvidenceRecorder:
             if len(alive) > self.max_pending:
                 self._promote(alive[0])
         return rel
+
+    def cancel_pending(self, reason: str = "") -> list[dict[str, Any]]:
+        """Снять все клипы, у которых окно «после» ещё не закрыто. Файлы не пишутся.
+
+        Зачем. Клип регистрируется в момент инцидента, а его «после» (треть
+        `clip_seconds`) добирается из следующих кадров. Правило «клип только при
+        одном лице» проверяется в момент регистрации — посторонний, вошедший
+        ПОСЛЕ события, уехал бы на диск незамытым: размывать видео рекордер не
+        умеет. Поэтому, как только в кадре появилось второе лицо, вызывающий
+        снимает все незакрытые клипы.
+
+        Что не трогается: клипы, уже отправленные в запись (`done`). Их окно
+        закрылось до этого кадра — кадров с посторонним в них нет.
+
+        Потокобезопасно: под тем же локом, что `push()` и `save_clip()`, поэтому
+        кадр, на котором заметили второе лицо, в снятый клип попасть уже не
+        может. Возвращает описания снятых клипов (`event_id` — как его передали
+        в `save_clip`, `kind`, `rel_path`, `event_ts`, `reason`, `cancelled_at`);
+        пустой список — снимать было нечего.
+        """
+        now = time.time()
+        out: list[dict[str, Any]] = []
+        with self._lock:
+            for clip in self._pending:
+                if clip.done:
+                    continue
+                clip.done = True
+                clip.cancelled = True
+                # Кадры клипа больше не нужны: память буфера отдаём сразу.
+                clip.pre = []
+                clip.post = []
+                out.append({
+                    "event_id": clip.source_id or clip.event_id,
+                    "kind": clip.kind,
+                    "rel_path": clip.rel_path,
+                    "event_ts": clip.event_ts,
+                    "reason": str(reason or ""),
+                    "cancelled_at": now,
+                })
+            if out:
+                self._pending = [c for c in self._pending if not c.done]
+                self._cancelled_total += len(out)
+        return out
 
     def _promote_ready(self, now: float) -> None:
         for clip in list(self._pending):
@@ -500,6 +595,8 @@ class EvidenceRecorder:
 
     def _write_clip(self, clip: _PendingClip) -> dict[str, Any] | None:
         """Собрать mp4 (fallback — avi/MJPG) из буферизованных кадров."""
+        if clip.cancelled:
+            return None  # снят cancel_pending(): файла не должно быть
         cv, np = self._deps()
         frames = list(clip.pre) + [f for f in clip.post if f.ts > (clip.pre[-1].ts if clip.pre else 0.0)]
         if cv is None or np is None or not frames:
@@ -613,4 +710,206 @@ class EvidenceRecorder:
                 del self._errors[:-50]
 
 
-__all__ = ["EvidenceRecorder"]
+# ---------------------------------------------------------------------------
+# Запасной детектор лиц для размытия: каскад Хаара из поставки OpenCV
+#
+# Зачем. Посторонних на сохраняемом кадре размывают по рамкам FaceMesh, а он
+# видит не больше `max_num_faces` лиц (2 по умолчанию), пропускает мелкие, а
+# без mediapipe не видит никого — документированный деградированный режим.
+# Тогда кадр уехал бы на диск с чужими лицами как есть. Каскад Хаара лежит в
+# самом opencv-python (`cv2.data.haarcascades`), моделей не скачивает и на
+# кадре 640 px работает за десятки миллисекунд — его хватает, чтобы найти и
+# замыть лица, которые FaceMesh не посчитал. Запускается только в момент записи доказательства, не
+# на каждом кадре потока: кадры клипа им не проверяются. Ограничение: каскад
+# `frontalface` видит лица анфас; профиль и сильно повёрнутую голову он
+# пропускает (docs/LIMITATIONS.md).
+# ---------------------------------------------------------------------------
+#: Файл каскада в каталоге `cv2.data.haarcascades`.
+HAAR_CASCADE_FILE = "haarcascade_frontalface_default.xml"
+#: Каскад ищет лица на копии кадра не шире этого: быстрее, а точность рамки
+#: для размытия с запасом не нужна.
+HAAR_MAX_WIDTH = 640
+#: С какого IoU рамка каскада считается тем же лицом, что основное. Рамка
+#: FaceMesh идёт по точкам сетки (брови — подбородок), рамка каскада — квадрат
+#: со лбом, поэтому у одного и того же лица IoU обычно 0.4–0.7.
+HAAR_PRIMARY_MIN_IOU = 0.15
+
+_haar_lock = threading.Lock()
+_haar_state: dict[str, Any] = {"tried": False, "cv": None, "cascade": None, "error": ""}
+
+
+def _haar() -> tuple[Any, Any]:
+    """(cv2, CascadeClassifier): загружается лениво и один раз на процесс.
+
+    (None, None) — каскада нет (нет opencv, нет файла, файл не читается);
+    причина — в `fallback_error()`.
+    """
+    with _haar_lock:
+        if not _haar_state["tried"]:
+            _haar_state["tried"] = True
+            try:
+                import cv2  # type: ignore
+                base = str(getattr(getattr(cv2, "data", None), "haarcascades", "") or "")
+                path = os.path.join(base, HAAR_CASCADE_FILE)
+                if not base or not os.path.isfile(path):
+                    raise FileNotFoundError(f"нет файла каскада {path or HAAR_CASCADE_FILE}")
+                cascade = cv2.CascadeClassifier(path)
+                if cascade.empty():
+                    raise RuntimeError(f"каскад {HAAR_CASCADE_FILE} не загрузился")
+                _haar_state["cv"], _haar_state["cascade"] = cv2, cascade
+            except Exception as exc:
+                _haar_state["error"] = str(exc) or exc.__class__.__name__
+        return _haar_state["cv"], _haar_state["cascade"]
+
+
+def fallback_available() -> bool:
+    """Есть ли запасной детектор лиц (каскад Хаара)."""
+    return _haar()[1] is not None
+
+
+def fallback_error() -> str:
+    """Почему каскада нет ("" — есть или ещё не пробовали)."""
+    _haar()
+    return str(_haar_state.get("error") or "")
+
+
+def fallback_face_boxes(frame_bgr: Any) -> list[tuple[int, int, int, int]] | None:
+    """Лица анфас по каскаду Хаара: [(x, y, w, h), ...] в пикселях кадра.
+
+    Отсортированы по площади, крупнейшее первым. None — каскада нет или он
+    упал на этом кадре: для размытия это одно и то же «посчитать нечем», и
+    вызывающий обязан сказать об этом в доказательстве, а не промолчать.
+    """
+    cv, cascade = _haar()
+    if cv is None or cascade is None or frame_bgr is None:
+        return None
+    try:
+        fh, fw = int(frame_bgr.shape[0]), int(frame_bgr.shape[1])
+        if fh < 8 or fw < 8:
+            return []
+        image, scale = frame_bgr, 1.0
+        if fw > HAAR_MAX_WIDTH:
+            scale = HAAR_MAX_WIDTH / float(fw)
+            image = cv.resize(frame_bgr, (HAAR_MAX_WIDTH, max(int(fh * scale), 8)),
+                              interpolation=cv.INTER_AREA)
+        gray = cv.cvtColor(image, cv.COLOR_BGR2GRAY) if image.ndim == 3 else image
+        gray = cv.equalizeHist(gray)
+        side = max(24, int(min(gray.shape[0], gray.shape[1]) * 0.06))
+        # CascadeClassifier не обещает потокобезопасности, а кадр к событию
+        # снимают и CV-поток, и рабочий поток event loop.
+        with _haar_lock:
+            found = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4,
+                                             minSize=(side, side))
+        boxes: list[tuple[int, int, int, int]] = []
+        for item in (list(found) if len(found) else []):
+            x, y, w, h = (float(v) / scale for v in list(item)[:4])
+            box = EvidenceRecorder._norm_bbox((x, y, w, h), fw, fh) if w > 1.5 else None
+            if box is not None:
+                boxes.append(box)
+        boxes.sort(key=lambda b: b[2] * b[3], reverse=True)
+        return boxes
+    except Exception as exc:
+        with _haar_lock:
+            _haar_state["error"] = f"каскад упал на кадре: {exc}"
+        return None
+
+
+def _iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    ax1, ay1, bx1, by1 = a[0] + a[2], a[1] + a[3], b[0] + b[2], b[1] + b[3]
+    iw = max(0, min(ax1, bx1) - max(a[0], b[0]))
+    ih = max(0, min(ay1, by1) - max(a[1], b[1]))
+    inter = iw * ih
+    union = a[2] * a[3] + b[2] * b[3] - inter
+    return inter / float(union) if union > 0 else 0.0
+
+
+def _center_inside(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
+    """Центр рамки `a` внутри рамки `b`."""
+    cx, cy = a[0] + a[2] / 2.0, a[1] + a[3] / 2.0
+    return b[0] <= cx <= b[0] + b[2] and b[1] <= cy <= b[1] + b[3]
+
+
+def _same_face(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
+    """Две рамки разных детекторов — одно и то же лицо (см. HAAR_PRIMARY_MIN_IOU)."""
+    return _iou(a, b) >= HAAR_PRIMARY_MIN_IOU or _center_inside(a, b) or _center_inside(b, a)
+
+
+def _covers(a: tuple[int, int, int, int], b: tuple[int, int, int, int], share: float) -> bool:
+    """Пересечение рамок покрывает не меньше `share` площади `b`."""
+    iw = max(0, min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0]))
+    ih = max(0, min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1]))
+    area = b[2] * b[3]
+    return area > 0 and iw * ih >= share * area
+
+
+#: Доля площади основного лица, при которой рамка каскада считается той же
+#: головой: каскад нередко даёт на одном лице две вложенные или сдвинутые рамки.
+HAAR_SAME_HEAD_SHARE = 0.3
+
+
+def _same_head(box: tuple[int, int, int, int], ref: tuple[int, int, int, int]) -> bool:
+    """Рамка каскада — та же голова, что `ref` (дубль или рамка, обнимающая лицо)."""
+    return (_same_face(box, ref) or _covers(box, ref, HAAR_SAME_HEAD_SHARE)
+            or _covers(ref, box, HAAR_SAME_HEAD_SHARE))
+
+
+def plan_fallback_blur(frame_bgr: Any, primary_bbox: Any = None,
+                       known: list[Any] | None = None,
+                       face_ran: bool = False) -> dict[str, Any]:
+    """Какие лица замыть на кадре по каскаду Хаара.
+
+    Основное лицо (субъект экзамена) не размывается: это рамка каскада с
+    наибольшим IoU к `primary_bbox` (рамка основного лица от FaceMesh) — если
+    она хоть как-то с ним совпала (IoU не меньше `HAAR_PRIMARY_MIN_IOU` или
+    центр внутри рамки). Нет `primary_bbox` и FaceMesh не работает
+    (`face_ran=False`, режим без mediapipe) — основным считается самое крупное
+    лицо. FaceMesh на кадре работал, но лица не нашёл (`face_ran=True`) —
+    основного нет, размываются ВСЕ лица каскада: крупнейшее лицо тогда вполне
+    может оказаться посторонним. Дубли основного (вложенные и сдвинутые рамки
+    той же головы) не размываются и не считаются. Всё остальное, что нашёл каскад, — в
+    `others`: вызывающий объединяет их с «прочими» лицами FaceMesh (`known`);
+    размываются обе рамки, а `new` — сколько из `others` FaceMesh не видел
+    (для честного счётчика размытых лиц).
+
+    Возвращает {"available": bool, "faces": int, "others": [[x, y, w, h], ...],
+    "new": int, "primary": [x, y, w, h] | None}. available=False — каскада
+    нет, размывать по нему нечем.
+    """
+    boxes = fallback_face_boxes(frame_bgr)
+    if boxes is None:
+        return {"available": False, "faces": 0, "others": [], "new": 0, "primary": None}
+    keep: int | None = None
+    known_boxes: list[tuple[int, int, int, int]] = []
+    if boxes:
+        fh, fw = int(frame_bgr.shape[0]), int(frame_bgr.shape[1])
+        prim = (EvidenceRecorder._norm_bbox(primary_bbox, fw, fh)
+                if primary_bbox is not None else None)
+        if prim is not None:
+            best = 0.0
+            for idx, box in enumerate(boxes):
+                iou = _iou(box, prim)
+                if (iou >= HAAR_PRIMARY_MIN_IOU or _center_inside(box, prim)) and iou > best:
+                    best, keep = iou, idx
+        elif not face_ran:
+            keep = 0  # без FaceMesh крупнейшее — субъект экзамена
+        for item in (known or []):
+            norm = EvidenceRecorder._norm_bbox(item, fw, fh)
+            if norm is not None:
+                known_boxes.append(norm)
+        refs = [r for r in (prim, boxes[keep] if keep is not None else None) if r is not None]
+    else:
+        refs = []
+    others = [box for idx, box in enumerate(boxes)
+              if idx != keep and not any(_same_head(box, ref) for ref in refs)]
+    new = sum(1 for box in others if not any(_same_face(box, k) for k in known_boxes))
+    return {
+        "available": True,
+        "faces": len(boxes),
+        "others": [list(box) for box in others],
+        "new": new,
+        "primary": list(boxes[keep]) if keep is not None else None,
+    }
+
+
+__all__ = ["EvidenceRecorder", "fallback_available", "fallback_error",
+           "fallback_face_boxes", "plan_fallback_blur"]

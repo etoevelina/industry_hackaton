@@ -1210,6 +1210,206 @@ function examViewRect(inset, size) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Снимок окна экзамена к инциденту (docs/CONTRACT.md, «Снимок окна экзамена»)
+// ---------------------------------------------------------------------------
+/*
+ * Снимается ТОЛЬКО представление экзамена: страница LMS, если тест идёт в
+ * ней, иначе содержимое нашего окна. Рабочий стол, другие окна и
+ * desktopCapturer — никогда. Здесь — правила, проверяемые без Electron:
+ * когда снимать, как не снимать одно и то же трижды и как прочитать размер
+ * готового JPEG. Сам capturePage() — в shell/main.js.
+ */
+
+/**
+ * Пределы снимка. Ширина, качество и окно повтора — из контракта; 3 МБ —
+ * предел приёма у ядра (SCREEN_EVIDENCE_MAX_BYTES в sidecar/protocol.py):
+ * больше слать незачем, ядро всё равно отвергнет. 200 символов — столько ядро
+ * оставляет от текста ошибки. 4 с — сколько ждём capturePage(): обычно он
+ * отвечает за десятки миллисекунд, а ядро примет снимок и через 60 с, так что
+ * 4 с — с большим запасом, но не настолько, чтобы зависший снимок держал
+ * очередь событий.
+ */
+const SCREEN_EVIDENCE = Object.freeze({
+  maxWidth: 1280,
+  jpegQuality: 70,
+  reuseMs: 1500,
+  captureTimeoutMs: 4000,
+  maxBytes: 3 * 1024 * 1024,
+  errorMaxChars: 200,
+});
+
+/** Как назвать состояние в причине «не снято» — она ляжет в отчёт по-русски. */
+const SCREEN_STATE_LABELS = Object.freeze({
+  idle: 'ожидание',
+  consent: 'экран согласия',
+  preflight: 'предполётная проверка',
+  calibration: 'калибровка',
+  finished: 'экзамен завершён',
+});
+
+/**
+ * Можно ли снимать окно экзамена прямо сейчас.
+ *
+ * Правило то же, что у блокировок: только exam и paused. На согласии,
+ * проверке и калибровке вопроса и ответа на экране нет, а снимать там
+ * значило бы снимать студента до экзамена. Ядро просит снимок у каждого
+ * неслужебного события сессии — в том числе на калибровке, — поэтому отказ
+ * отвечается причиной, и отчёт пишет «экзамен не на экране», а не «снимка нет».
+ *
+ * @param {{sessionStarted?:boolean, examState?:string, quitting?:boolean}} s
+ * @returns {{capture:boolean, error:string}} error пуст и capture=false —
+ *   сессии нет: не снимать и не отвечать вовсе.
+ */
+function screenCaptureVerdict(s) {
+  const st = s || {};
+  if (st.quitting || !st.sessionStarted) return { capture: false, error: '' };
+  if (!isLockedState(st.examState)) {
+    const label = SCREEN_STATE_LABELS[st.examState] || String(st.examState || '—');
+    return { capture: false, error: `экзамен не на экране (${label})` };
+  }
+  return { capture: true, error: '' };
+}
+
+/** Начинаются ли байты с сигнатуры JPEG FF D8 FF — ровно то, что проверяет ядро. */
+function isJpeg(buf) {
+  return Boolean(buf) && buf.length >= 3
+    && buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF;
+}
+
+/**
+ * Размер JPEG в пикселях по маркеру SOF — то, что реально лежит в файле.
+ *
+ * Зачем не getSize() картинки: на HiDPI-экране NativeImage считает в DIP, и
+ * в журнал ушли бы ширина и высота вдвое меньше настоящих. Возвращает null,
+ * если маркер не найден.
+ */
+function jpegSize(buf) {
+  if (!isJpeg(buf)) return null;
+  let i = 2;
+  while (i + 3 < buf.length) {
+    if (buf[i] !== 0xFF) return null;               // сегменты идут подряд
+    const marker = buf[i + 1];
+    if (marker === 0xFF) { i += 1; continue; }      // байты-заполнители
+    if (marker === 0x01 || (marker >= 0xD0 && marker <= 0xD8)) { i += 2; continue; }
+    if (marker === 0xD9 || marker === 0xDA) return null;   // конец или данные до SOF
+    const len = (buf[i + 2] << 8) | buf[i + 3];
+    if (len < 2) return null;
+    // SOF0..SOF15, кроме DHT (C4), JPG (C8) и DAC (CC)
+    if (marker >= 0xC0 && marker <= 0xCF && marker !== 0xC4 && marker !== 0xC8
+        && marker !== 0xCC) {
+      if (i + 8 >= buf.length) return null;
+      const height = (buf[i + 5] << 8) | buf[i + 6];
+      const width = (buf[i + 7] << 8) | buf[i + 8];
+      return width > 0 && height > 0 ? { width, height } : null;
+    }
+    i += 2 + len;
+  }
+  return null;
+}
+
+/** Текст причины для отчёта: «capturePage не ответил за 4 с» (дробные — с запятой). */
+function captureTimeoutText(ms) {
+  const sec = Math.round(ms / 100) / 10;
+  return `capturePage не ответил за ${String(sec).replace('.', ',')} с`;
+}
+
+/**
+ * Не больше одного снимка в полёте и повтор байтов в окне reuseMs.
+ *
+ * Инциденты приходят пачками: один уход со страницы даёт WINDOW_BLUR, следом
+ * связку и событие окружения. Снимать окно на каждое — три одинаковых кадра и
+ * три параллельных capturePage(). Поэтому событие, пришедшее, пока снимок
+ * делается, ждёт ЕГО результата, а событие в пределах reuseMs от удачного
+ * снимка получает те же байты. Ответ ядру у каждого всё равно свой, со своим
+ * event_id, — это делает вызывающий. Неудачный снимок не повторяется по
+ * времени: следующее событие снимает заново.
+ *
+ * Таймаут timeoutMs: capturePage(), который не ответил, иначе держал бы
+ * «снимок в полёте» вечно — все следующие события ждали бы его, и до конца
+ * сессии ни одного снимка уже не было бы. По таймауту снимок отвечает
+ * `{error:'capturePage не ответил за 4 с', timedOut:true}` всем, кто его ждал,
+ * и сразу снимается с полёта: следующее событие начинает НОВЫЙ снимок. Если
+ * зависший capturePage() всё-таки ответит позже, его результат отбрасывается:
+ * ответ ядру уже ушёл, а кадр не того момента повторно раздавать нельзя.
+ *
+ * reset() — граница сессии: байты прошлой сессии новой не достаются, а снимок
+ * прошлой, ещё летящий, дожидаемся (не дольше timeoutMs) и снимаем заново.
+ *
+ * @param {() => Promise<object>} capture снимок {error?:string, ...}
+ * @param {{reuseMs?:number, timeoutMs?:number, now?:() => number,
+ *          setTimeout?:Function, clearTimeout?:Function}} [opts]
+ *   setTimeout/clearTimeout — для проверки без настоящих часов.
+ */
+function screenShotCoordinator(capture, opts) {
+  const o = opts || {};
+  const reuseMs = Number.isFinite(o.reuseMs) ? o.reuseMs : SCREEN_EVIDENCE.reuseMs;
+  const timeoutMs = Number.isFinite(o.timeoutMs) && o.timeoutMs > 0
+    ? o.timeoutMs : SCREEN_EVIDENCE.captureTimeoutMs;
+  const now = typeof o.now === 'function' ? o.now : Date.now;
+  const setTimer = typeof o.setTimeout === 'function' ? o.setTimeout : setTimeout;
+  const clearTimer = typeof o.clearTimeout === 'function' ? o.clearTimeout : clearTimeout;
+  // Сколько снимков, брошенных по таймауту, всё ещё висят в capturePage.
+  // Пока висят `maxHung` (по умолчанию 2), новый не начинается: каждый зависший держит
+  // кадр окна и потом ещё кодирует его в JPEG, а копить их без счёта нельзя.
+  const maxHung = Number.isFinite(o.maxHung) && o.maxHung > 0 ? o.maxHung : 2;
+  let inflight = null;   // {epoch, promise}
+  let last = null;       // {shot, at}
+  let epoch = 0;
+  let hung = 0;
+
+  function take() {
+    if (last && now() - last.at <= reuseMs) return Promise.resolve(last.shot);
+    if (inflight) {
+      if (inflight.epoch === epoch) return inflight.promise;
+      return inflight.promise.then(() => take());
+    }
+    if (hung >= maxHung) {
+      return Promise.resolve({ error: 'capturePage не отвечает (предыдущий снимок завис)', timedOut: true });
+    }
+    const mine = epoch;
+    let abandoned = false;
+    const shot = Promise.resolve()
+      .then(() => capture())
+      .then(
+        (res) => (res && typeof res === 'object' ? res : { error: 'снимок не получен' }),
+        (err) => ({ error: `снимок не получен: ${String((err && err.message) || err)}` }),
+      );
+    // брошенный по таймауту снимок, когда всё-таки завершится, освобождает место
+    shot.then(() => { if (abandoned) hung -= 1; });
+    let entry = null;
+    let timer = null;
+    const expired = new Promise((resolve) => {
+      timer = setTimer(() => {
+        // С полёта снимаем сразу, до разрешения промиса: событие, пришедшее
+        // в этот же тик, уже начинает новый снимок, а не ждёт зависший.
+        if (inflight === entry) inflight = null;
+        abandoned = true;
+        hung += 1;
+        resolve({ error: captureTimeoutText(timeoutMs), timedOut: true });
+      }, timeoutMs);
+    });
+    const run = Promise.race([shot, expired]).then((res) => {
+      clearTimer(timer);
+      if (mine === epoch && !res.error) last = { shot: res, at: now() };
+      return res;
+    });
+    entry = { epoch: mine, promise: run };
+    inflight = entry;
+    run.then(() => {
+      if (inflight === entry) inflight = null;
+    });
+    return run;
+  }
+
+  function reset() {
+    epoch += 1;
+    last = null;
+  }
+
+  return { take, reset, busy: () => Boolean(inflight), hung: () => hung };
+}
+
 module.exports = {
   SHELL_STATES,
   WEAKENING_FLAGS,
@@ -1254,4 +1454,11 @@ module.exports = {
   examDenyText,
   examProfileHeadline,
   requestThrottle,
+
+  // --- снимок окна экзамена к инциденту ---
+  SCREEN_EVIDENCE,
+  screenCaptureVerdict,
+  isJpeg,
+  jpegSize,
+  screenShotCoordinator,
 };

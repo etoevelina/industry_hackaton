@@ -29,7 +29,7 @@ class MsgType(str, Enum):
     # sidecar -> shell
     HELLO = "hello"              # возможности сайдкара при подключении
     STATUS = "status"            # ~2 Гц: fps, живые признаки, состояние сессии
-    EVENT = "event"              # зафиксированный инцидент
+    EVENT = "event"              # зафиксированный инцидент (+ screen: bool, см. event_message)
     RISK = "risk"                # обновление risk-score с разложением
     CALIBRATION = "calibration"  # прогресс/результат калибровки
     VERDICT = "verdict"          # требование действия: warn / pause / lock
@@ -42,6 +42,11 @@ class MsgType(str, Enum):
     TELEMETRY = "telemetry"        # поток из renderer: клавиатура/ответы (для fusion)
     SHELL_EVENT = "shell_event"    # инцидент, замеченный оболочкой (blur, хоткей, мониторы)
     COMMAND = "command"            # {"name": <COMMAND_NAMES>, ...}
+    #: Снимок ОКНА ЭКЗАМЕНА к событию, разосланному с `screen: true`:
+    #: {"event_id", "mime", "data_b64", "width", "height", "captured_at",
+    #: "source"} или, если снять не удалось, то же без `data_b64` и с `error`.
+    #: Снимается только представление экзамена, не рабочий стол.
+    SCREEN_EVIDENCE = "screen_evidence"
 
 
 #: Полный словарь команд оболочки. `proctor_lock` / `proctor_release` — решение
@@ -166,6 +171,32 @@ class EventKind(str, Enum):
     RISK_RESET = "RISK_RESET"
 
 
+#: Служебные записи — описание условий наблюдения, а не наблюдение за
+#: студентом. Каноническая копия набора, который отчёт держит как
+#: `SERVICE_KINDS` (storage/report.py): в таблицу инцидентов, в таймлайн и в
+#: integrity score они не идут, кадр камеры и снимок окна экзамена к ним не
+#: снимаются (`evidence_skipped = "service"`). `EXAM_PROFILE` — имя из
+#: журналов прежних версий, вида с таким значением в EventKind больше нет.
+#:
+#: Решения над экзаменом (LOCK_REVIEW_REQUESTED, PROCTOR_DECISION, RISK_RESET)
+#: сюда НЕ входят: вес у них нулевой, но кадр момента решения — доказательство.
+SERVICE_EVENT_KINDS: frozenset[str] = frozenset({
+    EventKind.SESSION_STARTED.value,
+    EventKind.SESSION_ENDED.value,
+    EventKind.CALIBRATION_DONE.value,
+    EventKind.SHELL_CONFIG.value,
+    EventKind.EXAM_PROFILE_APPLIED.value,
+    EventKind.EXAM_PROFILE_ABSENT.value,
+    EventKind.EXAM_PROFILE_SEARCH_ALLOWED.value,
+    "EXAM_PROFILE",
+})
+
+
+def is_service_kind(kind: Any) -> bool:
+    """Служебная ли запись (см. SERVICE_EVENT_KINDS). Принимает EventKind и строку."""
+    return str(getattr(kind, "value", kind) or "").strip().upper() in SERVICE_EVENT_KINDS
+
+
 #: Вклад события в risk-score. Подбирается эмпирически, меняется только здесь.
 RISK_WEIGHTS: dict[EventKind, float] = {
     EventKind.PHONE_IN_FRAME: 25.0,
@@ -212,8 +243,9 @@ RISK_WEIGHTS: dict[EventKind, float] = {
     # получил, и ценность записи в доказательстве попытки. Рядом стоят
     # DEVTOOLS_ATTEMPT (25) и WINDOW_BLUR (15): это тот же класс «намеренное
     # действие в обход правил, остановленное оболочкой». 20 даёт severity
-    # medium, то есть эпизод попадает и в отчёт, и в сохранение кадра
-    # (`evidence_min_severity = "medium"`). Арифметика осознанная и проверена:
+    # medium, то есть эпизод попадает и в отчёт, и в запись клипа
+    # (`evidence_min_severity = "medium"`; кадр камеры снимается к любому
+    # неслужебному событию). Арифметика осознанная и проверена:
     # три отдельные попытки подряд дают 52-58 при полураспаде 90 с и пороге
     # приостановки 60 — экзамен подходит к краю, но переводит его в ожидание
     # проктора ЧЕТВЁРТАЯ попытка, а не третья. Больше ставить нельзя: внешняя ссылка в тексте
@@ -618,10 +650,58 @@ def cap_auto_action(action: VerdictAction, auto_lock: bool = False) -> VerdictAc
     return action
 
 
+#: Почему к событию НЕТ кадра камеры: значение `detail["evidence_skipped"]`.
+#: Ставит только ядро (из `shell_event` это поле снимается на границе сокета),
+#: и ставит ДО записи в хеш-цепочку — причина отсутствия кадра входит в
+#: подписанное тело события так же, как путь к кадру.
+EVIDENCE_SKIP_SERVICE = "service"            # служебная запись, кадр не нужен
+#: Камеры нет: --headless, --mock, нет opencv — или устройство в этом процессе
+#: не отдало ни одного кадра (не подключено, занято, доступ не выдан).
+EVIDENCE_SKIP_NO_CAMERA = "no_camera"
+#: Камера кадры отдавала, но последний старше EVIDENCE_FRAME_MAX_AGE: пропала.
+EVIDENCE_SKIP_STALE = "stale_frame"
+EVIDENCE_SKIP_WRITE_FAILED = "write_failed"  # файл кадра не записался
+EVIDENCE_SKIP_NOT_RECORDING = "not_recording"  # сессия не пишется
+#: Кадр выключен КОНФИГУРАЦИЕЙ: `save_evidence = false` или severity ниже
+#: `evidence_frame_min_severity`. При настройках по умолчанию не возникает.
+EVIDENCE_SKIP_DISABLED = "disabled"
+EVIDENCE_SKIP_REASONS: tuple[str, ...] = (
+    EVIDENCE_SKIP_SERVICE, EVIDENCE_SKIP_NO_CAMERA, EVIDENCE_SKIP_STALE,
+    EVIDENCE_SKIP_WRITE_FAILED, EVIDENCE_SKIP_NOT_RECORDING, EVIDENCE_SKIP_DISABLED,
+)
+#: Кадр камеры старше этого (секунд) к событию не прикладывается: он показал
+#: бы не момент события, а то, что было до потери камеры.
+EVIDENCE_FRAME_MAX_AGE = 2.0
+
+#: `evidence.extra.clip_skipped` — почему к событию, которому клип положен по
+#: severity и виду, клипа нет. Размывать видео рекордер не умеет, поэтому клип
+#: пишется только тогда, когда в кадре заведомо одно лицо.
+CLIP_SKIP_MULTIPLE_FACES = "multiple_faces"  # второе лицо в кадре или в последние clip_seconds
+CLIP_SKIP_FACES_UNKNOWN = "faces_unknown"    # FaceMesh недоступен: лица считать нечем
+#: Запись `control` в хеш-цепочке о клипе, снятом до записи файла:
+#: {event_id, kind, reason, at}. Клип уже назван в `evidence.clip_path`
+#: события, но файла нет и не будет.
+CLIP_CANCELLED_CONTROL = "clip_cancelled"
+#: Причина в `clip_cancelled`: посторонний вошёл в кадр, пока набиралось «после».
+CLIP_CANCEL_MULTIPLE_FACES_AFTER = "multiple_faces_after"
+#: `evidence.extra.blur` — как искались лица сверх рамок FaceMesh на кадре,
+#: ушедшем на диск. "haar" — кадр прошёл запасной каскад Хаара OpenCV, его
+#: лица (кроме основного) размыты вместе с «прочими» лицами FaceMesh.
+#: "unavailable" — каскада нет: кадр записан, лица, которых не увидел FaceMesh
+#: (а без mediapipe — все), НЕ размыты. Поля нет — кадр записан до этого
+#: правила.
+BLUR_HAAR = "haar"
+BLUR_UNAVAILABLE = "unavailable"
+
+
 @dataclass
 class Evidence:
-    """Доказательство инцидента. Пути — относительно каталога сессии."""
-    frame_path: str | None = None          # jpeg-кроп момента
+    """Доказательство инцидента. Пути — относительно каталога сессии.
+
+    `extra["frame_ts"]` — время кадра камеры (epoch, с), когда кадр приложен:
+    у событий оболочки и окружения оно не совпадает с `ts` события.
+    """
+    frame_path: str | None = None          # jpeg-кадр момента
     clip_path: str | None = None           # 15-секундный клип вокруг момента
     bbox: list[float] | None = None        # [x, y, w, h] в пикселях кадра
     extra: dict[str, Any] = field(default_factory=dict)
@@ -666,8 +746,25 @@ def decode(raw: str | bytes) -> dict[str, Any]:
     return json.loads(raw)
 
 
-def event_message(event: ProctorEvent) -> dict[str, Any]:
-    return envelope(MsgType.EVENT, event=event.to_dict())
+def event_message(event: ProctorEvent, screen: bool = False) -> dict[str, Any]:
+    """Сообщение `event`. `screen=True` — оболочка снимает окно экзамена и
+    отвечает `screen_evidence` с `event_id` этого события. Ядро ставит его
+    каждому НЕслужебному событию, пока сессия пишется."""
+    return envelope(MsgType.EVENT, event=event.to_dict(), screen=bool(screen))
+
+
+#: Пределы приёма `screen_evidence` (проверяет ядро, а не оболочка).
+SCREEN_EVIDENCE_MAX_BYTES = 3 * 1024 * 1024   # после декодирования base64
+SCREEN_EVIDENCE_MAX_AGE = 60.0                # с момента рассылки события, с
+SCREEN_EVIDENCE_SOURCES: tuple[str, ...] = ("exam_view", "main_window")
+#: Имя записи `control` в хеш-цепочке со снимком окна экзамена.
+SCREEN_EVIDENCE_CONTROL = "evidence_screen"
+#: Потолок одного WS-кадра на транспорте: снимок предельного размера в base64
+#: плюс конверт. Сообщение больше max_size библиотека не отклоняет, а рвёт
+#: соединение (1009), поэтому потолок выше проверки ядра. Предел для всех
+#: ОСТАЛЬНЫХ сообщений — `ws_max_message` конфига (1 МиБ): больше ядро их не
+#: обрабатывает, а пишет отказ в лог.
+WS_TRANSPORT_MAX_BYTES = (SCREEN_EVIDENCE_MAX_BYTES * 4) // 3 + (64 << 10)
 
 
 # ---------------------------------------------------------------------------

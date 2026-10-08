@@ -121,10 +121,28 @@
               'Без кадров и звука.'
     },
     {
+      // Кадр — к каждому инциденту (evidence_frame_min_severity = "info"),
+      // клип — от средней важности и выше, включая критические
+      // (evidence_min_severity = "medium"), и никогда, если в кадре больше
+      // одного лица или число лиц неизвестно: размыть постороннего в видео
+      // нечем (docs/CONTRACT.md, «Кадр камеры»). Посторонний, появившийся уже
+      // после события, отменяет начатый клип (control/clip_cancelled).
       signal: 'Кадр и клип инцидента',
       mode: 'yes',
-      detail: 'Сохраняются только в момент зафиксированного инцидента: обрезанный кадр и ' +
-              'короткий клип вокруг события, в каталоге сессии на этом компьютере.'
+      detail: 'Сохраняются только в момент зафиксированного инцидента: кадр с камеры — ' +
+              'к каждому инциденту, короткий клип вокруг события — к инцидентам средней ' +
+              'важности и выше, если в кадре одно лицо. Лежат в каталоге сессии на этом компьютере.'
+    },
+    {
+      // Снимок делает оболочка через webContents.capturePage() — только
+      // представление экзамена, никогда не desktopCapturer (shell/main.js,
+      // «Снимок окна экзамена к инциденту»).
+      signal: 'Снимок окна теста',
+      mode: 'yes',
+      detail: 'Только в момент инцидента и только окно теста: страница экзамена или окно ' +
+              'этой программы. На снимке видны вопрос и ваш ответ в этот момент. Рабочий стол, ' +
+              'другие окна и программы не снимаются никогда. Снимок лежит в каталоге сессии ' +
+              'рядом с кадром и попадает в отчёт.'
     },
     {
       // Эталон — вектор признаков в памяти сайдкара (detectors/identity.py):
@@ -156,10 +174,13 @@
               'Текст, набранный в других окнах, физически недоступен.'
     },
     {
+      // Раньше здесь стояло «не пишется» и «ответ остаётся в окне теста».
+      // Со снимком окна к инциденту это неправда: ответ виден на снимке.
       signal: 'Текст вашего ответа',
-      mode: 'no',
-      detail: 'Из поля ответа наружу уходит только длина в символах. ' +
-              'Сам ответ остаётся в окне теста.'
+      mode: 'yes',
+      detail: 'Текстом не передаётся: из поля ответа в журнал уходит только длина в символах. ' +
+              'Но на снимке окна теста при инциденте виден ваш ответ таким, каким он был в этот ' +
+              'момент.'
     },
     {
       // «не пишется» относится к самому звуку и расшифровке: факт речи при
@@ -172,16 +193,20 @@
               'там же до конца сессии; в посекундную сводку попадают только числа.'
     },
     {
+      // «не пишется» — про сам буфер. Вставленное в поле ответа — уже часть
+      // ответа и видно на снимке окна теста (строка «Текст вашего ответа»).
       signal: 'Содержимое буфера обмена',
       mode: 'no',
-      detail: 'Текст не сохраняется и никуда не передаётся. Во время теста буфер ' +
+      detail: 'Текст из буфера не сохраняется и никуда не передаётся. Во время теста буфер ' +
               'очищается раз в 1,5 с; если в нём что-то было, фиксируются только факт ' +
-              'и длина в символах.'
+              'и длина в символах. Вставленное в поле ответа видно на снимке окна теста, ' +
+              'как и весь ответ.'
     },
     {
-      signal: 'Экран и другие окна',
+      signal: 'Рабочий стол и другие окна',
       mode: 'no',
-      detail: 'Снимков экрана нет, список открытых файлов и окон не собирается.'
+      detail: 'Снимается только окно теста и только при инциденте (см. выше). Рабочий стол, ' +
+              'другие окна и программы не снимаются; список открытых файлов и окон не собирается.'
     },
     {
       signal: 'Проверки окружения',
@@ -574,6 +599,18 @@
     } catch (e) { return false; }
   };
 
+  /**
+   * Открыть отчёт сессии браузером по умолчанию. Путь знает main-процесс
+   * (со слов ядра), он же откажет, пока сессия не закрыта. Ответ —
+   * {ok, reason?, message?, path?}; без моста — null.
+   */
+  Bridge.prototype.openReport = function () {
+    if (!this.api || typeof this.api.openReport !== 'function') return Promise.resolve(null);
+    try {
+      return Promise.resolve(this.api.openReport()).catch(function () { return null; });
+    } catch (e) { return Promise.resolve(null); }
+  };
+
   /** Закрыть программу (отказ от согласия). Без моста — false. */
   Bridge.prototype.exit = function (reason) {
     if (!this.api || typeof this.api.exit !== 'function') return false;
@@ -629,6 +666,10 @@
     this.preflightOverride = null;
     // Идёт ли экзамен на чужой странице (LMS) вместо локального мок-теста.
     this.externalExam = false;
+    // Где лежат отчёт и пакет (shellStatus().sessionReport от main-процесса):
+    // каталог сессии, код, деградация передачи, готовность файлов по диску.
+    this.sessionFiles = null;
+    this._sessionFilesSig = '';
   }
 
   /** Экранирование: своё, если hud.js не отдал общий помощник. */
@@ -1082,6 +1123,11 @@
      */
     var fromShell = st.sidecar && pickSidecarCaps(st.sidecar.capabilities);
     if (fromShell) this._applyCaps(fromShell);
+    // Где отчёт и пакет: приходит раз в секунду, перерисовываем только по
+    // изменению — иначе таблица на экране отчёта мигала бы каждую секунду.
+    if (st.sessionReport && typeof st.sessionReport === 'object') {
+      this._applySessionFiles(st.sessionReport);
+    }
     // Состояние защищённого режима приходит и отдельным событием, и здесь:
     // статус оболочки — страховка на случай, если renderer загрузился позже
     // первого push и пропустил его.
@@ -2166,7 +2212,9 @@
     setText('report-level', lv.text);
     setText('report-incidents', String(sum.total));
     setText('report-high', String(sum.high));
-    setText('report-session', this.sessionId || '—');
+    // Номер сессии и где лежат файлы — из того, что сообщило ядро; там же
+    // предупреждение о деградированной передаче.
+    this._renderReportFiles();
 
     var dur = this.examResult ? this.examResult.elapsed_ms : (Date.now() - this.sessionStartedAt);
     setText('report-duration', fmtDuration(dur));
@@ -2335,19 +2383,150 @@
     box.innerHTML = html;
   };
 
+  // --- где отчёт и пакет ---
+
+  /** Сведения о файлах сессии от main-процесса. Перерисовка — только по изменению. */
+  App.prototype._applySessionFiles = function (info) {
+    var sig;
+    try { sig = JSON.stringify(info); } catch (e) { sig = String(Date.now()); }
+    if (sig === this._sessionFilesSig) return;
+    this._sessionFilesSig = sig;
+    this.sessionFiles = info;
+    if (this.screen === 'report') this._renderReportFiles();
+  };
+
+  /**
+   * Финальный экран: код сессии, где лежат отчёт и пакет, готовы ли они, и
+   * громкое предупреждение, если передача деградировала.
+   *
+   * Пути — ФАКТИЧЕСКИЕ, со слов ядра (main.js: sessionReportInfo), а не
+   * шаблон: человек у машины должен знать, какой файл забрать, без поиска.
+   * Нет сведений (ядро недоступно, демо-режим) — так и написано, кнопка
+   * «Открыть отчёт» выключена.
+   */
+  App.prototype._renderReportFiles = function () {
+    var f = this.sessionFiles;
+    var self = this;
+    var known = Boolean(f && (f.sessionDir || f.packagePath || f.ended));
+
+    // --- номер сессии: код сверки от ядра, иначе локальная метка ---
+    var code = f && f.sessionCode ? String(f.sessionCode) : '';
+    setText('report-session', code || this.sessionId || '—');
+    setText('report-session-cap', code ? 'код сессии' : 'номер сессии');
+
+    // --- деградация передачи ---
+    var warn = el('report-handover');
+    if (warn) {
+      warn.hidden = !(f && f.degradedHandover);
+      if (f && f.degradedHandover) {
+        var why = f.handoverReason ? ' Причина: ' + f.handoverReason + '.' : '';
+        setText('report-handover-text',
+          'Каталог, который задал проктор, был недоступен, и сессия записана в запасной ' +
+          'каталог на этом компьютере' + (f.sessionDir ? ' (' + f.sessionDir + ')' : '') + '.' +
+          why + ' Передайте проктору пакет вручную' +
+          (f.packagePath ? ': ' + f.packagePath : '') +
+          (code ? '. Код сессии ' + code + ' — по нему проктор сверит пакет.' : '.'));
+      }
+    }
+
+    // --- таблица файлов ---
+    var body = el('report-files-body');
+    if (body) {
+      var rows = [];
+      if (!known) {
+        var demo = this.demoMode || !this.bridge.available;
+        rows.push(['Итоговый отчёт', '—', demo
+          ? 'ядро недоступно: отчёт в этой сессии не собирался'
+          : 'ждём ответа ядра: каталог сессии ещё не сообщён']);
+      } else {
+        var reportState;
+        if (f.reportReady) reportState = 'готов';
+        else if (f.ended) reportState = 'собирается…';
+        else reportState = 'появится после завершения сессии';
+        rows.push(['Итоговый отчёт', f.reportPath || '—', reportState]);
+
+        var pkgState;
+        if (f.packageReady) pkgState = 'собран: отчёт, журнал, кадры, снимки окна, manifest.json';
+        else if (f.packageOk === false) {
+          pkgState = 'не собран' + (f.packageMessage ? ': ' + f.packageMessage : '') +
+                     '. Забирайте каталог сессии целиком';
+        } else if (f.ended) pkgState = 'собирается после отчёта…';
+        else pkgState = 'соберётся после отчёта';
+        rows.push(['Пакет для проктора', f.packagePath || '—', pkgState]);
+
+        rows.push(['Каталог сессии', f.sessionDir || '—',
+          'журнал evidence.sqlite с хеш-цепочкой; кадры, клипы и снимки окна теста — в evidence/']);
+      }
+      body.innerHTML = rows.map(function (r) {
+        return '<tr><td>' + self._esc(r[0]) + '</td>' +
+               '<td class="mono">' + self._esc(r[1]) + '</td>' +
+               '<td>' + self._esc(r[2]) + '</td></tr>';
+      }).join('');
+    }
+
+    // --- кнопка «Открыть отчёт» и подсказка ---
+    var btn = el('btn-report');
+    if (btn) btn.disabled = !(f && f.canOpen);
+    var hint = el('report-hint');
+    if (hint && !this._reportHintPinned) {
+      var text;
+      if (!known) {
+        text = (this.demoMode || !this.bridge.available)
+          ? 'Ядро недоступно — отчёт не собирался.'
+          : 'Отчёт собирается локально, рядом с доказательствами.';
+      } else if (f.canOpen) {
+        text = 'Отчёт готов: откроется браузером по умолчанию.';
+      } else if (f.ended) {
+        text = 'Ядро собирает отчёт и пакет — кнопка включится, когда файл будет на месте.';
+      } else {
+        text = 'Отчёт соберётся после завершения сессии.';
+      }
+      hint.textContent = text;
+    }
+  };
+
   App.prototype._wireReport = function () {
     var self = this;
+    var hint = function (text) {
+      var node = el('report-hint');
+      if (!node) return;
+      node.textContent = text;
+      // Ответ на нажатие не затирается ежесекундным обновлением состояния.
+      self._reportHintPinned = true;
+      clearTimeout(self._reportHintTimer);
+      self._reportHintTimer = setTimeout(function () {
+        self._reportHintPinned = false;
+        if (self.screen === 'report') self._renderReportFiles();
+      }, 8000);
+    };
+
     var btn = el('btn-report');
-    if (!btn) return;
-    btn.addEventListener('click', function () {
-      var ok = self.bridge.sendCommand('export_report');
-      var hint = el('report-hint');
-      if (hint) {
-        hint.textContent = ok
-          ? 'Запрошена сборка отчёта: HTML-файл появится в каталоге сессии ' + (self.sessionId || '') + '.'
-          : 'Ядро недоступно — отчёт собрать нельзя. Файлы сессии остаются в каталоге evidence.';
-      }
-    });
+    if (btn) {
+      btn.addEventListener('click', function () {
+        if (btn.disabled) return;
+        self.bridge.openReport().then(function (res) {
+          if (!res) {
+            hint('Открыть отчёт отсюда нельзя: оболочка недоступна. Файл лежит в каталоге сессии.');
+          } else if (res.ok) {
+            hint('Отчёт открыт браузером по умолчанию: ' + (res.path || 'report.html') + '.');
+          } else {
+            hint(String(res.message || 'Отчёт открыть не удалось.'));
+          }
+        });
+      });
+    }
+
+    // Прежнее поведение кнопки — пересборка отчёта и пакета ядром (команда
+    // export_report). Не открывает файл, поэтому и называется иначе.
+    var rebuild = el('btn-report-rebuild');
+    if (rebuild) {
+      rebuild.addEventListener('click', function () {
+        var ok = self.bridge.sendCommand('export_report');
+        hint(ok
+          ? 'Запрошена пересборка: ядро соберёт отчёт и пакет заново в каталоге сессии.'
+          : 'Ядро недоступно — пересобрать отчёт нельзя. Файлы сессии остаются в её каталоге.');
+      });
+    }
   };
 
   // ------------------------------------------------------------------ старт

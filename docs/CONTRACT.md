@@ -9,12 +9,18 @@ WebSocket-сервер поднимает **сайдкар** на `ws://127.0.0.
 как клиент и переподключается с бэкоффом. JSON, один объект на сообщение, конверт:
 `{"v":1,"type":<MsgType>,"ts":<float>, ...payload}`.
 
+Размер сообщения shell -> sidecar: не больше `ws_max_message` (1 МиБ, `config.py`) для
+всех типов, кроме `screen_evidence`. Больше — ядро сообщение не обрабатывает: пишет отказ в
+лог и отвечает `error` с `code:"too_large"`, соединение остаётся. Транспортный потолок кадра
+выше — `WS_TRANSPORT_MAX_BYTES` (`protocol.py`, ~4 МиБ + 64 КиБ): ради снимка окна экзамена
+до 3 МБ в base64. Сообщение больше потолка библиотека не отклоняет, а рвёт соединение (1009).
+
 ### sidecar -> shell
 | type | payload |
 |---|---|
 | `hello` | `{capabilities:{vision:bool,gaze:bool,identity:bool,audio:bool,env:bool}, version:str}` |
 | `status` | `{fps:float, face_present:bool, face_count:int, gaze:{yaw:float,pitch:float,zone:str}, phone:bool, identity_ok:bool, audio_ok:bool, risk:float, state:str}` |
-| `event` | `{event:<ProctorEvent.to_dict()>}` |
+| `event` | `{event:<ProctorEvent.to_dict()>, screen:bool}` — `screen:true` у каждого неслужебного события, пока сессия пишется: оболочка снимает окно экзамена и отвечает `screen_evidence` (см. «Доказательства к инциденту») |
 | `risk` | `{score:float, level:str, breakdown:[{kind,contribution,count}], action:<VerdictAction>, requested_action:<VerdictAction>, review_required:bool}` |
 | `calibration` | `{stage:str, progress:float, done:bool, result:dict}` |
 | `verdict` | `{action:<VerdictAction>, reason:str, score:float, requested_action:<VerdictAction>, review_required:bool, review:<Review>\|absent, decided_by:str\|absent}` |
@@ -29,6 +35,7 @@ WebSocket-сервер поднимает **сайдкар** на `ws://127.0.0.
 | `telemetry` | `{kind:"keystroke"\|"paste"\|"answer_submit"\|"question_shown", question_id:str, ...}` |
 | `shell_event` | `{kind:<EventKind>, detail:dict}` — оболочка шлёт уже готовый EventKind |
 | `command` | `{name:"snapshot"\|"reset_risk"\|"export_report"\|"proctor_lock"\|"proctor_release", actor:str, reason:str}` |
+| `screen_evidence` | `{event_id:str, mime:"image/jpeg", data_b64:str, width:int, height:int, captured_at:float, source:"exam_view"\|"main_window"}` — или без `data_b64` и с `error:str`, если снять окно не удалось |
 
 ### Калибровка — детальнее
 - `gaze_center`, `identity`, `voice`: одно `calibrate` на этап, итог — `calibration` с `done:true`.
@@ -61,6 +68,120 @@ WebSocket-сервер поднимает **сайдкар** на `ws://127.0.0.
 - `paste`: `{question_id, ts, length:int, source:"clipboard"}`
 - `answer_submit`: `{question_id, ts, length:int, time_to_answer_ms:int, typing_stats:{mean_ms,std_ms,chars}}`
 - `question_shown`: `{question_id, ts, difficulty:int}`
+
+## Доказательства к инциденту: кадр камеры и снимок окна экзамена
+
+### Кадр камеры (сайдкар)
+
+К КАЖДОМУ событию, кроме служебных, ядро прикладывает кадр камеры **до** записи в
+хеш-цепочку: путь к кадру — часть подписанного тела события. Служебные виды —
+`SERVICE_EVENT_KINDS` (`sidecar/protocol.py`, каноническая копия `SERVICE_KINDS` отчёта):
+`SESSION_STARTED`, `SESSION_ENDED`, `CALIBRATION_DONE`, `SHELL_CONFIG`,
+`EXAM_PROFILE_APPLIED`, `EXAM_PROFILE_ABSENT`, `EXAM_PROFILE_SEARCH_ALLOWED` (и `EXAM_PROFILE`
+из журналов прежних версий).
+
+- События CV-потока получают кадр своего момента; остальные (оболочка, окружение, связки,
+  решения проктора) — последний кадр камеры (`_emit` -> `_ensure_frame`).
+- `evidence.frame_path` — кадр, `evidence.extra.frame_ts` — время кадра (epoch, с). У событий
+  оболочки оно не совпадает с `ts` события, поэтому отчёт показывает именно его.
+- На каждом сохранённом кадре размываются ВСЕ лица, кроме основного: «прочие» лица FaceMesh
+  (основное — самое крупное) и лица, найденные каскадом Хаара OpenCV
+  (`haarcascade_frontalface_default.xml` из `cv2.data.haarcascades`, `storage/evidence.py`,
+  `plan_fallback_blur`). Каскад проходит каждый кадр, уходящий на диск: FaceMesh видит не
+  больше `max_num_faces` лиц (2), пропускает мелкие, а без mediapipe не видит никого.
+  Основным у каскада считается лицо, совпавшее с рамкой основного лица FaceMesh (наибольший
+  IoU, не меньше 0.15, или центр внутри рамки); без FaceMesh — самое крупное.
+  - `extra.blurred_faces` — сколько лиц размыто (лицо, найденное обоими детекторами,
+    считается один раз); нет поля — размывать было некого;
+  - `extra.blur` — `"haar"`: кадр прошёл каскад; `"unavailable"`: каскада нет (нет opencv с
+    `cv2.data`, файл каскада не читается) — кадр всё равно записан, но лица, которых не
+    увидел FaceMesh (а без mediapipe — все), НЕ размыты. Отчёт обязан это показать.
+  - Подпись на кадре — латиницей (`VIS_101 PHONE_IN_FRAME`): `cv2.putText` кириллицу не
+    рисует.
+- Кадра нет -> `event.detail.evidence_skipped` (ставит только ядро; из `shell_event` это
+  поле снимается на границе сокета):
+
+| код | когда |
+|---|---|
+| `service` | служебный вид, кадр не нужен |
+| `no_camera` | камеры нет: `--headless`, `--mock` (события из сценария), нет opencv — или устройство в этом процессе не отдало ни одного кадра (не подключено, занято, доступ не выдан) |
+| `stale_frame` | камера кадры отдавала, но последний старше 2 с (`EVIDENCE_FRAME_MAX_AGE`) — камера пропала |
+| `write_failed` | файл кадра не записался (в том числе `cv2.imwrite` вернул `False` для кадра или кропа) |
+| `not_recording` | сессия не пишется (событие до `session_start` или после `session_end`) |
+| `disabled` | кадр выключен конфигурацией: `save_evidence:false` или severity ниже `evidence_frame_min_severity`. При настройках по умолчанию не возникает |
+
+- Правило кадра — `evidence_frame_min_severity` (по умолчанию `"info"`, то есть все
+  неслужебные). Правило клипа — отдельное: severity не ниже `evidence_min_severity` (по
+  умолчанию `"medium"`), никогда для `SECOND_FACE`, и клипа нет — с причиной в
+  `extra.clip_skipped` (`CLIP_SKIP_*` в `protocol.py`):
+
+| `clip_skipped` | когда |
+|---|---|
+| `multiple_faces` | в кадре больше одного лица — по FaceMesh или по каскаду на кадре события; с запасом: второе лицо в последние `evidence_clip_seconds` тоже закрывает клип (10 с «до» берутся из буфера) |
+| `faces_unknown` | FaceMesh недоступен (нет mediapipe, канал выключен флагом): «одно лицо» не доказано |
+
+  Клип размывать нечем, поэтому он пишется только при заведомо одном лице.
+
+- **Снятие клипа (`clip_cancelled`).** Клип регистрируется в момент события: путь уже стоит
+  в `evidence.clip_path`, а треть `evidence_clip_seconds` «после» добирается из следующих
+  кадров. Если, пока «после» не набрано, FaceMesh (или каскад на сохраняемом кадре) увидел
+  два лица и больше, рекордер снимает ВСЕ незакрытые клипы (`EvidenceRecorder.cancel_pending`):
+  файл не создаётся вовсе, кадр со вторым лицом в них не попадает. Клипы, чьё окно закрылось
+  раньше, не трогаются. На каждый снятый клип ядро пишет в хеш-цепочку запись
+  `control`/`clip_cancelled`:
+
+```
+{event_id,                       # id события, чей clip_path теперь без файла
+ kind,                           # вид события
+ reason:"multiple_faces_after",  # посторонний вошёл в кадр после события
+ at}                             # когда снят (epoch, с)
+```
+
+  Связь с событием — только по `event_id`. Обычно запись стоит в цепочке после события; у
+  события оболочки, клип которого сняли, пока оно писалось, может оказаться и раньше.
+  Отчёт и проверка пакета обязаны показывать такой клип как снятый («посторонний в кадре»),
+  а не как потерянный файл; `scripts/verify_report.py` считает эти записи отдельно от
+  записей о решениях.
+
+### Снимок окна экзамена (оболочка -> сайдкар)
+
+Снимается ТОЛЬКО представление экзамена: `webContents` LMS-представления, если экзамен идёт в
+нём, иначе `webContents` главного окна — `webContents.capturePage()`. Рабочий стол, другие
+окна и `desktopCapturer` — никогда. Снимок показывает вопрос и ответ студента в этот момент.
+
+На `event` с `screen:true` оболочка снимает окно, уменьшает до ширины не больше 1280,
+кодирует JPEG качества 70 и отвечает:
+
+```
+{"v":1,"type":"screen_evidence","ts":<epoch>,"event_id":"<id события>","mime":"image/jpeg",
+ "data_b64":"<base64>","width":W,"height":H,"captured_at":<epoch>,"source":"exam_view"|"main_window"}
+```
+
+Снять не удалось — то же без `data_b64` и с `"error":"<короткая причина>"`. `capturePage()`,
+не ответивший за 4 с (`SCREEN_EVIDENCE.captureTimeoutMs` в `shell/state.js`), — тоже неудача:
+`"error":"capturePage не ответил за 4 с"`; зависший снимок снимается с полёта, следующее
+событие снимает заново, а его поздний результат не отправляется и не переиспользуется. События в
+пределах 1.5 с от предыдущего снимка могут получить те же байты, но каждое — своим
+сообщением со своим `event_id`.
+
+Ядро принимает снимок только пока сессия пишется, только к событию, которое само разослало
+с `screen:true` в этой сессии не раньше 60 с назад (`SCREEN_EVIDENCE_MAX_AGE`), не больше
+одного раза на `event_id`, не больше 3 МБ после декодирования и только JPEG (первые байты
+`FF D8 FF`). С резервным журналом (JSONL вместо SQLite: записей `control` он не умеет) снимок
+отклоняется до записи файла — файл без sha256 в цепочке был бы непроверяемым. Отклонённое
+пишется в лог и в журнал не попадает. Принятое — файл
+`evidence/<ms>_<seq>_<kind>_screen.jpg` (`session.evidence_file(f"{kind}_screen")`) и запись
+`control`/`evidence_screen` в хеш-цепочке:
+
+```
+{event_id, kind, path,          # path — относительно каталога сессии
+ sha256, width, height, bytes,  # sha256 записанных байт
+ captured_at, received_at, source}
+```
+
+Для сообщения с `error` — `{event_id, kind, error, received_at}` (текст ошибки — одна
+строка, до 200 символов). Если ядро не смогло записать уже принятый снимок, запись та же, с
+`error` от ядра.
 
 ## Эскалация и решение человека — обязательно к реализации в оболочке
 

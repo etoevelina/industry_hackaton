@@ -103,6 +103,7 @@ from types import SimpleNamespace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Iterator
+from urllib.parse import quote
 
 _HERE = Path(__file__).resolve().parent          # sidecar/storage
 _SIDECAR = _HERE.parent                          # sidecar
@@ -133,6 +134,57 @@ DEFAULT_HALF_LIFE = 90.0
 EMBED_BUDGET_BYTES = 24 * 1024 * 1024
 THUMB_WIDTH = 260
 CLIP_EMBED_LIMIT = 3 * 1024 * 1024
+#: Снимок окна экзамена вшивается шире кадра камеры: на нём текст вопроса и
+#: ответа, и при 260 px его уже не прочитать даже с увеличением. Полный файл
+#: открывается ссылкой из миниатюры (лежит в evidence/ комплекта).
+SCREEN_THUMB_WIDTH = 400
+
+#: Запись `control` цепочки со снимком окна экзамена: оболочка присылает
+#: `screen_evidence`, сайдкар пишет файл и эту запись с тем же `event_id`.
+SCREEN_CONTROL = "evidence_screen"
+
+#: Запись `control` цепочки об отменённом клипе: `{event_id, kind, reason}`.
+#: Клип к инциденту уже начат, но в его «после» в кадре появился второй
+#: человек: размыть постороннего в видео нечем, и ядро клип не сохраняет. Путь
+#: к клипу в самом событии остаётся — событие легло в цепочку раньше, — и без
+#: этой записи отчёт напечатал бы «клип … не найден», то есть «доказательство
+#: потеряно», хотя его не стало намеренно.
+CLIP_CANCEL_CONTROL = "clip_cancelled"
+CLIP_CANCELLED_RU: dict[str, str] = {
+    "multiple_faces_after": "в кадре появился посторонний",
+}
+
+#: Почему клип к инциденту не пишется вовсе: `evidence.extra.clip_skipped`.
+#: Ядро ставит код только там, где клип по важности полагался бы.
+CLIP_SKIPPED_RU: dict[str, str] = {
+    "multiple_faces": "в кадре больше одного лица",
+    "faces_unknown": "анализ лица недоступен",
+}
+
+#: `evidence.extra.blur == "unavailable"`: каскада Хаара (запасного детектора
+#: лиц) не было. Лица, которые видел FaceMesh, размыты; лица, которых он не
+#: увидел (а без mediapipe — все), — нет. Поэтому «могли остаться», а не «не
+#: размыты»: FaceMesh мог работать. Это предупреждение и для преподавателя (на
+#: кадре может быть чужое лицо), и о самой сессии. Смысл кода — docs/CONTRACT.md.
+BLUR_UNAVAILABLE = "unavailable"
+BLUR_UNAVAILABLE_RU = ("посторонние на кадре могли остаться не размыты: "
+                       "запасной детектор лиц (каскад Хаара) недоступен")
+
+#: Почему у инцидента нет кадра камеры: код `detail["evidence_skipped"]`,
+#: который сайдкар ставит событию ДО записи в цепочку. Формулировки — для
+#: преподавателя: отсутствие кадра обязано читаться как факт с причиной, а не
+#: как пропуск в документе.
+EVIDENCE_SKIPPED_RU: dict[str, str] = {
+    "service": "кадр не требуется (служебная запись)",
+    "no_camera": "камера не работала (запуск без камеры)",
+    "stale_frame": "камера не отдала свежий кадр",
+    "write_failed": "кадр не записался",
+    "not_recording": "запись сессии не шла",
+    # Не из основного набора контракта: кадр выключен конфигурацией
+    # (save_evidence=false или поднятый evidence_frame_min_severity). При
+    # настройках по умолчанию не возникает, см. EVIDENCE_SKIP_DISABLED.
+    "disabled": "кадр отключён настройками",
+}
 
 TEMPLATE_NAME = "report.html.j2"
 
@@ -422,6 +474,12 @@ DETAIL_LABELS = {
     "message": "Наблюдение движка",
     "by": "Забрала наблюдение связка",
     "id": "Идентификатор записи",
+    # Ссылка связки на событие-триггер: по `event_id` отчёт находит кадр
+    # триггера, когда своего кадра у связки нет.
+    "event_id": "Запись события",
+    "frame_path": "Кадр (файл)",
+    # Кадр камеры не приложен — с причиной (сайдкар, контракт доказательств).
+    "evidence_skipped": "Кадр камеры не приложен",
     "keystrokes": "Нажатий учтено",
     "pastes": "Вставок учтено",
     "fired": "Связок выпущено",
@@ -897,6 +955,7 @@ DETAIL_VALUE_RU["origin_class"] = DETAIL_VALUE_RU["class"]
 DETAIL_VALUE_RU["mode"] = {"classroom": "компьютерный класс (аудитория)",
                            "remote": "сдача из дома"}
 DETAIL_VALUE_RU["exam_mode"] = DETAIL_VALUE_RU["mode"]
+DETAIL_VALUE_RU["evidence_skipped"] = EVIDENCE_SKIPPED_RU
 
 #: Поля, в которых лежит абсолютная отметка времени Unix. В таблице показаний
 #: она печаталась как `1792000176` — число, по которому читатель не может ни
@@ -910,6 +969,7 @@ DETAIL_OPAQUE_VALUES = frozenset({
     "code", "id", "session_id", "exam_id", "student_id", "session_dir",
     "session_code", "session_code_display", "bbox", "process", "device",
     "linked_event", "accelerators", "admin_exit", "adminExit",
+    "event_id", "frame_path",
     # Адреса и хеш профиля — идентификаторы. Адрес попытки печатается ЦЕЛИКОМ
     # и дословно: он и есть доказательство, по нему преподаватель открывает
     # страницу и видит, что студент искал. Сокращать или переводить нельзя.
@@ -934,6 +994,10 @@ DETAIL_OPAQUE_VALUES = frozenset({
 #:
 #: Сами ПОПЫТКИ выхода за белый список служебными не являются и в оценку идут
 #: со своими весами (20 за переход, 2 за подзапрос — см. protocol.py).
+#:
+#: Каноническая копия — `protocol.SERVICE_EVENT_KINDS`: по ней сайдкар решает,
+#: каким записям кадр и снимок окна не нужны (`evidence_skipped="service"`).
+#: Наборы обязаны совпадать.
 SERVICE_KINDS = {"SESSION_STARTED", "SESSION_ENDED", "CALIBRATION_DONE",
                  "SHELL_CONFIG", "EXAM_PROFILE_APPLIED", "EXAM_PROFILE_ABSENT",
                  "EXAM_PROFILE_SEARCH_ALLOWED", "EXAM_PROFILE"}
@@ -1477,6 +1541,11 @@ def recompute_integrity(session_dir: str | Path, db_path: str | Path | None = No
 # ---------------------------------------------------------------------------
 def _esc(value: Any) -> str:
     return html.escape("" if value is None else str(value), quote=True)
+
+
+def _breakable(value: Any) -> str:
+    """Экранировать и разрешить перенос строки после «_» (вид, код инцидента)."""
+    return _esc(value).replace("_", "_<wbr>")
 
 
 def _f(value: Any, default: float = 0.0) -> float:
@@ -3992,27 +4061,239 @@ _ICON_MARK = ('<svg class="mark" viewBox="0 0 34 34" width="34" height="34" '
               f'<circle cx="17" cy="17" r="4.5" fill="{ACID}"/></svg>')
 
 
+def _screen_records(controls: list[dict[str, Any]] | None) -> dict[str, dict[str, Any]]:
+    """Снимки окна экзамена из цепочки: `event_id` -> payload `evidence_screen`.
+
+    Читаются из записей `control`, то есть из байтов, по которым считан хеш:
+    путь и sha256 снимка защищены цепочкой так же, как сам инцидент. Сайдкар
+    принимает не больше одного снимка на событие, но отчёт на это не
+    полагается: запись с файлом сильнее записи об ошибке, из двух записей с
+    файлом берётся первая — она ближе к моменту фиксации.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for record in controls or []:
+        if str(record.get("control") or "") != SCREEN_CONTROL:
+            continue
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        event_id = str(payload.get("event_id") or "")
+        if not event_id:
+            continue
+        have = out.get(event_id)
+        if have is not None and (have.get("path") or not payload.get("path")):
+            continue
+        out[event_id] = {**payload, "_seq": record.get("_seq"),
+                         "_hash": str(record.get("_hash") or "")}
+    return out
+
+
+def _clip_cancel_records(controls: list[dict[str, Any]] | None) -> dict[str, dict[str, Any]]:
+    """Отменённые клипы из цепочки: `event_id` -> payload `clip_cancelled`.
+
+    Журнал прежней версии таких записей не знает — словарь просто пуст, и
+    отчёт ведёт себя как раньше. Из нескольких записей на событие берётся
+    первая: причина у отмены одна.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for record in controls or []:
+        if str(record.get("control") or "") != CLIP_CANCEL_CONTROL:
+            continue
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        event_id = str(payload.get("event_id") or "")
+        if event_id and event_id not in out:
+            out[event_id] = dict(payload)
+    return out
+
+
+def _ev_note(text: str, warn: bool = False) -> str:
+    """Строка под миниатюрами: клип, его отсутствие или предупреждение."""
+    if warn:
+        icon = _ICON_ALERT.replace('class="icon"', 'class="icon ev-warn-icon"', 1)
+        return f'<div class="ev-warn" role="note">{icon}<span>{_esc(text)}</span></div>'
+    return f'<div class="ev-clip ev-clip-miss ev-clip-why mono">{_esc(text)}</div>'
+
+
+def _clip_cancel_text(record: dict[str, Any]) -> str:
+    """«клип не записан: в кадре появился посторонний» (или код причины)."""
+    code = str(record.get("reason") or "").strip()
+    reason = CLIP_CANCELLED_RU.get(code)
+    if reason:
+        return f"клип не записан: {reason}"
+    return f"клип не записан ({code[:60]})" if code else "клип не записан"
+
+
+def _clip_skipped_text(code: str) -> str:
+    """«клип не пишется: …» по `extra.clip_skipped`."""
+    reason = CLIP_SKIPPED_RU.get(code)
+    return f"клип не пишется: {reason}" if reason else f"клип не пишется ({code[:60]})"
+
+
+def _evidence_href(embed: _Embedder, path: Path) -> str:
+    """Относительная ссылка на файл доказательства (`evidence/<файл>`).
+
+    Отчёт лежит в корне каталога сессии и в корне пакета, файлы — в
+    `evidence/` рядом, поэтому одна и та же ссылка работает и на машине
+    студента, и в распакованном комплекте. Это переход по ссылке, а не
+    загрузка ресурса: CSP отчёта он не нарушает, внешних адресов не добавляет.
+    """
+    try:
+        rel = path.resolve().relative_to(embed.session_dir.resolve()).as_posix()
+    except Exception:
+        rel = f"evidence/{path.name}"
+    return _esc(quote(rel, safe="/-_."))
+
+
+def _ev_missing(slot: str, label: str, reason: str, link: str = "") -> str:
+    """Место миниатюры, когда её нет: подпись слота и причина по-русски."""
+    return (f'<div class="ev ev-miss {slot}" role="note">'
+            f'<span class="ev-k mono">{_esc(label)}</span>'
+            f'<span class="ev-why">{_esc(reason)}</span>{link}</div>')
+
+
+def _ev_image(embed: _Embedder, rel: str, width: int, slot: str, label: str,
+              when: float, alt: str, title: str = "") -> str:
+    """Миниатюра, вшитая data URI, со ссылкой на исходный файл рядом с отчётом."""
+    name = Path(rel).name
+    path = embed.resolve(rel)
+    if path is None:
+        return _ev_missing(slot, label, f"файл {name} не найден рядом с отчётом")
+    href = _evidence_href(embed, path)
+    uri = embed.image(rel, width)
+    if not uri:
+        # Бюджет вшивания исчерпан (или файл не читается как картинка): сам
+        # файл в evidence/ есть, и ссылка на него остаётся.
+        return _ev_missing(slot, label, "не вшит в отчёт: превышен объём",
+                           f'<a class="ev-file mono" href="{href}">{_esc(name)}</a>')
+    caption = label + (f" · {_clock(when)}" if when else "")
+    return (f'<figure class="ev {slot}">'
+            f'<a class="ev-open" href="{href}" title="{_esc(title or rel)}">'
+            f'<img class="thumb" src="{uri}" alt="{_esc(alt)}"></a>'
+            f'<figcaption class="mono">{_esc(caption)}</figcaption></figure>')
+
+
+def _trigger_frame(event: dict[str, Any],
+                   by_id: dict[str, dict[str, Any]] | None
+                   ) -> tuple[str, float, dict[str, Any]]:
+    """Кадр события-триггера связки: (путь, время, extra кадра) или ("", 0, {}).
+
+    Связка фиксируется в момент ответа, а смотреть преподавателю нужно на
+    момент сигнала: взгляд ушёл, телефон в кадре. `fusion.py` кладёт в
+    `detail.trigger` идентификатор и путь кадра триггера; журнал, записанный
+    раньше, пути не знает — тогда кадр ищется по `event_id` среди событий.
+    `extra` — сведения о кадре триггера (`blur` и прочее): предупреждение о
+    неразмытых посторонних относится к кадру, а не к связке.
+    """
+    detail = event.get("detail") if isinstance(event.get("detail"), dict) else {}
+    trig = detail.get("trigger")
+    if not isinstance(trig, dict):
+        return "", 0.0, {}
+    rel = str(trig.get("frame_path") or "")
+    when = _f(trig.get("ts"))
+    extra: dict[str, Any] = {}
+    source = (by_id or {}).get(str(trig.get("event_id") or ""))
+    if source is not None:
+        evidence = source.get("evidence") if isinstance(source.get("evidence"), dict) else {}
+        extra = evidence.get("extra") if isinstance(evidence.get("extra"), dict) else {}
+        rel = rel or str(evidence.get("frame_path") or "")
+        when = _f(extra.get("frame_ts")) or _f(source.get("ts")) or when
+    return rel, when, extra
+
+
 def _evidence_cell(event: dict[str, Any], embed: _Embedder,
-                   empty: str = '<span class="muted mono">нет кадра</span>') -> str:
-    evidence = event.get("evidence") or {}
-    if not isinstance(evidence, dict):
-        return empty
+                   screens: dict[str, dict[str, Any]] | None = None,
+                   by_id: dict[str, dict[str, Any]] | None = None,
+                   clip_cancels: dict[str, dict[str, Any]] | None = None) -> str:
+    """Доказательства инцидента: кадр камеры, снимок окна экзамена, клип.
+
+    Обе миниатюры стоят на своих местах всегда: если кадра или снимка нет,
+    на месте миниатюры напечатана причина. Пустое место читалось бы как
+    «доказательство потеряно», а причина («камера не работала», «запись
+    сессии не шла») — это факт о сессии, который преподаватель обязан видеть.
+    Журнал прежней версии этих полей не знает, и тогда причина честная:
+    «кадра нет» / «снимка окна нет».
+
+    Под миниатюрами — строка о клипе (ссылка, «клип не записан», «клип не
+    пишется» или «не найден») и, если посторонних на кадре размыть было
+    нечем, предупреждение об этом. `clip_cancels` — `_clip_cancel_records`.
+    """
+    evidence = event.get("evidence") if isinstance(event.get("evidence"), dict) else {}
+    detail = event.get("detail") if isinstance(event.get("detail"), dict) else {}
+    extra = evidence.get("extra") if isinstance(evidence.get("extra"), dict) else {}
+
+    # --- кадр камеры ------------------------------------------------------
     frame = str(evidence.get("frame_path") or "")
+    label = "камера"
+    when = _f(extra.get("frame_ts")) or _f(event.get("ts"))
+    frame_extra = extra
+    if not frame:
+        frame, trig_when, trig_extra = _trigger_frame(event, by_id)
+        if frame:
+            label, when, frame_extra = "камера · триггер связки", trig_when, trig_extra
+    if frame:
+        camera = _ev_image(embed, frame, THUMB_WIDTH, "ev-cam", label, when,
+                           "кадр камеры в момент фиксации")
+    else:
+        code = str(detail.get("evidence_skipped") or "")
+        reason = EVIDENCE_SKIPPED_RU.get(code) or (
+            f"кадр не приложен ({code})" if code else "кадра нет")
+        camera = _ev_missing("ev-cam", "камера", reason)
+
+    # --- снимок окна экзамена ---------------------------------------------
+    record = (screens or {}).get(str(event.get("id") or ""))
+    if record is None:
+        screen = _ev_missing("ev-screen", "окно экзамена", "снимка окна нет")
+    elif not str(record.get("path") or ""):
+        error = str(record.get("error") or "").strip() or "причина не записана"
+        if len(error) > 160:
+            error = error[:157] + "…"
+        screen = _ev_missing("ev-screen", "окно экзамена",
+                             f"снимок окна не получен: {error}")
+    else:
+        path = str(record.get("path"))
+        size = (f" · {int(_f(record.get('width')))}×{int(_f(record.get('height')))}"
+                if record.get("width") and record.get("height") else "")
+        sha = str(record.get("sha256") or "")
+        title = f"{path}{size}" + (f" · sha256 {sha[:16]}…" if sha else "")
+        screen = _ev_image(embed, path, SCREEN_THUMB_WIDTH, "ev-screen",
+                           "окно экзамена", _f(record.get("captured_at")),
+                           "снимок окна экзамена в момент фиксации", title)
+
+    # --- посторонние на кадре не размыты ----------------------------------
+    # Только когда кадр есть: без кадра предупреждать не о чем.
+    blur_html = ""
+    if frame and str(frame_extra.get("blur") or "") == BLUR_UNAVAILABLE:
+        blur_html = _ev_note(BLUR_UNAVAILABLE_RU, warn=True)
+
+    # --- клип -------------------------------------------------------------
+    # Клип не вшивается: ссылка на файл рядом с отчётом. Рекордер пишет mp4,
+    # а если кодека нет — avi (MJPG) с тем же именем, поэтому при пропавшем
+    # .mp4 проверяется соседний .avi. Порядок: файл есть — ссылка (это факт,
+    # что бы ни было записано об отмене); файла нет, а в цепочке отмена —
+    # «клип не записан: …»; иначе «не найден». Клипа в событии нет, а ядро
+    # записало `clip_skipped`, — «клип не пишется: …».
+    clip_html = ""
     clip = str(evidence.get("clip_path") or "")
-    bits: list[str] = []
-    uri = embed.image(frame) if frame else ""
-    if uri:
-        bits.append(f'<figure class="ev"><img class="thumb" src="{uri}" '
-                    f'alt="кадр момента фиксации" title="{_esc(frame)}">'
-                    f'<figcaption class="mono">{_esc(Path(frame).name)}</figcaption></figure>')
-    elif frame:
-        bits.append(f'<span class="muted mono">кадр {_esc(Path(frame).name)} '
-                    f'не вшит</span>')
+    cancel = (clip_cancels or {}).get(str(event.get("id") or ""))
+    skipped = str(extra.get("clip_skipped") or "").strip()
     if clip:
-        bits.append(f'<span class="muted mono">клип {_esc(Path(clip).name)}</span>')
-    if not bits:
-        return empty
-    return "".join(bits)
+        clip_path = embed.resolve(clip)
+        if clip_path is None and Path(clip).suffix.lower() == ".mp4":
+            clip_path = embed.resolve(str(Path(clip).with_suffix(".avi")))
+        if clip_path is not None:
+            clip_html = (f'<div class="ev-clip mono"><a href="{_evidence_href(embed, clip_path)}">'
+                         f'клип {_esc(clip_path.name)}</a></div>')
+        elif cancel is not None:
+            clip_html = _ev_note(_clip_cancel_text(cancel))
+        else:
+            clip_html = _ev_note(f"клип {Path(clip).name} не найден рядом с отчётом")
+    elif cancel is not None:
+        clip_html = _ev_note(_clip_cancel_text(cancel))
+    elif skipped:
+        clip_html = _ev_note(_clip_skipped_text(skipped))
+    return f'<div class="ev-set">{camera}{screen}</div>{blur_html}{clip_html}'
 
 
 def build_masthead_html(meta: dict[str, Any], summary: dict[str, Any],
@@ -5353,7 +5634,9 @@ def build_attempts_html(attempts: dict[str, Any] | None,
 def build_incidents_html(events: list[dict[str, Any]], t0: float,
                          embed: _Embedder,
                          attempts: dict[str, Any] | None = None,
-                         profile: dict[str, Any] | None = None) -> str:
+                         profile: dict[str, Any] | None = None,
+                         screens: dict[str, dict[str, Any]] | None = None,
+                         clip_cancels: dict[str, dict[str, Any]] | None = None) -> str:
     """Таблица инцидентов по паттерну .data-table: тёмная, с кодами и кадрами.
 
     Иерархия ячейки «Наблюдение»: КРУПНО — `message` из движка, он построен по
@@ -5361,6 +5644,13 @@ def build_incidents_html(events: list[dict[str, Any]], t0: float,
     подпись вида. Обратный порядок означал бы, что документ подменяет
     наблюдение движка собственной короткой формулировкой, а она по природе
     своей ближе к ярлыку, чем к наблюдению.
+
+    Доказательства (кадр камеры и снимок окна экзамена) стоят В ЭТОЙ ЖЕ
+    ячейке, под наблюдением. Раньше они жили в последней, восьмой колонке,
+    и при 1280–1920 px она уезжала за правый край прокрутки: преподаватель
+    видел таблицу без единого кадра и не знал, что их надо искать справа.
+    `screens` — снимки окна из цепочки (`_screen_records`), `clip_cancels` —
+    отменённые клипы (`_clip_cancel_records`).
     """
     # Подраздел попыток выхода идёт ПЕРЕД общей таблицей: это доказательство,
     # за которым проктор открывает раздел, и искать его среди ста строк он не
@@ -5370,6 +5660,7 @@ def build_incidents_html(events: list[dict[str, Any]], t0: float,
     if attempts is not None or profile is not None:
         head = build_attempts_html(attempts, t0, profile)
 
+    by_id = {str(e.get("id")): e for e in events if e.get("id")}
     rows: list[str] = []
     for event in events:
         kind = str(event.get("kind") or "")
@@ -5387,11 +5678,13 @@ def build_incidents_html(events: list[dict[str, Any]], t0: float,
                                 f'<div class="kv-list">{_detail_rows(detail)}</div>')
         duration = _f(event.get("duration"))
         code = _incident_code(event)
+        # Перенос разрешён только после «_»: FUSION_GAZE_THEN_ANSWER одной
+        # строкой съедал 250 px, и таблица не помещалась в 1280 px.
         if code:
-            code_cell = (f'<span class="code code-kind">{_esc(code)}</span>'
-                         f'<div class="cell-sub mono">{_esc(kind)}</div>')
+            code_cell = (f'<span class="code code-kind">{_breakable(code)}</span>'
+                         f'<div class="cell-sub mono">{_breakable(kind)}</div>')
         else:
-            code_cell = f'<span class="code code-kind">{_esc(kind)}</span>'
+            code_cell = f'<span class="code code-kind">{_breakable(kind)}</span>'
         if message:
             observation = (f'<div class="obs">{_esc(message)}</div>'
                            f'<div class="obs-kind mono">{_esc(label)}</div>')
@@ -5401,16 +5694,16 @@ def build_incidents_html(events: list[dict[str, Any]], t0: float,
             f'<tr>'
             f'<td class="nowrap"><div class="mono t-main">{_clock(event.get("ts"))}</div>'
             f'<div class="mono t-sub">{_offset(event.get("ts"), t0)}</div></td>'
-            f'<td class="nowrap"><span class="code">{_esc(_channel_code(channel))}</span>'
+            f'<td><span class="code">{_esc(_channel_code(channel))}</span>'
             f'<div class="cell-sub">{_esc(_channel_label(channel))}</div></td>'
-            f'<td class="nowrap">{code_cell}</td>'
-            f'<td class="cell-wide">{observation}{extra}</td>'
+            f'<td>{code_cell}</td>'
+            f'<td class="cell-wide">{observation}'
+            f'{_evidence_cell(event, embed, screens, by_id, clip_cancels)}{extra}</td>'
             f'<td class="nowrap"><span class="sev sev-{_esc(severity)}">'
             f'{_sev_glyph(severity)}'
             f'{_esc(SEVERITY_LABELS.get(severity, severity))}</span></td>'
             f'<td class="num mono">{_num(_f(event.get("confidence"), 1.0) * 100, 0)}%</td>'
-            f'<td class="num mono">{(_num(duration) + " с") if duration else "—"}</td>'
-            f'<td>{_evidence_cell(event, embed)}</td>'
+            f'<td class="num mono nowrap">{(_num(duration) + " с") if duration else "—"}</td>'
             f'</tr>')
     if not rows:
         return (head
@@ -5425,10 +5718,10 @@ def build_incidents_html(events: list[dict[str, Any]], t0: float,
         head + all_head
         + f'<div class="table-wrap{long_cls}" tabindex="0" role="group" '
         f'aria-label="Таблица инцидентов, {len(rows)} строк">'
-        '<table class="data-table"><thead><tr>'
-        '<th>Время</th><th>Канал</th><th>Код</th><th>Наблюдение</th>'
-        '<th>Критичность</th><th>Уверен&shy;ность</th><th>Длит.</th>'
-        '<th>Доказательство</th>'
+        '<table class="data-table incident-table"><thead><tr>'
+        '<th>Время</th><th>Канал</th><th>Код</th>'
+        '<th>Наблюдение и доказательства</th>'
+        '<th>Критичность</th><th class="th-wrap">Уверен&shy;ность</th><th>Длит.</th>'
         '</tr></thead><tbody>' + "".join(rows) + '</tbody></table></div>'
     )
 
@@ -5527,10 +5820,19 @@ def build_fusion_timing_svg(event: dict[str, Any]) -> str:
     return _plot_wrap(svg)
 
 
-def build_fusion_html(events: list[dict[str, Any]], t0: float, embed: _Embedder) -> str:
-    """Раздел связок: главное отличие системы, поэтому с подробным разбором."""
+def build_fusion_html(events: list[dict[str, Any]], t0: float, embed: _Embedder,
+                      screens: dict[str, dict[str, Any]] | None = None,
+                      clip_cancels: dict[str, dict[str, Any]] | None = None) -> str:
+    """Раздел связок: главное отличие системы, поэтому с подробным разбором.
+
+    Кадр карточки — свой кадр связки, а если его нет, кадр события-триггера
+    (`detail.trigger`): связка фиксируется в момент ответа, а смотреть нужно
+    на момент сигнала. Снимок окна — свой, по `event_id` связки: на нём ответ,
+    который она описывает.
+    """
     fusion_kinds = _fusion_kinds()
     items = [e for e in events if str(e.get("kind") or "") in fusion_kinds]
+    by_id = {str(e.get("id")): e for e in events if e.get("id")}
     intro = (
         '<p class="lead">Связка — не одно срабатывание, а совпадение сигналов разной '
         'природы на одной временной шкале. По отдельности «взгляд ушёл в сторону» и '
@@ -5546,11 +5848,11 @@ def build_fusion_html(events: list[dict[str, Any]], t0: float, embed: _Embedder)
         kind = str(event.get("kind") or "")
         detail = event.get("detail") if isinstance(event.get("detail"), dict) else {}
         severity = str(event.get("severity") or "high")
-        thumb = _evidence_cell(event, embed, empty="")
         timing = build_fusion_timing_svg(event)
         raw = json.dumps(event.get("detail") or {}, ensure_ascii=False, indent=2,
                          sort_keys=True)
-        evidence_block = (f'<div class="fusion-ev">{thumb}</div>') if thumb else ""
+        evidence_block = (f'<div class="fusion-ev">'
+                          f'{_evidence_cell(event, embed, screens, by_id, clip_cancels)}</div>')
         cards.append(
             f'<article class="fusion-card">'
             f'<header class="fusion-head">'
@@ -6822,10 +7124,15 @@ border-radius:var(--radius-sm)}
 /* ---- таблица инцидентов (паттерн .data-table: среда наблюдения) ---- */
 .table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;
 border:1px solid var(--border-hair-dark);border-radius:var(--radius-md)}
-.data-table{width:100%;min-width:1040px;border-collapse:collapse;
-background:var(--bg-panel);color:var(--text-on-dark);font-size:var(--fs-small)}
+/* min-width ниже ширины колонки страницы (1004 px при 1280+): таблица
+   инцидентов обязана помещаться целиком, без прокрутки вбок, — в ней кадры.
+   Прокрутка остаётся только на узком окне, и кадры при этом стоят в
+   четвёртой колонке, то есть видны без неё. */
+.data-table{width:100%;min-width:860px;border-collapse:collapse;
+background:var(--bg-panel);color:var(--text-on-dark);font-size:var(--fs-small);
+--focus-ring-color:var(--info)}
 /* Шапка липкая: на длинной сессии таблица уходит на десятки экранов, и без
-   этого восемь колонок (две из них числовые подряд) читаются вслепую.
+   этого семь колонок (две из них числовые подряд) читаются вслепую.
    Тонкость: `position:sticky` прилипает к ближайшему СКРОЛЛПОРТУ, а
    `.table-wrap` им уже является (overflow-x:auto делает auto и по вертикали),
    поэтому одного `sticky` недостаточно — у длинной таблицы контейнер получает
@@ -6837,8 +7144,9 @@ background:var(--bg-panel);color:var(--text-on-dark);font-size:var(--fs-small)}
 color:var(--text-muted-on-dark);font-family:var(--font-mono);font-size:var(--fs-small);
 font-weight:400;text-align:left;text-transform:uppercase;
 letter-spacing:var(--tracking-label);white-space:nowrap}
-.data-table td{padding:var(--space-4);border-top:1px solid var(--border-hair-dark);
-vertical-align:top}
+.data-table td{padding:var(--space-4) var(--space-3);
+border-top:1px solid var(--border-hair-dark);vertical-align:top}
+.data-table th.th-wrap{white-space:normal;hyphens:manual}
 .data-table tr:hover td{background:rgba(198,255,0,.04)}
 .cell-wide{min-width:280px}
 .nowrap{white-space:nowrap}
@@ -6853,6 +7161,10 @@ color:var(--text-muted-on-dark)}
 .obs{font-size:var(--fs-body);max-width:52ch}
 .obs-kind{margin-top:var(--space-1);font-size:var(--fs-small);
 color:var(--text-muted-on-dark)}
+/* Адрес в наблюдении или вид без русской подписи (LOCK_REVIEW_REQUESTED)
+   переносятся где угодно: иначе одно длинное слово задаёт минимальную
+   ширину колонки, и таблица с кадрами вылезает за край экрана или листа. */
+.obs,.obs-kind{overflow-wrap:anywhere}
 .code{display:inline-block;padding:2px var(--space-2);background:var(--gray-100);
 border:1px solid var(--border-hair);border-radius:var(--radius-xs);
 font-family:var(--font-mono);font-size:var(--fs-small);color:var(--text-primary);
@@ -6872,12 +7184,50 @@ font-size:var(--fs-small);white-space:nowrap}
 .sheet .sev{background:var(--tone);color:var(--ink);border-color:var(--border-hair-dark)}
 .monitor .sev,.data-table .sev{background:transparent;color:var(--tone);
 border-color:var(--tone)}
-.ev{margin:0}
-.thumb{display:block;width:140px;border:1px solid var(--border-hair-dark);
+/* Код и вид переносятся только после «_» (<wbr>): одной строкой
+   FUSION_GAZE_THEN_ANSWER занимал четверть таблицы. */
+.data-table .code-kind{white-space:normal}
+
+/* ---- доказательства инцидента: кадр камеры + снимок окна экзамена ----
+   Две миниатюры стоят рядом под наблюдением; если кадра или снимка нет,
+   на его месте напечатана причина (рамка пунктиром той же ширины). */
+.ev-set{display:flex;flex-wrap:wrap;align-items:flex-start;gap:var(--space-2);
+margin-top:var(--space-3)}
+.ev{margin:0;width:var(--ev-w);flex:0 0 auto}
+.ev-cam{--ev-w:120px}
+.ev-screen{--ev-w:160px}
+.ev-open{display:block;border-radius:var(--radius-xs)}
+.thumb{display:block;width:100%;height:auto;border:1px solid var(--border-hair-dark);
 border-radius:var(--radius-xs)}
-.ev figcaption{max-width:140px;margin-top:var(--space-1);font-size:var(--fs-small);
-color:var(--text-muted-on-dark);word-break:break-all}
-.fusion-ev .ev figcaption{color:var(--text-muted)}
+.ev figcaption{margin-top:var(--space-1);font-size:var(--fs-tiny);line-height:1.35;
+color:var(--text-muted-on-dark)}
+.ev-miss{display:flex;flex-direction:column;gap:2px;padding:var(--space-2);
+border:1px dashed var(--gray-500);border-radius:var(--radius-xs);
+font-size:var(--fs-label);line-height:1.35;color:var(--text-muted-on-dark)}
+.ev-k{font-size:var(--fs-tiny);text-transform:uppercase;
+letter-spacing:var(--tracking-label)}
+.ev-why{color:var(--text-on-dark);overflow-wrap:anywhere}
+.ev-file{word-break:break-all;font-size:var(--fs-tiny)}
+.ev-clip{margin-top:var(--space-2);font-size:var(--fs-label);word-break:break-all}
+.ev-clip a,.ev-file{color:var(--acid)}
+.ev-clip-miss{color:var(--text-muted-on-dark)}
+/* Причина без имени файла переносится по словам: break-all нужен только
+   длинному имени клипа, фразу он рвал посреди слова («пост|оронний»). */
+.ev-clip-why{word-break:normal;overflow-wrap:anywhere}
+/* Предупреждение под кадром: посторонних размыть было нечем. Жёлтый текст
+   на чёрном (11:1); на белом карточки связки текст чёрный, а жёлтым — только
+   значок: жёлтый текст на белом не читается (1.7:1). */
+.ev-warn{display:flex;align-items:flex-start;gap:var(--space-1);
+margin-top:var(--space-2);max-width:56ch;font-size:var(--fs-label);line-height:1.35;
+color:var(--warning)}
+.ev-warn .ev-warn-icon{width:14px;height:14px;margin-top:1px;color:var(--warning)}
+.fusion-ev .ev-warn{color:var(--text-primary)}
+.fusion-ev .ev figcaption,.fusion-ev .ev-miss,.fusion-ev .ev-clip-miss{
+color:var(--text-muted)}
+.fusion-ev .ev-miss{border-color:var(--gray-300)}
+.fusion-ev .ev-why{color:var(--text-primary)}
+.fusion-ev .ev-clip a,.fusion-ev .ev-file{color:var(--signal-text-on-light)}
+.fusion-ev .ev-set{margin-top:0}
 
 /* ---- связки ---- */
 .fusion-card{margin-bottom:var(--space-6);padding:var(--space-6);background:var(--white);
@@ -6889,7 +7239,7 @@ margin-bottom:var(--space-4)}
 .fusion-msg{margin:0 0 var(--space-4);font-size:var(--fs-body);max-width:78ch}
 .fusion-body{display:flex;flex-wrap:wrap;gap:var(--space-6)}
 .fusion-body .kv-list{flex:1 1 320px;margin:0}
-.fusion-ev{flex:0 0 140px}
+.fusion-ev{flex:0 1 auto}
 .fusion-foot{margin-top:var(--space-4);padding-top:var(--space-3);
 border-top:1px solid var(--border-hair);font-size:var(--fs-small);
 color:var(--text-muted);word-break:break-all}
@@ -7012,6 +7362,27 @@ section{break-inside:avoid;box-shadow:none;border-color:var(--gray-300)}
 .data-table{min-width:0}
 .data-table thead th{position:static}
 .data-table thead{display:table-header-group}
+/* A4 даёт таблице ~650 px: всё, что на экране держит строку, на бумаге
+   переносится, а миниатюры уменьшаются — иначе правые колонки, а с ними
+   критичность, обрезаются краем листа. Строка инцидента не рвётся между
+   страницами: кадр без своего наблюдения доказательством не является. */
+.incident-table,.attempt-table{font-size:12px}
+.incident-table th,.incident-table td,.attempt-table th,.attempt-table td{
+padding:var(--space-2) 6px}
+.incident-table th,.attempt-table th{white-space:normal;letter-spacing:.04em;
+font-size:11px}
+/* У таблицы попыток то же: вид обращения и подпись вида под кодом на
+   бумаге переносятся, адрес уже переносится (.brk). */
+.attempt-table .nowrap{white-space:normal}
+.attempt-table .cell-sub{overflow-wrap:anywhere}
+.incident-table .cell-wide{min-width:0;width:40%}
+.incident-table .t-main,.incident-table .obs{font-size:13px}
+.incident-table .sev{padding:2px var(--space-2);font-size:12px;white-space:normal}
+.incident-table .code{font-size:12px}
+.incident-table tr{break-inside:avoid}
+.ev-cam{--ev-w:96px}
+.ev-screen{--ev-w:128px}
+.ev{break-inside:avoid}
 .plot-scroll{overflow:visible}
 .plot,.timing{min-width:0}
 /* На печати раскрытия не нажимаются: закрытое остаётся закрытым, поэтому
@@ -7164,6 +7535,11 @@ def build_report(session_dir: str | Path, db_path: str | Path | None = None,
                    sorted(by_severity, key=lambda s: -SEVERITY_ORDER.get(s, 0))}
 
     embed = _Embedder(data.session_dir)
+    # Снимки окна экзамена лежат в цепочке записями `control`/`evidence_screen`
+    # и присоединяются к инцидентам по `event_id`; так же — отмены клипов
+    # (`control`/`clip_cancelled`).
+    screens = _screen_records(data.controls)
+    clip_cancels = _clip_cancel_records(data.controls)
     signature = (_sign_chain_head(data.chain, key_path, authority) if sign is not False
                  else {"available": False, "reason": "подпись отключена конфигурацией",
                        "authority": authority})
@@ -7242,9 +7618,10 @@ def build_report(session_dir: str | Path, db_path: str | Path | None = None,
         "timeline_svg": build_timeline_svg(meaningful, started, ended),
         "risk_svg": build_risk_svg(series, started, ended, _thresholds(), half_life,
                                    cap=risk_cap, folded=series_folded),
-        "fusion_html": build_fusion_html(events, started, embed),
+        "fusion_html": build_fusion_html(events, started, embed, screens, clip_cancels),
         "incidents_html": build_incidents_html(events, started, embed,
-                                               attempts, profile),
+                                               attempts, profile, screens,
+                                               clip_cancels),
         "policy_html": build_policy_html(policy, decisions, data.observations,
                                          profiles_block),
         "handover_html": build_handover_html(handover, code, package),

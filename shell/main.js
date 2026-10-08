@@ -11,7 +11,10 @@
  *  - удержание фокуса и полного экрана: blur => WINDOW_BLUR + возврат фокуса,
  *    leave-full-screen => FULLSCREEN_EXIT + возврат в fullscreen;
  *  - WS-канал к сайдкару (shell/ipc.js). Сайдкар не поднялся — оболочка работает,
- *    HUD честно показывает «CV-канал недоступен».
+ *    HUD честно показывает «CV-канал недоступен»;
+ *  - снимок ОКНА ЭКЗАМЕНА к инциденту (screen_evidence) по `event` с `screen: true` —
+ *    только представление экзамена через capturePage(), никогда не рабочий стол;
+ *  - финальный экран: где лежат отчёт и пакет, «Открыть отчёт» после конца сессии.
  *
  * Весь текст для пользователя — по-русски. Наружу (в интернет) не ходим: только loopback.
  */
@@ -22,7 +25,7 @@ const crypto = require('crypto');
 const { spawn } = require('child_process');
 const {
   app, BrowserWindow, BrowserView, ipcMain, screen, globalShortcut, clipboard,
-  session, Menu,
+  session, Menu, nativeImage, shell: electronShell,
 } = require('electron');
 
 const { SidecarLink, EventKind, MsgType, DEFAULT_WS_HOST, DEFAULT_WS_PORT } = require('./ipc');
@@ -34,6 +37,7 @@ const {
   examProfileHeadline, originRejectText, requestThrottle,
   examProfileCarriesRules,
   EXAM_VIEW_INSET_FALLBACK, normalizeExamViewInset, examViewRect,
+  SCREEN_EVIDENCE, screenCaptureVerdict, isJpeg, jpegSize, screenShotCoordinator,
 } = require('./state');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
@@ -533,6 +537,14 @@ const state = {
   lastVerdict: null,
   lastRisk: null,
   statusTimer: null,
+  /**
+   * Где лежат отчёт и пакет последней сессии — для финального экрана.
+   * Заполняется из того, что ядро уже присылает: SESSION_STARTED (каталог
+   * сессии), SESSION_ENDED (код, признак деградации, путь пакета) и status
+   * (итог сборки пакета, причина деградации). Своих путей оболочка не
+   * выдумывает. См. freshSessionReport().
+   */
+  sessionReport: freshSessionReport(),
 
   // --- профиль экзамена и страница LMS ------------------------------------
   examProfile: null,        // результат normalizeExamProfile(); null до старта
@@ -692,6 +704,8 @@ function shellStatus() {
     // Правила экзамена для HUD: студент обязан видеть, какие источники ему
     // разрешены, а не узнавать об этом из блокировки на середине задания.
     examProfile: examProfileInfo(),
+    // Финальный экран: где отчёт и пакет, код сессии, деградация передачи.
+    sessionReport: sessionReportInfo(),
   };
 }
 
@@ -2636,6 +2650,397 @@ function killSidecar() {
 }
 
 // ---------------------------------------------------------------------------
+// Снимок окна экзамена к инциденту (docs/CONTRACT.md, «Снимок окна экзамена»)
+// ---------------------------------------------------------------------------
+/*
+ * Ядро присылает `event` с `screen: true` к каждому неслужебному событию,
+ * пока сессия пишется. Оболочка отвечает `screen_evidence`: снимком ТОЛЬКО
+ * представления экзамена — страницы LMS, если тест идёт в ней, иначе
+ * содержимого нашего окна — через webContents.capturePage(). Рабочий стол,
+ * другие окна и desktopCapturer не используются НИКОГДА: снимок нужен, чтобы
+ * показать вопрос и ответ в момент инцидента, а не то, что ещё открыто на
+ * машине. Об этом же сказано студенту на экране согласия.
+ *
+ * capturePage() берёт кадр из компоновщика самого окна, поэтому
+ * setContentProtection на снимок не влияет: защищено окно от ЧУЖОЙ записи
+ * экрана, а не от собственной.
+ *
+ * Когда снимать, как не снимать одно и то же трижды и как прочитать размер
+ * JPEG — в shell/state.js (screenCaptureVerdict, screenShotCoordinator,
+ * jpegSize), там это проверяется без Electron.
+ */
+
+/** Тип сообщения. ipc.js его может ещё не знать — имя из контракта. */
+const SCREEN_EVIDENCE_TYPE = MsgType.SCREEN_EVIDENCE || 'screen_evidence';
+
+function nowEpochSec() {
+  return Date.now() / 1000;
+}
+
+/** Одна строка без управляющих символов: текст ошибки ляжет в отчёт. */
+function oneLine(value, limit) {
+  const text = String(value == null ? '' : value).replace(/[\u0000-\u001f\u007f]+/g, ' ')
+    .replace(/\s+/g, ' ').trim();
+  return text.slice(0, limit || SCREEN_EVIDENCE.errorMaxChars);
+}
+
+/**
+ * Что снимать. Страница LMS — только если она ПРИКРЕПЛЕНА к окну, то есть
+ * сейчас на экране (syncExamViewWithState держит её только в exam/paused).
+ * Иначе тест идёт в нашем окне, и снимается его содержимое.
+ */
+function screenEvidenceTarget() {
+  const view = state.examView;
+  if (view && state.examViewAttached) {
+    const wc = view.webContents;
+    if (wc && !wc.isDestroyed()) return { wc, source: 'exam_view' };
+  }
+  const win = state.win;
+  if (win && !win.isDestroyed()) {
+    const wc = win.webContents;
+    if (wc && !wc.isDestroyed()) return { wc, source: 'main_window' };
+  }
+  return null;
+}
+
+/**
+ * Уменьшить до ширины SCREEN_EVIDENCE.maxWidth и закодировать JPEG.
+ *
+ * Второй проход — для HiDPI: getSize() отдаёт ширину в DIP, а toJPEG()
+ * может закодировать представление 2x, и в байтах окажется вдвое больше
+ * пикселей. Ширину проверяем по готовому JPEG (jpegSize), и если она всё ещё
+ * больше предела — перечитываем байты как картинку масштаба 1 и уменьшаем.
+ */
+function encodeScreenJpeg(image) {
+  const maxWidth = SCREEN_EVIDENCE.maxWidth;
+  let img = image;
+  let out = null;
+  for (let pass = 0; pass < 2; pass += 1) {
+    const size = img.getSize();
+    if (size.width > maxWidth) img = img.resize({ width: maxWidth, quality: 'good' });
+    const jpeg = img.toJPEG(SCREEN_EVIDENCE.jpegQuality);
+    const dims = jpegSize(jpeg) || img.getSize();
+    out = { jpeg, width: dims.width, height: dims.height };
+    if (dims.width <= maxWidth) break;
+    img = nativeImage.createFromBuffer(jpeg, { scaleFactor: 1 });
+    if (img.isEmpty()) break;
+  }
+  return out;
+}
+
+/**
+ * Снять представление экзамена. Не бросает: неудача — это `{error}`, и она
+ * уходит ядру причиной, а отчёт пишет «снимок окна не получен: <причина>».
+ */
+async function captureExamView() {
+  const target = screenEvidenceTarget();
+  if (!target) {
+    return { error: 'окна экзамена нет', source: 'main_window', capturedAt: nowEpochSec() };
+  }
+  const { wc, source } = target;
+  let image;
+  try {
+    image = await wc.capturePage();
+  } catch (err) {
+    return {
+      error: `capturePage не удался: ${oneLine((err && err.message) || err, 120)}`,
+      source,
+      capturedAt: nowEpochSec(),
+    };
+  }
+  const capturedAt = nowEpochSec();
+  if (!image || image.isEmpty()) {
+    return { error: 'снимок пустой: окно экзамена скрыто или свёрнуто', source, capturedAt };
+  }
+  let encoded;
+  try {
+    encoded = encodeScreenJpeg(image);
+  } catch (err) {
+    return {
+      error: `JPEG не собран: ${oneLine((err && err.message) || err, 120)}`,
+      source,
+      capturedAt,
+    };
+  }
+  if (!encoded || !isJpeg(encoded.jpeg)) {
+    return { error: 'кодировщик вернул не JPEG', source, capturedAt };
+  }
+  if (encoded.jpeg.length > SCREEN_EVIDENCE.maxBytes) {
+    return {
+      error: `снимок ${encoded.jpeg.length} байт больше предела ${SCREEN_EVIDENCE.maxBytes}`,
+      source,
+      capturedAt,
+    };
+  }
+  return {
+    source,
+    capturedAt,
+    width: encoded.width,
+    height: encoded.height,
+    bytes: encoded.jpeg.length,
+    data_b64: encoded.jpeg.toString('base64'),
+  };
+}
+
+/**
+ * Не больше одного снимка в полёте; события в пределах 1.5 с — те же байты.
+ * capturePage(), не ответивший за 4 с, уходит ядру причиной «capturePage не
+ * ответил за 4 с» и снимается с полёта: следующее событие снимает заново.
+ */
+const screenShots = screenShotCoordinator(() => captureExamView(), {
+  reuseMs: SCREEN_EVIDENCE.reuseMs,
+  timeoutMs: SCREEN_EVIDENCE.captureTimeoutMs,
+});
+
+/**
+ * Ответ ядру по одному событию. Каждое событие получает СВОЁ сообщение со
+ * своим event_id, даже если байты общие с соседним.
+ *
+ * Только по живому каналу: в очередь ipc.js снимок не ставим. Очередь
+ * рассчитана на короткие события, а не на сотни килобайт, и ядро всё равно
+ * не примет снимок позже 60 с после события.
+ */
+function sendScreenEvidence(eventId, kind, shot) {
+  const s = shot || {};
+  const payload = {
+    event_id: eventId,
+    mime: 'image/jpeg',
+    captured_at: Number.isFinite(s.capturedAt) ? s.capturedAt : nowEpochSec(),
+    source: s.source === 'exam_view' ? 'exam_view' : 'main_window',
+  };
+  if (s.data_b64) {
+    payload.data_b64 = s.data_b64;
+    payload.width = s.width;
+    payload.height = s.height;
+  } else {
+    payload.error = oneLine(s.error || 'снимок не получен') || 'снимок не получен';
+  }
+  if (!link.connected) {
+    log(`снимок окна экзамена к ${kind} не отправлен: нет связи с ядром`);
+    return false;
+  }
+  const sent = link.send(SidecarLink.envelope(SCREEN_EVIDENCE_TYPE, payload));
+  log(payload.data_b64
+    ? `снимок окна экзамена к ${kind} (${eventId.slice(0, 8)}): ${payload.source} `
+      + `${payload.width}x${payload.height}, ${Math.round((s.bytes || 0) / 1024)} КБ`
+    : `снимка окна экзамена к ${kind} (${eventId.slice(0, 8)}) нет: ${payload.error}`);
+  return sent;
+}
+
+/**
+ * Событие ядра с `screen: true`. Снимаем только внутри активной сессии и
+ * только пока экзамен на экране (exam/paused); иначе отвечаем причиной.
+ * Сессии нет вовсе — не снимаем и не отвечаем: ядро такой снимок не примет.
+ */
+function requestScreenEvidence(ev) {
+  const eventId = ev && typeof ev.id === 'string' ? ev.id.trim().slice(0, 64) : '';
+  if (!eventId) return;
+  const kind = oneLine(ev.kind || '?', 64);
+  const verdict = screenCaptureVerdict({
+    sessionStarted: state.sessionStarted,
+    examState: state.examState,
+    quitting: state.quitting,
+  });
+  if (!verdict.capture) {
+    if (!verdict.error) {
+      log(`снимок окна экзамена к ${kind} не снят: сессия не открыта`);
+      return;
+    }
+    const target = screenEvidenceTarget();
+    sendScreenEvidence(eventId, kind, {
+      error: verdict.error,
+      source: target ? target.source : 'main_window',
+      capturedAt: nowEpochSec(),
+    });
+    return;
+  }
+  screenShots.take()
+    .then((shot) => sendScreenEvidence(eventId, kind, shot))
+    .catch((err) => log('снимок окна экзамена не отправлен:', err && err.message));
+}
+
+// ---------------------------------------------------------------------------
+// Финальный экран: где отчёт и пакет
+// ---------------------------------------------------------------------------
+/*
+ * Ядро собирает report.html в каталоге сессии ПОСЛЕ SESSION_ENDED, затем
+ * пакет `<сессия>.proctor.zip` рядом с каталогом. Оболочка запоминает пути из
+ * того, что ядро уже присылает, и раз в секунду отдаёт renderer готовность
+ * файлов (shellStatus().sessionReport). Открыть отчёт можно только после
+ * конца сессии, когда машина отпущена: shell.openPath уводит фокус в браузер,
+ * и во время экзамена это был бы законный выход из kiosk-окна.
+ */
+
+/** Имя отчёта в каталоге сессии (report_filename в sidecar/config.py). */
+const REPORT_FILENAME = 'report.html';
+const PACKAGE_SUFFIX = '.proctor.zip';
+
+function freshSessionReport() {
+  return {
+    sessionDir: '',
+    packagePath: '',
+    packageOk: null,         // null — пакет ещё не собирался или итог не пришёл
+    packageMessage: '',
+    sessionCode: '',
+    degradedHandover: false,
+    handoverReason: '',
+    ended: false,
+    endReason: '',
+  };
+}
+
+function textField(value, limit) {
+  return typeof value === 'string' ? value.trim().slice(0, limit || 4096) : '';
+}
+
+/** Абсолютный путь из сообщения ядра; относительный считаем от корня репозитория. */
+function absFromSidecar(p) {
+  const raw = textField(p);
+  if (!raw || raw.indexOf('\u0000') !== -1) return '';
+  return path.isAbsolute(raw) ? path.normalize(raw) : path.resolve(ROOT_DIR, raw);
+}
+
+function fileReady(p) {
+  if (!p) return false;
+  try {
+    const st = fs.statSync(p);
+    return st.isFile() && st.size > 0;
+  } catch (err) {
+    return false;
+  }
+}
+
+/** SESSION_STARTED / SESSION_ENDED: каталог, код, пакет. */
+function noteSessionReportFromEvent(ev) {
+  if (!ev || typeof ev !== 'object') return;
+  const d = ev.detail && typeof ev.detail === 'object' ? ev.detail : {};
+  if (ev.kind === EventKind.SESSION_STARTED) {
+    state.sessionReport = Object.assign(freshSessionReport(), {
+      sessionDir: absFromSidecar(d.session_dir),
+      sessionCode: textField(d.session_code_display, 32),
+      degradedHandover: Boolean(d.degraded_handover),
+    });
+    broadcastShellStatus();
+    return;
+  }
+  if (ev.kind !== EventKind.SESSION_ENDED) return;
+  const r = state.sessionReport;
+  r.ended = true;
+  r.endReason = textField(d.reason, 200);
+  if (textField(d.session_code_display)) r.sessionCode = textField(d.session_code_display, 32);
+  if (typeof d.degraded_handover === 'boolean') r.degradedHandover = d.degraded_handover;
+  const pkg = absFromSidecar(d.package_path);
+  if (pkg) r.packagePath = pkg;
+  // SESSION_STARTED мог пройти мимо (оболочку перезапустили посреди сессии):
+  // каталог сессии лежит рядом с пакетом под тем же именем.
+  if (!r.sessionDir && pkg.endsWith(PACKAGE_SUFFIX)) {
+    r.sessionDir = pkg.slice(0, -PACKAGE_SUFFIX.length);
+  }
+  log(`сессия закрыта ядром: каталог ${r.sessionDir || '—'}, пакет ${r.packagePath || '—'}, `
+    + `код ${r.sessionCode || '—'}${r.degradedHandover ? ', ПЕРЕДАЧА ДЕГРАДИРОВАНА' : ''}`);
+  broadcastShellStatus();
+}
+
+/** status: итог сборки пакета и причина деградации передачи. */
+function noteSessionReportFromStatus(msg) {
+  const r = state.sessionReport;
+  if (!msg || typeof msg !== 'object') return;
+  const handover = msg.handover && typeof msg.handover === 'object' ? msg.handover : null;
+  if (handover && handover.degraded_handover) {
+    r.handoverReason = textField(handover.reason || handover.message, 400);
+  }
+  if (!r.ended) return;
+  if (!r.sessionCode && textField(msg.session_code_display)) {
+    r.sessionCode = textField(msg.session_code_display, 32);
+  }
+  const pkg = msg.package && typeof msg.package === 'object' ? msg.package : null;
+  if (!pkg) return;
+  const pkgPath = absFromSidecar(pkg.package);
+  // Итог чужого пакета (пересборка другой сессии) к этой не относится.
+  if (pkgPath && r.packagePath && pkgPath !== r.packagePath) return;
+  if (pkgPath) r.packagePath = pkgPath;
+  r.packageOk = Boolean(pkg.ok);
+  r.packageMessage = r.packageOk ? '' : textField(pkg.reason || pkg.message, 400);
+}
+
+/** То, что видит финальный экран. Готовность файлов — по диску, не на слово. */
+function sessionReportInfo() {
+  const r = state.sessionReport || freshSessionReport();
+  const reportPath = r.sessionDir ? path.join(r.sessionDir, REPORT_FILENAME) : '';
+  const reportReady = fileReady(reportPath);
+  const examOver = !isLockedState(state.examState) && !state.locksIntended && !state.locksActive;
+  return {
+    sessionDir: r.sessionDir,
+    reportPath,
+    reportReady,
+    packagePath: r.packagePath,
+    packageReady: fileReady(r.packagePath),
+    packageOk: r.packageOk,
+    packageMessage: r.packageMessage,
+    sessionCode: r.sessionCode,
+    degradedHandover: Boolean(r.degradedHandover),
+    handoverReason: r.handoverReason,
+    ended: Boolean(r.ended),
+    canOpen: Boolean(r.ended && reportReady && examOver),
+  };
+}
+
+/**
+ * Открыть <каталог сессии>/report.html браузером по умолчанию. Только после
+ * конца сессии и снятия блокировок — проверка здесь, а не в renderer:
+ * кнопку можно нажать и из подменённой страницы.
+ */
+async function openSessionReport() {
+  if (isLockedState(state.examState) || state.locksIntended || state.locksActive) {
+    return {
+      ok: false,
+      reason: 'exam_running',
+      message: 'Отчёт открывается только после завершения экзамена.',
+    };
+  }
+  const info = sessionReportInfo();
+  if (!info.ended) {
+    return {
+      ok: false,
+      reason: 'session_not_ended',
+      message: 'Ядро ещё не закрыло сессию: отчёт появится после её завершения.',
+    };
+  }
+  if (!info.reportPath) {
+    return {
+      ok: false,
+      reason: 'no_session_dir',
+      message: 'Каталог сессии неизвестен: ядро его не сообщило.',
+    };
+  }
+  if (!info.reportReady) {
+    return {
+      ok: false,
+      reason: 'report_not_ready',
+      message: `Отчёт ещё собирается: ${info.reportPath}`,
+      path: info.reportPath,
+    };
+  }
+  let err = '';
+  try {
+    err = await electronShell.openPath(info.reportPath);
+  } catch (e) {
+    err = (e && e.message) || 'openPath не удался';
+  }
+  if (err) {
+    log('отчёт не открылся:', info.reportPath, err);
+    return {
+      ok: false,
+      reason: 'open_failed',
+      message: `Не удалось открыть отчёт: ${oneLine(err, 200)}. Файл: ${info.reportPath}`,
+      path: info.reportPath,
+    };
+  }
+  log('отчёт открыт браузером по умолчанию:', info.reportPath);
+  return { ok: true, path: info.reportPath };
+}
+
+// ---------------------------------------------------------------------------
 // IPC из renderer
 // ---------------------------------------------------------------------------
 
@@ -2680,6 +3085,7 @@ function registerIpc() {
     link.sendSessionEnd(typeof reason === 'string' ? reason : 'renderer_request');
     state.sessionStarted = false;
     state.sessionSentAt = 0;
+    screenShots.reset();
     // Сессия закончилась — машина обязана освободиться, даже если renderer
     // забыл прислать состояние finished.
     if (isLockedState(state.examState)) setExamState('finished', 'session-end');
@@ -2733,6 +3139,14 @@ function registerIpc() {
     return state.blockingReason;
   });
 
+  /*
+   * «Открыть отчёт» на финальном экране: <каталог сессии>/report.html
+   * браузером по умолчанию. Путь renderer не передаёт и передать не может —
+   * он берётся из того, что сообщило ядро, а условия (сессия закрыта,
+   * блокировки сняты, файл на месте) проверяет openSessionReport().
+   */
+  ipcMain.handle('proctor:open-report', () => openSessionReport());
+
   // Запрос выхода из оболочки (кнопка «завершить тест» в renderer).
   ipcMain.handle('proctor:exit', (e, reason) => {
     shutdown(typeof reason === 'string' ? reason : 'renderer_exit');
@@ -2754,6 +3168,8 @@ function openSession(payload, auto) {
   state.sessionAuto = Boolean(auto);
   state.sessionMeta = payload;
   state.sessionSentAt = Date.now();
+  // Снимок окна прошлой сессии новой не достаётся даже в окне повтора 1.5 с.
+  screenShots.reset();
   link.sendSessionStart(payload);
   // Режим запуска уходит СРАЗУ ЗА session_start и по тому же сокету: порядок
   // сообщений в канале сохраняется, поэтому ядро успевает открыть цепочку и
@@ -2813,6 +3229,14 @@ function wireSidecar() {
     }
     if (msg.type === MsgType.VERDICT) {
       state.lastVerdict = { action: msg.action, reason: msg.reason, score: msg.score };
+    }
+    if (msg.type === MsgType.STATUS) noteSessionReportFromStatus(msg);
+    if (msg.type === MsgType.EVENT) {
+      const ev = msg.event && typeof msg.event === 'object' ? msg.event : null;
+      noteSessionReportFromEvent(ev);
+      // Строго `true`: ядро прежней версии поля не шлёт, и снимать по нему
+      // окно было бы самодеятельностью оболочки.
+      if (msg.screen === true) requestScreenEvidence(ev);
     }
   });
 

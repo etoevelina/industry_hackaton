@@ -311,6 +311,14 @@ const api = {
   /** Блокирующий экран поверх теста: {active, reason, title, text}. */
   setBlocking: (payload) => ipcRenderer.invoke('proctor:set-blocking', payload || { active: false }),
 
+  /**
+   * Открыть отчёт сессии (<каталог сессии>/report.html) браузером по
+   * умолчанию. Путь не передаётся: его знает main-процесс со слов ядра, и он
+   * же откажет, пока сессия не закрыта и блокировки не сняты.
+   * Ответ — {ok, reason?, message?, path?}.
+   */
+  openReport: () => ipcRenderer.invoke('proctor:open-report'),
+
   /** Завершить тест и закрыть оболочку. */
   exit: (reason) => ipcRenderer.invoke('proctor:exit', String(reason || 'renderer_exit')),
 };

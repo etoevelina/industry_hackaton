@@ -71,6 +71,12 @@ LINE = "─" * 72
 AUTHORITY_SELF = "self_signed"
 AUTHORITY_INSTITUTION = "institution"
 
+#: Имена записей `control` о доказательствах, а не о решениях. Дублируют
+#: SCREEN_EVIDENCE_CONTROL и CLIP_CANCELLED_CONTROL из sidecar/protocol.py по
+#: той же причине: скрипт работает и без исходников системы.
+SCREEN_CONTROL = "evidence_screen"
+CLIP_CANCELLED_CONTROL = "clip_cancelled"
+
 #: Итог по одной оси проверки.
 OK, FAIL, UNKNOWN = "ok", "fail", "unknown"
 
@@ -594,10 +600,17 @@ def _check_chain(db_mod: Any, db: Path | None) -> tuple[str, list[str]]:
         return UNKNOWN, ["  Модуль sidecar/storage/db.py недоступен — цепочку "
                          "проверить нечем."]
     store = db_mod.EvidenceStore(None, db_path=str(db))
+    controls: list[dict[str, Any]] = []
     try:
         detailed = store.verify_chain_detailed()
         ok, number = store.verify_chain()
         sessions = store.list_sessions()
+        loader = getattr(store, "load_controls", None)
+        if callable(loader):
+            try:
+                controls = list(loader() or [])
+            except Exception:
+                controls = []
     finally:
         try:
             store.close()
@@ -620,9 +633,23 @@ def _check_chain(db_mod: Any, db: Path | None) -> tuple[str, list[str]]:
     # проктора) тоже проверены хешами, а не дописаны мимо журнала.
     raw_checked = int(detailed.get("observations_checked") or 0)
     ctl_checked = int(detailed.get("controls_checked") or 0)
+    # Записи control о доказательствах — снимок окна экзамена и снятый клип —
+    # к решениям над экзаменом не относятся: их по одной на инцидент, и в
+    # общей сумме они выдали бы десятки «решений» там, где их не было.
+    # Считаем их отдельно, остальное — записи о решениях и условиях экзамена.
+    by_name: dict[str, int] = {}
+    for record in controls:
+        name = str(record.get("control") or "")
+        by_name[name] = by_name.get(name, 0) + 1
+    screens = by_name.get(SCREEN_CONTROL, 0)
+    clips_cancelled = by_name.get(CLIP_CANCELLED_CONTROL, 0)
+    decisions = max(ctl_checked - screens - clips_cancelled, 0)
     if raw_checked or ctl_checked:
         lines.append(f"  В той же цепочке:  сырых наблюдений {raw_checked}, "
-                     f"записей о решениях {ctl_checked}")
+                     f"записей о решениях {decisions}")
+        if screens or clips_cancelled:
+            lines.append(f"                     снимков окна теста: {screens}, "
+                         f"отменённых клипов: {clips_cancelled}")
     if detailed.get("last_hash"):
         lines.append(f"  Хеш последней записи: {detailed['last_hash']}")
     if ok:
